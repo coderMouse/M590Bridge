@@ -20,14 +20,15 @@ export function Toggle({
         aria-checked={checked}
         onClick={() => onChange?.(!checked)}
         className={cn(
-          'relative h-[22px] w-[40px] shrink-0 rounded-full transition-colors',
+          // p-[2px] + thumb 18px + travel 18px = 40px track, keeps knob inside
+          'relative inline-flex h-[22px] w-[40px] shrink-0 items-center overflow-hidden rounded-full p-[2px] transition-colors',
           checked ? 'bg-primary' : dark ? 'bg-[#374151]' : 'bg-[#CBD5E1]',
         )}
       >
         <span
           className={cn(
-            'absolute top-[2px] size-[18px] rounded-full bg-white shadow transition-transform',
-            checked ? 'translate-x-[20px]' : 'translate-x-[2px]',
+            'block size-[18px] shrink-0 rounded-full bg-white shadow-sm transition-transform duration-200 ease-out will-change-transform',
+            checked ? 'translate-x-[18px]' : 'translate-x-0',
           )}
         />
       </button>
