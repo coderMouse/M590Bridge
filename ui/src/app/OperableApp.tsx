@@ -46,6 +46,11 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const [autoSync, setAutoSync] = useState(true)
   const [autoReconnect, setAutoReconnect] = useState(true)
   const [prefsLoaded, setPrefsLoaded] = useState(false)
+  const [settingsDeviceId, setSettingsDeviceId] = useState('')
+  const [settingsPort, setSettingsPort] = useState(5901)
+  const [settingsAddr, setSettingsAddr] = useState('127.0.0.1:5901')
+  const [settingsCode, setSettingsCode] = useState('')
+  const [settingsSaved, setSettingsSaved] = useState<string | null>(null)
 
   const apiBase = useMemo(() => getApiBase(), [])
 
@@ -62,6 +67,9 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
       setError(s.last_error)
       setAutoSync(s.auto_sync)
       setAutoReconnect(s.auto_reconnect)
+      if (s.device_id) {
+        setSettingsDeviceId((prev) => prev || s.device_id)
+      }
       if (s.phase === 'connected') setTab((t) => (t === 'pair' ? 'home' : t))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -85,6 +93,10 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
         if (cfg.pairing_code) setCode(cfg.pairing_code.replace(/\D/g, '').slice(0, 6))
         if (cfg.listen_port) setPort(cfg.listen_port)
         if (cfg.connect_addr) setAddr(cfg.connect_addr)
+        setSettingsDeviceId(cfg.device_id || '')
+        setSettingsPort(cfg.listen_port || 5901)
+        setSettingsAddr(cfg.connect_addr || '127.0.0.1:5901')
+        setSettingsCode((cfg.pairing_code || '').replace(/\D/g, '').slice(0, 6))
         setAutoSync(cfg.auto_sync)
         setAutoReconnect(cfg.auto_reconnect)
         setPrefsLoaded(true)
@@ -110,12 +122,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
       }
       const listenPort = Number.isFinite(port) && port > 0 ? port : 5901
       const peerAddr = addr.trim() || '127.0.0.1:5901'
-      const payload: { code: string; port?: number; addr?: string; device_id?: string } = {
-        code: cleanCode,
-      }
-      if (status?.device_id) payload.device_id = status.device_id
       if (role === 'host') {
-        payload.port = listenPort
         await postListen({
           code: cleanCode,
           port: listenPort,
@@ -193,6 +200,54 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setAutoReconnect(!next)
+    }
+  }
+
+  async function onSaveSettings() {
+    setBusy(true)
+    setSettingsSaved(null)
+    setError(null)
+    try {
+      const cleanCode = settingsCode.replace(/\D/g, '').slice(0, 6)
+      const listenPort = Number.isFinite(settingsPort) && settingsPort > 0 ? settingsPort : 5901
+      const peerAddr = settingsAddr.trim()
+      const deviceId = settingsDeviceId.trim()
+      await postConfig({
+        device_id: deviceId || undefined,
+        listen_port: listenPort,
+        connect_addr: peerAddr || null,
+        pairing_code: cleanCode || null,
+        last_role: role,
+        auto_sync: autoSync,
+        auto_reconnect: autoReconnect,
+      })
+      // Keep pair tab fields in sync with saved defaults
+      setPort(listenPort)
+      if (peerAddr) setAddr(peerAddr)
+      if (cleanCode) setCode(cleanCode)
+      await refresh()
+      setSettingsSaved('已保存到本机配置')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function phaseLabel(phase?: string | null) {
+    switch (phase) {
+      case 'idle':
+        return '空闲'
+      case 'waiting_peer':
+        return '等待对端'
+      case 'pairing':
+        return '配对中'
+      case 'connected':
+        return '已连接'
+      case 'error':
+        return '错误'
+      default:
+        return phase || '未知'
     }
   }
 
@@ -431,39 +486,153 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
 
         {tab === 'settings' ? (
           <div className="space-y-4 px-4 py-4 text-[13px]">
-            <div className="rounded-xl border border-black/8 bg-white p-4 space-y-3">
-              <div className="font-semibold">同步与连接</div>
-              <Toggle
-                label="自动同步剪贴板"
-                checked={autoSync}
-                onChange={(v) => void onToggleAutoSync(v)}
-              />
-              <Toggle
-                label="断线自动重连"
-                checked={autoReconnect}
-                onChange={(v) => void onToggleAutoReconnect(v)}
-              />
-              <p className="text-[12px] text-[#6B7589]">
-                重连次数：{status?.reconnect_attempt ?? 0}
-                {status?.last_error ? ` · ${status.last_error}` : ''}
-              </p>
-            </div>
-            <div className="rounded-xl border border-black/8 bg-white p-4">
-              <div className="mb-2 font-semibold">Hub API</div>
-              <div className="break-all font-mono text-[12px] text-[#6B7589]">{apiBase}</div>
-              <p className="mt-2 text-[12px] text-[#6B7589]">
-                配置保存在本机（可用环境变量 M590_CONFIG 覆盖路径）。桌面壳会内嵌 hub。
-              </p>
-            </div>
-            <div className="rounded-xl border border-black/8 bg-white p-4">
-              <div className="mb-2 font-semibold">当前状态</div>
-              <pre className="overflow-auto rounded bg-[#F5F7FA] p-2 text-[11px]">
-                {JSON.stringify(status, null, 2)}
-              </pre>
-            </div>
-            <PrimaryButton variant="ghost" onClick={() => onOpenGallery?.()}>
-              打开设计画廊（对照 Figma）
+            <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
+              <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
+                设备
+              </div>
+              <div className="space-y-3 px-4 py-3">
+                <label className="block">
+                  <span className="mb-1 block text-[12px] text-[#6B7589]">本机设备 ID</span>
+                  <input
+                    className="w-full rounded-lg border border-black/10 bg-[#F8FAFC] px-3 py-2 font-mono text-[12px]"
+                    value={settingsDeviceId}
+                    onChange={(e) => setSettingsDeviceId(e.target.value)}
+                    placeholder="例如 ui-host"
+                  />
+                </label>
+                <div className="flex items-center justify-between gap-3 border-t border-black/5 pt-3 text-[13px]">
+                  <span className="text-[#6B7589]">当前对端</span>
+                  <span className="max-w-[60%] truncate font-mono text-[12px] text-[#1A2030]">
+                    {status?.peer_device || '未连接'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-[13px]">
+                  <span className="text-[#6B7589]">最近角色</span>
+                  <span className="text-[#1A2030]">
+                    {status?.role || status?.last_role || role || '未设置'}
+                  </span>
+                </div>
+              </div>
+            </section>
+
+            <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
+              <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
+                网络
+              </div>
+              <div className="space-y-3 px-4 py-3">
+                <label className="block">
+                  <span className="mb-1 block text-[12px] text-[#6B7589]">监听端口（创建配对）</span>
+                  <input
+                    type="number"
+                    className="w-full rounded-lg border border-black/10 bg-[#F8FAFC] px-3 py-2 font-mono text-[12px]"
+                    value={settingsPort}
+                    onChange={(e) => setSettingsPort(Number(e.target.value) || 5901)}
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-[12px] text-[#6B7589]">默认对端地址（加入）</span>
+                  <input
+                    className="w-full rounded-lg border border-black/10 bg-[#F8FAFC] px-3 py-2 font-mono text-[12px]"
+                    value={settingsAddr}
+                    onChange={(e) => setSettingsAddr(e.target.value)}
+                    placeholder="192.168.1.10:5901"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-[12px] text-[#6B7589]">默认配对码</span>
+                  <input
+                    className="w-full rounded-lg border border-black/10 bg-[#F8FAFC] px-3 py-2 text-center font-mono text-[16px] tracking-[0.18em] text-primary"
+                    value={formatCodeDisplay(settingsCode)}
+                    onChange={(e) => setSettingsCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    placeholder="123 456"
+                  />
+                </label>
+                <p className="text-[11px] leading-4 text-[#6B7589]">
+                  保存后会作为下次启动的默认值；真正开始配对仍在「配对」页操作。
+                </p>
+              </div>
+            </section>
+
+            <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
+              <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
+                同步
+              </div>
+              <div className="space-y-3 px-4 py-3">
+                <Toggle
+                  label="自动同步剪贴板"
+                  checked={autoSync}
+                  onChange={(v) => void onToggleAutoSync(v)}
+                />
+                <Toggle
+                  label="断线自动重连"
+                  checked={autoReconnect}
+                  onChange={(v) => void onToggleAutoReconnect(v)}
+                />
+              </div>
+            </section>
+
+            <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
+              <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
+                运行状态
+              </div>
+              <div className="divide-y divide-black/5 text-[13px]">
+                <div className="flex items-center justify-between gap-3 px-4 py-3">
+                  <span className="text-[#6B7589]">连接阶段</span>
+                  <span>{phaseLabel(status?.phase)}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 px-4 py-3">
+                  <span className="text-[#6B7589]">会话状态</span>
+                  <span>{status?.connection || '—'}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 px-4 py-3">
+                  <span className="text-[#6B7589]">当前端点</span>
+                  <span className="max-w-[60%] truncate font-mono text-[12px]">
+                    {status?.endpoint || '—'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3 px-4 py-3">
+                  <span className="text-[#6B7589]">重连次数</span>
+                  <span>{status?.reconnect_attempt ?? 0}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 px-4 py-3">
+                  <span className="text-[#6B7589]">Hub API</span>
+                  <span className="max-w-[60%] truncate font-mono text-[11px] text-[#6B7589]">
+                    {status?.hub_api || apiBase}
+                  </span>
+                </div>
+                {status?.last_error ? (
+                  <div className="px-4 py-3">
+                    <div className="mb-1 text-[12px] text-[#6B7589]">最近错误</div>
+                    <div className="text-[12px] leading-5 text-destructive">{status.last_error}</div>
+                  </div>
+                ) : null}
+                {status?.last_sync_text ? (
+                  <div className="px-4 py-3">
+                    <div className="mb-1 text-[12px] text-[#6B7589]">最近同步</div>
+                    <div className="line-clamp-3 text-[12px] leading-5 text-[#1A2030]">
+                      {status.last_sync_text}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </section>
+
+            <PrimaryButton loading={busy} onClick={() => void onSaveSettings()} disabled={!hubOnline || busy}>
+              保存配置
             </PrimaryButton>
+            {settingsSaved ? (
+              <div className="text-center text-[12px] text-emerald-600">{settingsSaved}</div>
+            ) : null}
+
+            <p className="text-center text-[11px] leading-4 text-[#6B7589]">
+              配置保存在本机。可用环境变量 <code>M590_CONFIG</code> 覆盖路径。
+            </p>
+
+            {onOpenGallery ? (
+              <PrimaryButton variant="ghost" onClick={() => onOpenGallery()}>
+                打开设计画廊（对照 Figma）
+              </PrimaryButton>
+            ) : null}
           </div>
         ) : null}
       </div>

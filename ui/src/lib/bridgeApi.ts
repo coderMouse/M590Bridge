@@ -85,7 +85,17 @@ export async function fetchConfig(): Promise<HubConfig> {
   return request<HubConfig>('/api/config')
 }
 
-export async function postConfig( partial: Partial<HubConfig>): Promise<HubConfig> {
+export type HubConfigPatch = {
+  device_id?: string
+  last_role?: string | null
+  pairing_code?: string | null
+  listen_port?: number
+  connect_addr?: string | null
+  auto_sync?: boolean
+  auto_reconnect?: boolean
+}
+
+export async function postConfig(partial: HubConfigPatch): Promise<HubConfig> {
   return request<HubConfig>('/api/config', {
     method: 'POST',
     body: JSON.stringify(partial),
