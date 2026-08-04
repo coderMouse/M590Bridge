@@ -54,30 +54,13 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
 
 fn handle_http(mut stream: TcpStream, shared: SharedStatus) -> Result<(), String> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
-    if n == 0 {
-        return Ok(());
-    }
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let mut lines = req.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
-
-    let body = req
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .trim_end_matches('\0')
-        .to_string();
+    let (method, path, body) = read_http_request(&mut stream)?;
 
     if method == "OPTIONS" {
         return write_response(&mut stream, 204, "text/plain", "");
     }
 
-    match (method, path) {
+    match (method.as_str(), path.as_str()) {
         ("GET", "/api/health") => {
             write_response(&mut stream, 200, "application/json", "{\"ok\":true}")
         }
@@ -94,22 +77,24 @@ fn handle_http(mut stream: TcpStream, shared: SharedStatus) -> Result<(), String
             Err(err) => write_json_err(&mut stream, &err),
         },
         ("POST", "/api/listen") => {
-            let code = json_get(&body, "code").unwrap_or_default();
+            let code = resolve_pairing_code(&shared, &body);
             let port = json_get(&body, "port")
                 .and_then(|p| p.parse().ok())
                 .unwrap_or_else(|| with_status(&shared, |s| s.listen_port));
-            let device_id = json_get(&body, "device_id");
+            let device_id = json_get(&body, "device_id").filter(|s| !s.is_empty());
             match start_listen(shared, code, port, device_id) {
                 Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
                 Err(err) => write_json_err(&mut stream, &err),
             }
         }
         ("POST", "/api/connect") => {
-            let code = json_get(&body, "code").unwrap_or_default();
-            let addr = json_get(&body, "addr").unwrap_or_else(|| {
-                with_status(&shared, |s| s.connect_addr.clone().unwrap_or_default())
-            });
-            let device_id = json_get(&body, "device_id");
+            let code = resolve_pairing_code(&shared, &body);
+            let addr = json_get(&body, "addr")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    with_status(&shared, |s| s.connect_addr.clone().unwrap_or_default())
+                });
+            let device_id = json_get(&body, "device_id").filter(|s| !s.is_empty());
             match start_connect(shared, code, addr, device_id) {
                 Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
                 Err(err) => write_json_err(&mut stream, &err),
@@ -156,6 +141,89 @@ fn apply_config_update(shared: &SharedStatus, body: &str) -> Result<String, Stri
     });
     config::save_config(&cfg)?;
     Ok(cfg.to_json())
+}
+
+
+fn read_http_request(stream: &mut TcpStream) -> Result<(String, String, String), String> {
+    let mut data: Vec<u8> = Vec::with_capacity(4096);
+    let mut buf = [0u8; 2048];
+    loop {
+        if find_header_end(&data).is_some() {
+            break;
+        }
+        let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if data.len() > 64 * 1024 {
+            return Err("http headers too large".into());
+        }
+    }
+    if data.is_empty() {
+        return Err("empty request".into());
+    }
+    let header_end = match find_header_end(&data) {
+        Some(p) => p,
+        None => return Err("incomplete http headers".into()),
+    };
+
+    let header_bytes = &data[..header_end];
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+
+    let mut content_length = 0usize;
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            content_length = v.trim().parse().unwrap_or(0);
+        }
+    }
+
+    let mut body = data[header_end + 4..].to_vec();
+    while body.len() < content_length {
+        let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..n]);
+        if body.len() > 1024 * 1024 {
+            return Err("http body too large".into());
+        }
+    }
+    if content_length > 0 {
+        body.truncate(content_length);
+    }
+    let body = String::from_utf8_lossy(&body).trim_end_matches('\0').to_string();
+    Ok((method, path, body))
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn normalize_pairing_code(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_ascii_digit()).take(6).collect()
+}
+
+fn resolve_pairing_code(shared: &SharedStatus, body: &str) -> String {
+    let from_body = json_get(body, "code")
+        .map(|s| normalize_pairing_code(&s))
+        .filter(|s| !s.is_empty());
+    if let Some(code) = from_body {
+        return code;
+    }
+    with_status(shared, |s| {
+        s.pairing_code
+            .as_ref()
+            .map(|c| normalize_pairing_code(c))
+            .filter(|c| !c.is_empty())
+            .unwrap_or_default()
+    })
 }
 
 fn write_json_err(stream: &mut TcpStream, err: &str) -> Result<(), String> {
@@ -233,12 +301,14 @@ fn json_get(body: &str, key: &str) -> Option<String> {
 
 fn start_listen(
     shared: SharedStatus,
-    code: String,
+    mut code: String,
     port: u16,
     device_id: Option<String>,
 ) -> Result<(), String> {
+    code = normalize_pairing_code(&code);
     if code.is_empty() {
-        return Err("code required".into());
+        // Last resort: generate a 6-digit code so host can still start.
+        code = format!("{:06}", (std::process::id() % 900_000) + 100_000);
     }
     if BRIDGE_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("bridge already running; disconnect first".into());
@@ -268,12 +338,17 @@ fn start_listen(
 
 fn start_connect(
     shared: SharedStatus,
-    code: String,
+    mut code: String,
     addr: String,
     device_id: Option<String>,
 ) -> Result<(), String> {
-    if code.is_empty() || addr.is_empty() {
-        return Err("code and addr required".into());
+    code = normalize_pairing_code(&code);
+    let addr = addr.trim().to_string();
+    if code.is_empty() {
+        return Err("code required".into());
+    }
+    if addr.is_empty() {
+        return Err("addr required".into());
     }
     if BRIDGE_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("bridge already running; disconnect first".into());

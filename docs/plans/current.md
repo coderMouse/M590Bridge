@@ -12,6 +12,7 @@ Linux + Windows 文本剪贴板同步 MVP；托盘常驻；参数可记住、断
 - [x] task-001..009 核心、UI、Tauri 壳
 - [x] **跨机实机**：Linux hub/UI ↔ Windows `connect`，`sync_rx` + `clipboard_write=ok`
 - [x] **task-010** 配置持久化 + 断线自动重连（`GET/POST /api/config`）
+- [x] **task-011** 修复 listen 间歇 code required（完整读 HTTP body）
 
 ## 进行中
 

@@ -97,7 +97,12 @@ export async function postListen(input: {
   port: number
   device_id?: string
 }): Promise<void> {
-  await request('/api/listen', { method: 'POST', body: JSON.stringify(input) })
+  const body: Record<string, string | number> = {
+    code: String(input.code ?? '').replace(/\D/g, '').slice(0, 6),
+    port: Number(input.port) || 5901,
+  }
+  if (input.device_id) body.device_id = input.device_id
+  await request('/api/listen', { method: 'POST', body: JSON.stringify(body) })
 }
 
 export async function postConnect(input: {
@@ -105,7 +110,12 @@ export async function postConnect(input: {
   addr: string
   device_id?: string
 }): Promise<void> {
-  await request('/api/connect', { method: 'POST', body: JSON.stringify(input) })
+  const body: Record<string, string | number> = {
+    code: String(input.code ?? '').replace(/\D/g, '').slice(0, 6),
+    addr: String(input.addr ?? '').trim(),
+  }
+  if (input.device_id) body.device_id = input.device_id
+  await request('/api/connect', { method: 'POST', body: JSON.stringify(body) })
 }
 
 export async function postPush(text: string): Promise<void> {

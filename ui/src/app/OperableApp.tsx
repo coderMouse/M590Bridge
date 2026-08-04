@@ -102,13 +102,34 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
     setBusy(true)
     setError(null)
     try {
-      const cleanCode = code.replace(/\D/g, '')
-      if (cleanCode.length < 4) throw new Error('请输入至少 4 位配对码')
-      const deviceId = status?.device_id
+      let cleanCode = code.replace(/\D/g, '').slice(0, 6)
+      if (cleanCode.length < 4) {
+        // UI 状态偶发空码时自动补一个，避免 hub 报 code required
+        cleanCode = randomPairCode()
+        setCode(cleanCode)
+      }
+      const listenPort = Number.isFinite(port) && port > 0 ? port : 5901
+      const peerAddr = addr.trim() || '127.0.0.1:5901'
+      const payload: { code: string; port?: number; addr?: string; device_id?: string } = {
+        code: cleanCode,
+      }
+      if (status?.device_id) payload.device_id = status.device_id
       if (role === 'host') {
-        await postListen({ code: cleanCode, port, device_id: deviceId })
+        payload.port = listenPort
+        await postListen({
+          code: cleanCode,
+          port: listenPort,
+          device_id: status?.device_id,
+        })
       } else {
-        await postConnect({ code: cleanCode, addr, device_id: deviceId })
+        if (!peerAddr.includes(':')) {
+          throw new Error('请填写对端地址，例如 192.168.1.10:5901')
+        }
+        await postConnect({
+          code: cleanCode,
+          addr: peerAddr,
+          device_id: status?.device_id,
+        })
       }
       await refresh()
     } catch (e) {
@@ -304,9 +325,15 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
             </div>
 
             <PrimaryButton
-              loading={busy || status?.phase === 'pairing' || status?.phase === 'waiting_peer'}
+              loading={busy || status?.phase === 'pairing'}
               onClick={() => void onStart()}
-              disabled={!hubOnline || busy}
+              disabled={
+                !hubOnline ||
+                busy ||
+                status?.phase === 'waiting_peer' ||
+                status?.phase === 'pairing' ||
+                status?.phase === 'connected'
+              }
             >
               {role === 'host' ? '开始等待配对' : '连接对端'}
             </PrimaryButton>
