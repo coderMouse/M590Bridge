@@ -13,6 +13,7 @@
 //! - Open failures surface as [`ClipboardError::Backend`] / [`ClipboardError::NoDisplay`]
 
 mod error;
+mod image_file;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod arboard_text;
@@ -24,6 +25,7 @@ mod linux;
 mod windows;
 
 pub use error::ClipboardError;
+pub use image_file::{image_from_clipboard_text, load_image_file};
 
 /// Which OS/display backend is selected or available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -744,15 +744,47 @@ fn run_session_loop(
             if auto {
                 if let Ok(Some(text)) = clip.poll_text_change() {
                     content_seq += 1;
-                    let cid = format!("ui-clip-{}-{content_seq}", std::process::id());
-                    if let Ok(QueueClipboardResult::Queued) =
-                        session.queue_clipboard_text(cid, text.clone())
-                    {
-                        conn.send_all(session.take_outbox().iter())
-                            .map_err(|e| e.to_string())?;
-                        with_status(&shared, |s| {
-                            s.last_sync_text = Some(text);
-                        });
+                    // File-manager "copy image file" often only places a path/URI as text.
+                    // Prefer decoding local image files into ClipboardImage.
+                    if let Ok(Some(image)) = m590_clipboard::image_from_clipboard_text(&text) {
+                        let cid = format!("ui-clip-imgfile-{}-{content_seq}", std::process::id());
+                        let summary = format!(
+                            "[image {}x{} {}B]",
+                            image.width,
+                            image.height,
+                            image.rgba.len()
+                        );
+                        match session.queue_clipboard_image(
+                            cid,
+                            image.width,
+                            image.height,
+                            image.rgba,
+                        ) {
+                            Ok(QueueClipboardResult::Queued) => {
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|e| e.to_string())?;
+                                with_status(&shared, |s| {
+                                    s.last_sync_text = Some(summary);
+                                });
+                            }
+                            Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                eprintln!(
+                                    "m590-hub: skip oversized image-from-path bytes={byte_len} limit={limit}"
+                                );
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        let cid = format!("ui-clip-{}-{content_seq}", std::process::id());
+                        if let Ok(QueueClipboardResult::Queued) =
+                            session.queue_clipboard_text(cid, text.clone())
+                        {
+                            conn.send_all(session.take_outbox().iter())
+                                .map_err(|e| e.to_string())?;
+                            with_status(&shared, |s| {
+                                s.last_sync_text = Some(text);
+                            });
+                        }
                     }
                 }
                 if let Ok(Some(image)) = clip.poll_image_change() {

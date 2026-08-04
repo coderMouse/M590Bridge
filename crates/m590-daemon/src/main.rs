@@ -472,24 +472,52 @@ fn run_bridge(
                 Ok(Some(text)) => {
                     if session.state() == ConnectionState::Connected {
                         content_seq += 1;
-                        let cid = format!("clip-{}-{content_seq}", process::id());
-                        match session.queue_clipboard_text(cid, text.clone()) {
-                            Ok(QueueClipboardResult::Queued) => {
-                                let out = session.take_outbox();
-                                conn.send_all(out.iter()).map_err(|e| e.to_string())?;
-                                println!("sync_tx len={}", text.len());
+                        if let Ok(Some(image)) = m590_clipboard::image_from_clipboard_text(&text) {
+                            let cid = format!("clip-imgfile-{}-{content_seq}", process::id());
+                            let w = image.width;
+                            let h = image.height;
+                            match session.queue_clipboard_image(cid, w, h, image.rgba) {
+                                Ok(QueueClipboardResult::Queued) => {
+                                    let out = session.take_outbox();
+                                    conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+                                    println!("sync_tx_image_from_path {w}x{h}");
+                                }
+                                Ok(QueueClipboardResult::DuplicateContentId) => {
+                                    println!("sync_tx_image=skip duplicate_content_id");
+                                }
+                                Ok(QueueClipboardResult::UnchangedImage) => {
+                                    println!("clipboard_poll_image=skip_echo");
+                                }
+                                Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                    println!(
+                                        "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
+                                    );
+                                }
+                                Ok(QueueClipboardResult::UnchangedText) => {
+                                    println!("sync_tx_image=skip unexpected_text_result");
+                                }
+                                Err(err) => println!("sync_tx_image=error {err}"),
                             }
-                            Ok(QueueClipboardResult::DuplicateContentId) => {
-                                println!("sync_tx=skip duplicate_content_id");
+                        } else {
+                            let cid = format!("clip-{}-{content_seq}", process::id());
+                            match session.queue_clipboard_text(cid, text.clone()) {
+                                Ok(QueueClipboardResult::Queued) => {
+                                    let out = session.take_outbox();
+                                    conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+                                    println!("sync_tx len={}", text.len());
+                                }
+                                Ok(QueueClipboardResult::DuplicateContentId) => {
+                                    println!("sync_tx=skip duplicate_content_id");
+                                }
+                                Ok(QueueClipboardResult::UnchangedText) => {
+                                    println!("clipboard_poll=skip_echo len={}", text.len());
+                                }
+                                Ok(QueueClipboardResult::UnchangedImage)
+                                | Ok(QueueClipboardResult::ImageTooLarge { .. }) => {
+                                    println!("sync_tx=skip unexpected_image_result_on_text");
+                                }
+                                Err(err) => println!("sync_tx=error {err}"),
                             }
-                            Ok(QueueClipboardResult::UnchangedText) => {
-                                println!("clipboard_poll=skip_echo len={}", text.len());
-                            }
-                            Ok(QueueClipboardResult::UnchangedImage)
-                            | Ok(QueueClipboardResult::ImageTooLarge { .. }) => {
-                                println!("sync_tx=skip unexpected_image_result_on_text");
-                            }
-                            Err(err) => println!("sync_tx=error {err}"),
                         }
                     }
                 }
