@@ -8,7 +8,7 @@
 //! - payload_len: u32 BE
 //! - payload: type-specific fields (strings = u32 BE len + UTF-8 bytes; u64 = BE)
 
-use m590_core::{ClipboardTextPayload, DeviceId, Message, PROTOCOL_VERSION};
+use m590_core::{ClipboardImagePayload, ClipboardTextPayload, DeviceId, Message, PROTOCOL_VERSION};
 
 /// Wire magic bytes.
 pub const FRAME_MAGIC: &[u8; 4] = b"M590";
@@ -58,6 +58,7 @@ const TYPE_HEARTBEAT: u8 = 6;
 const TYPE_HEARTBEAT_ACK: u8 = 7;
 const TYPE_CLIPBOARD_TEXT: u8 = 8;
 const TYPE_GOODBYE: u8 = 9;
+const TYPE_CLIPBOARD_IMAGE: u8 = 10;
 
 /// Encode one message into a single frame buffer.
 pub fn encode_frame(message: &Message) -> Result<Vec<u8>, FrameError> {
@@ -153,6 +154,14 @@ fn encode_payload(message: &Message) -> Result<(u8, Vec<u8>), FrameError> {
             write_string(&mut payload, &body.text)?;
             TYPE_CLIPBOARD_TEXT
         }
+        Message::ClipboardImage(body) => {
+            write_string(&mut payload, body.device_id.as_str())?;
+            write_string(&mut payload, &body.content_id)?;
+            payload.extend_from_slice(&body.width.to_be_bytes());
+            payload.extend_from_slice(&body.height.to_be_bytes());
+            write_bytes(&mut payload, &body.rgba)?;
+            TYPE_CLIPBOARD_IMAGE
+        }
         Message::Goodbye { device_id, reason } => {
             write_string(&mut payload, device_id.as_str())?;
             write_string(&mut payload, reason)?;
@@ -224,6 +233,22 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
             };
             Ok(Message::ClipboardText(body))
         }
+        TYPE_CLIPBOARD_IMAGE => {
+            let device_id = DeviceId::new(read_string(&mut payload)?);
+            let content_id = read_string(&mut payload)?;
+            let width = read_u32(&mut payload)?;
+            let height = read_u32(&mut payload)?;
+            let rgba = read_bytes(&mut payload)?;
+            ensure_empty(payload)?;
+            let body = ClipboardImagePayload::new(device_id, content_id, width, height, rgba)
+                .map_err(|e| FrameError::InvalidField(match e {
+                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                    m590_core::ProtocolError::EmptyContentId => "content_id",
+                    m590_core::ProtocolError::InvalidImage(reason) => reason,
+                    _ => "image",
+                }))?;
+            Ok(Message::ClipboardImage(body))
+        }
         TYPE_GOODBYE => {
             let device_id = DeviceId::new(read_string(&mut payload)?);
             let reason = read_string(&mut payload)?;
@@ -268,6 +293,41 @@ fn read_u64(input: &mut &[u8]) -> Result<u64, FrameError> {
     *input = &input[8..];
     Ok(u64::from_be_bytes(buf))
 }
+
+fn write_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), FrameError> {
+    let len = value.len();
+    if len > MAX_PAYLOAD_LEN {
+        return Err(FrameError::PayloadTooLarge(len));
+    }
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+fn read_bytes(input: &mut &[u8]) -> Result<Vec<u8>, FrameError> {
+    if input.len() < 4 {
+        return Err(FrameError::TruncatedPayload);
+    }
+    let len = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    *input = &input[4..];
+    if input.len() < len {
+        return Err(FrameError::TruncatedPayload);
+    }
+    let slice = input[..len].to_vec();
+    *input = &input[len..];
+    Ok(slice)
+}
+
+fn read_u32(input: &mut &[u8]) -> Result<u32, FrameError> {
+    if input.len() < 4 {
+        return Err(FrameError::TruncatedPayload);
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&input[..4]);
+    *input = &input[4..];
+    Ok(u32::from_be_bytes(buf))
+}
+
 
 fn ensure_empty(input: &[u8]) -> Result<(), FrameError> {
     if input.is_empty() {
@@ -325,6 +385,22 @@ mod tests {
                 content_id: "c".into(),
                 text: "剪贴板 ✅".into(),
             },
+        );
+        let decoded = decode_frame(&encode_frame(&msg).unwrap()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn roundtrip_clipboard_image() {
+        let msg = Message::clipboard_image(
+            ClipboardImagePayload::new(
+                DeviceId::new("dev"),
+                "img-1",
+                2,
+                1,
+                vec![1, 2, 3, 255, 4, 5, 6, 255],
+            )
+            .unwrap(),
         );
         let decoded = decode_frame(&encode_frame(&msg).unwrap()).unwrap();
         assert_eq!(decoded, msg);

@@ -32,13 +32,24 @@ pub enum QueueClipboardResult {
     DuplicateContentId,
     /// Same text as the last applied/queued clipboard payload (echo / no-op).
     UnchangedText,
+    /// Same image as the last applied/queued image payload (echo / no-op).
+    UnchangedImage,
+    /// Image exceeds inline transport budget.
+    ImageTooLarge { byte_len: usize, limit: usize },
 }
 
 /// Result of handling an inbound clipboard text message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundClipboardResult {
-    /// New content applied to session state.
+    /// New text content applied to session state.
     Applied { content_id: String, text: String },
+    /// New image content applied to session state.
+    AppliedImage {
+        content_id: String,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
     /// `content_id` already seen — ignored.
     DuplicateContentId,
 }
@@ -54,6 +65,8 @@ pub struct SessionSnapshot {
     pub last_heartbeat_seq: u64,
     pub last_clipboard_content_id: Option<String>,
     pub last_clipboard_text: Option<String>,
+    pub last_clipboard_image_content_id: Option<String>,
+    pub last_clipboard_image_bytes: Option<usize>,
     pub missed_heartbeat_acks: u32,
     pub outstanding_heartbeat_seq: Option<u64>,
 }
@@ -73,8 +86,11 @@ pub struct Session {
     missed_heartbeat_acks: u32,
     last_clipboard_content_id: Option<String>,
     last_clipboard_text: Option<String>,
+    last_clipboard_image_content_id: Option<String>,
+    last_clipboard_image_fp: Option<u64>,
+    last_clipboard_image_bytes: Option<usize>,
     seen_content_ids: VecDeque<String>,
-    /// Filled when an inbound ClipboardText is newly applied (daemon should consume).
+    /// Filled when an inbound clipboard payload is newly applied (daemon should consume).
     last_inbound_clipboard: Option<InboundClipboardResult>,
     /// Outbound messages produced by the last `handle` / queue call.
     pending_outbox: Vec<Message>,
@@ -96,6 +112,9 @@ impl Session {
             missed_heartbeat_acks: 0,
             last_clipboard_content_id: None,
             last_clipboard_text: None,
+            last_clipboard_image_content_id: None,
+            last_clipboard_image_fp: None,
+            last_clipboard_image_bytes: None,
             seen_content_ids: VecDeque::new(),
             last_inbound_clipboard: None,
             pending_outbox: Vec::new(),
@@ -137,6 +156,8 @@ impl Session {
             last_heartbeat_seq: self.last_heartbeat_seq,
             last_clipboard_content_id: self.last_clipboard_content_id.clone(),
             last_clipboard_text: self.last_clipboard_text.clone(),
+            last_clipboard_image_content_id: self.last_clipboard_image_content_id.clone(),
+            last_clipboard_image_bytes: self.last_clipboard_image_bytes,
             missed_heartbeat_acks: self.missed_heartbeat_acks,
             outstanding_heartbeat_seq: self.outstanding_heartbeat_seq,
         }
@@ -201,6 +222,58 @@ impl Session {
         self.last_clipboard_text = Some(payload.text.clone());
         self.pending_outbox
             .push(Message::clipboard_text(payload));
+        self.sync_state = SyncState::Idle;
+        Ok(QueueClipboardResult::Queued)
+    }
+
+    /// Maximum raw RGBA bytes accepted for inline image sync.
+    pub const INLINE_IMAGE_MAX_BYTES: usize = 12 * 1024 * 1024;
+
+    /// Queue outbound image after connected.
+    pub fn queue_clipboard_image(
+        &mut self,
+        content_id: impl Into<String>,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> Result<QueueClipboardResult, SessionError> {
+        self.pending_outbox.clear();
+        self.last_inbound_clipboard = None;
+        if self.state != ConnectionState::Connected {
+            return Err(SessionError::InvalidTransition {
+                from: self.state,
+                event: "queue_clipboard_image",
+            });
+        }
+        let content_id = content_id.into();
+        if self.has_seen_content_id(&content_id) {
+            return Ok(QueueClipboardResult::DuplicateContentId);
+        }
+        let fp = image_fingerprint(width, height, &rgba);
+        if self.last_clipboard_image_fp == Some(fp) {
+            return Ok(QueueClipboardResult::UnchangedImage);
+        }
+        if rgba.len() > Self::INLINE_IMAGE_MAX_BYTES {
+            return Ok(QueueClipboardResult::ImageTooLarge {
+                byte_len: rgba.len(),
+                limit: Self::INLINE_IMAGE_MAX_BYTES,
+            });
+        }
+        let payload = crate::ClipboardImagePayload::new(
+            self.local_device.clone(),
+            content_id,
+            width,
+            height,
+            rgba,
+        )?;
+        self.sync_state = SyncState::Syncing;
+        self.remember_content_id(payload.content_id.clone());
+        self.last_clipboard_content_id = Some(payload.content_id.clone());
+        self.last_clipboard_image_content_id = Some(payload.content_id.clone());
+        self.last_clipboard_image_fp = Some(fp);
+        self.last_clipboard_image_bytes = Some(payload.rgba.len());
+        self.pending_outbox
+            .push(Message::clipboard_image(payload));
         self.sync_state = SyncState::Idle;
         Ok(QueueClipboardResult::Queued)
     }
@@ -298,6 +371,7 @@ impl Session {
                 Ok(())
             }
             Message::ClipboardText(payload) => self.on_clipboard_text(payload),
+            Message::ClipboardImage(payload) => self.on_clipboard_image(payload),
             Message::Goodbye { .. } => {
                 self.reset_to_disconnected(true);
                 Ok(())
@@ -443,6 +517,51 @@ impl Session {
         Ok(())
     }
 
+    fn on_clipboard_image(
+        &mut self,
+        payload: crate::ClipboardImagePayload,
+    ) -> Result<(), SessionError> {
+        if self.state != ConnectionState::Connected {
+            return Err(SessionError::InvalidTransition {
+                from: self.state,
+                event: "clipboard_image",
+            });
+        }
+        if let Some(peer) = &self.peer_device {
+            if peer != &payload.device_id {
+                return Err(SessionError::UnexpectedPeer(payload.device_id.to_string()));
+            }
+        } else {
+            self.peer_device = Some(payload.device_id.clone());
+        }
+
+        if self.has_seen_content_id(&payload.content_id) {
+            self.last_inbound_clipboard = Some(InboundClipboardResult::DuplicateContentId);
+            return Ok(());
+        }
+        if payload.rgba.len() > Self::INLINE_IMAGE_MAX_BYTES {
+            return Err(SessionError::Protocol(ProtocolError::InvalidImage(
+                "image exceeds inline limit",
+            )));
+        }
+
+        self.sync_state = SyncState::Syncing;
+        self.remember_content_id(payload.content_id.clone());
+        self.last_clipboard_content_id = Some(payload.content_id.clone());
+        self.last_clipboard_image_content_id = Some(payload.content_id.clone());
+        let fp = image_fingerprint(payload.width, payload.height, &payload.rgba);
+        self.last_clipboard_image_fp = Some(fp);
+        self.last_clipboard_image_bytes = Some(payload.rgba.len());
+        self.last_inbound_clipboard = Some(InboundClipboardResult::AppliedImage {
+            content_id: payload.content_id,
+            width: payload.width,
+            height: payload.height,
+            rgba: payload.rgba,
+        });
+        self.sync_state = SyncState::Idle;
+        Ok(())
+    }
+
     fn remember_peer(&mut self, device_id: DeviceId) -> Result<(), SessionError> {
         if device_id.as_str().is_empty() {
             return Err(ProtocolError::EmptyDeviceId.into());
@@ -486,12 +605,25 @@ impl Session {
         self.missed_heartbeat_acks = 0;
         self.last_clipboard_content_id = None;
         self.last_clipboard_text = None;
+        self.last_clipboard_image_content_id = None;
+        self.last_clipboard_image_fp = None;
+        self.last_clipboard_image_bytes = None;
         self.seen_content_ids.clear();
         self.last_inbound_clipboard = None;
         if clear_outbox {
             self.pending_outbox.clear();
         }
     }
+}
+
+fn image_fingerprint(width: u32, height: u32, rgba: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    rgba.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -686,5 +818,40 @@ mod tests {
     fn snapshot_exposes_protocol_version() {
         let session = Session::new(DeviceId::new("a")).unwrap();
         assert_eq!(session.snapshot().protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn clipboard_image_dedup_and_apply() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        let rgba = vec![9, 8, 7, 255];
+        assert_eq!(
+            joiner
+                .queue_clipboard_image("img-1", 1, 1, rgba.clone())
+                .unwrap(),
+            QueueClipboardResult::Queued
+        );
+        let msg = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(msg)).unwrap();
+        assert_eq!(
+            host.take_inbound_clipboard(),
+            Some(InboundClipboardResult::AppliedImage {
+                content_id: "img-1".into(),
+                width: 1,
+                height: 1,
+                rgba: rgba.clone(),
+            })
+        );
+        assert_eq!(
+            joiner
+                .queue_clipboard_image("img-1", 1, 1, rgba.clone())
+                .unwrap(),
+            QueueClipboardResult::DuplicateContentId
+        );
+        assert_eq!(
+            joiner
+                .queue_clipboard_image("img-2", 1, 1, rgba)
+                .unwrap(),
+            QueueClipboardResult::UnchangedImage
+        );
     }
 }

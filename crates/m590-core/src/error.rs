@@ -6,6 +6,7 @@ pub enum ProtocolError {
     EmptyDeviceId,
     EmptyPairingCode,
     EmptyContentId,
+    InvalidImage(&'static str),
     InvalidMessage(&'static str),
 }
 
@@ -15,6 +16,7 @@ impl fmt::Display for ProtocolError {
             Self::EmptyDeviceId => write!(f, "device id must not be empty"),
             Self::EmptyPairingCode => write!(f, "pairing code must not be empty"),
             Self::EmptyContentId => write!(f, "clipboard content id must not be empty"),
+            Self::InvalidImage(reason) => write!(f, "invalid clipboard image: {reason}"),
             Self::InvalidMessage(reason) => write!(f, "invalid message: {reason}"),
         }
     }

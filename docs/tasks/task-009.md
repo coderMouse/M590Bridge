@@ -65,7 +65,8 @@ cd ui && npm run desktop:dev
 ### 文档影响
 
 - 已更新 plan / discovery / ui README
-- 待补：Windows 上 `cargo build -p m590-ui` / 托盘实机；正式安装包
+- 已补：Windows `m590-ui` 构建与联调（见 task-013）
+- 待补：正式安装包 / 开机自启
 
 ### 风险
 
@@ -75,5 +76,5 @@ cd ui && npm run desktop:dev
 
 ### 下一步
 
-- Windows 编译运行 `m590-ui`
-- 或配置持久化 / 自动重连
+- 已完成：Windows `m590-ui`（task-013）；配置持久化/重连（task-010..012）
+- 后续：图片/文件通道、mDNS、安装包

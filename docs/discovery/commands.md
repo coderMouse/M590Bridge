@@ -34,11 +34,15 @@ cargo run -p m590-daemon -- connect --code 123456 --addr 127.0.0.1:19591 \
 - Linux/Windows 剪贴板 demo
 - `cargo test` 含 TCP loopback 配对+文本
 - 本机双进程：`push_text` → 对端 `sync_rx` / `expect_text=ok`；OS 路径 `clipboard_write=ok`
+- 图片：Connected 后 OS 复制图片 → `sync_tx_image` / `sync_rx_image`（超 12MiB RGBA 会 skip）
 
 ## 跨机
 
-> 产品决定：完整实机联调可等有界面后再做；以下 CLI 步骤供需要时使用。
+已确认：Linux ↔ Windows 文本同步实机通过（CLI 与 `m590-ui` 路径）。
 
+推荐：两端均运行 `m590-ui`，一侧「创建配对 / 等待」，另一侧「加入」并填对端地址与配对码。
+
+CLI 步骤（调试仍可用）：
 
 1. 防火墙放行 TCP 端口（默认草案 5901，可改 `--port`）
 2. A：`listen --code CODE --port PORT`
@@ -49,7 +53,7 @@ cargo run -p m590-daemon -- connect --code 123456 --addr 127.0.0.1:19591 \
 
 ```text
 docs/plans/current.md
-docs/tasks/task-010.md
+docs/tasks/task-014.md
 docs/domain/protocol-draft.md
 ```
 

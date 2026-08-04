@@ -1,7 +1,7 @@
 # 协议草案 · M590Bridge
 
-> 状态：draft（task-003）  
-> 范围：局域网 1 对 1；文本剪贴板；无真实 TCP 实现说明见代码 mock
+> 状态：draft（task-003 + task-014 图片）  
+> 范围：局域网 1 对 1；文本 + 小图剪贴板；文件分片仍后置
 
 ## 版本
 
@@ -20,7 +20,11 @@
 | 12 | N | payload |
 
 字符串字段：`u32 BE 长度 + UTF-8 字节`。  
-`u64` 字段：大端。
+原始字节字段：`u32 BE 长度 + bytes`。  
+`u32` / `u64` 字段：大端。
+
+最大 payload：`MAX_PAYLOAD_LEN = 16 MiB`。  
+内联图片软上限：`Session::INLINE_IMAGE_MAX_BYTES = 12 MiB`（超出则发送侧 skip）。
 
 ## 消息类型（msg_type）
 
@@ -35,6 +39,9 @@
 | 7 | HeartbeatAck | seq |
 | 8 | ClipboardText | device_id, content_id, text |
 | 9 | Goodbye | device_id, reason |
+| 10 | ClipboardImage | device_id, content_id, width u32, height u32, rgba bytes |
+
+`ClipboardImage` 的 `rgba` 为 row-major **RGBA8**，长度必须为 `width * height * 4`。
 
 所有业务消息在类型上携带或保留 `DeviceId`，便于以后扩展；**运行时 MVP 仅 1 peer**。
 
@@ -50,7 +57,7 @@
 
 - QUIC / 公网中继
 - 加密套件定稿（见 open-questions Q7）
-- 文件分片 / 图片
+- 文件分片 / 按需拉文件
 - 多 peer 网格
 
 ## 传输（task-006）
@@ -60,12 +67,11 @@
 - 实现：`m590_net::TcpFrameStream`；daemon 命令：`listen` / `connect`
 - 配对：host listen 持有 pairing code；joiner connect 发送 Hello + PairRequest
 - 文本：Connected 后发送 `ClipboardText`；接收方可写 OS 剪贴板
-
+- 图片（task-014）：Connected 后发送 `ClipboardImage`；超限则日志 skip，不分片
 
 ## 运行时硬化（task-007）
 
 - **心跳**：Connected 后定期 `Heartbeat` / `HeartbeatAck`；连续未 ack 达到阈值则会话视为 peer suspect
 - **空闲**：长时间无任何对端帧则超时断开
-- **content_id 去重**：同一 id 只应用一次（收发两侧）
-- **回环抑制**：与最近一次剪贴板文本相同则不再发送
-- **跨机实机验证**：延期到有 UI 后
+- **content_id 去重**：同一 id 只应用一次（收发两侧，文本与图片共用）
+- **回环抑制**：与最近一次剪贴板文本/图片指纹相同则不再发送

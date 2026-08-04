@@ -1,7 +1,7 @@
 //! Platform clipboard abstraction.
 //!
-//! - Linux (task-004): text read / write / poll-watch via `arboard`
-//! - Windows (task-005): same API surface via `arboard` + Win32
+//! - Linux (task-004/014): text + image read / write / poll-watch via `arboard`
+//! - Windows (task-005/014): same API surface via `arboard` + Win32
 //!
 //! Linux strategy (Q4):
 //! - Prefer Wayland when `WAYLAND_DISPLAY` is set
@@ -53,6 +53,49 @@ impl TextClipboard {
     }
 }
 
+/// Image clipboard payload (raw RGBA8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageClipboard {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl ImageClipboard {
+    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self, ClipboardError> {
+        if width == 0 || height == 0 {
+            return Err(ClipboardError::Backend(
+                "image dimensions must be non-zero".into(),
+            ));
+        }
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| ClipboardError::Backend("image dimensions overflow".into()))?;
+        if rgba.len() != expected {
+            return Err(ClipboardError::Backend(format!(
+                "rgba length mismatch: got {} expected {expected}",
+                rgba.len()
+            )));
+        }
+        Ok(Self {
+            width,
+            height,
+            rgba,
+        })
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.width.hash(&mut hasher);
+        self.height.hash(&mut hasher);
+        self.rgba.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 /// Trait boundary for clipboard backends.
 pub trait ClipboardService {
     fn backend(&self) -> ClipboardBackend;
@@ -69,6 +112,24 @@ pub trait ClipboardService {
     /// First baseline is captured on `open` (and refreshed after successful writes
     /// from this handle when using [`PlatformClipboard`]).
     fn poll_text_change(&mut self) -> Result<Option<String>, ClipboardError>;
+
+    /// Read current image. `Ok(None)` means no image content.
+    fn read_image(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
+        let _ = self;
+        Ok(None)
+    }
+
+    /// Replace clipboard image.
+    fn write_image(&mut self, image: &ImageClipboard) -> Result<(), ClipboardError> {
+        let _ = image;
+        Err(ClipboardError::UnsupportedPlatform)
+    }
+
+    /// Poll for image change since open / last poll / last local write.
+    fn poll_image_change(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
+        let _ = self;
+        Ok(None)
+    }
 }
 
 /// No-op clipboard used in tests and headless demos.
@@ -76,6 +137,8 @@ pub trait ClipboardService {
 pub struct NullClipboard {
     text: Option<String>,
     last_seen: Option<String>,
+    image: Option<ImageClipboard>,
+    last_image_fp: Option<u64>,
 }
 
 impl NullClipboard {
@@ -103,6 +166,26 @@ impl ClipboardService for NullClipboard {
         if self.text != self.last_seen {
             self.last_seen = self.text.clone();
             Ok(self.text.clone())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn read_image(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
+        Ok(self.image.clone())
+    }
+
+    fn write_image(&mut self, image: &ImageClipboard) -> Result<(), ClipboardError> {
+        self.image = Some(image.clone());
+        self.last_image_fp = Some(image.fingerprint());
+        Ok(())
+    }
+
+    fn poll_image_change(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
+        let fp = self.image.as_ref().map(|img| img.fingerprint());
+        if fp != self.last_image_fp {
+            self.last_image_fp = fp;
+            Ok(self.image.clone())
         } else {
             Ok(None)
         }
@@ -203,6 +286,40 @@ impl ClipboardService for PlatformClipboard {
             Err(ClipboardError::UnsupportedPlatform)
         }
     }
+
+    fn read_image(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.read_image()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Err(ClipboardError::UnsupportedPlatform)
+        }
+    }
+
+    fn write_image(&mut self, image: &ImageClipboard) -> Result<(), ClipboardError> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.write_image(image)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = image;
+            Err(ClipboardError::UnsupportedPlatform)
+        }
+    }
+
+    fn poll_image_change(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.poll_image_change()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Err(ClipboardError::UnsupportedPlatform)
+        }
+    }
 }
 
 /// Backends compiled into this build (not necessarily usable at runtime).
@@ -240,6 +357,14 @@ mod tests {
         clip.text = Some("external".into());
         assert_eq!(clip.poll_text_change().unwrap().as_deref(), Some("external"));
         assert_eq!(clip.poll_text_change().unwrap(), None);
+
+        let img = ImageClipboard::from_rgba(1, 1, vec![1, 2, 3, 255]).unwrap();
+        clip.write_image(&img).unwrap();
+        assert_eq!(clip.read_image().unwrap(), Some(img.clone()));
+        assert_eq!(clip.poll_image_change().unwrap(), None);
+        let img2 = ImageClipboard::from_rgba(1, 1, vec![9, 8, 7, 255]).unwrap();
+        clip.image = Some(img2.clone());
+        assert_eq!(clip.poll_image_change().unwrap(), Some(img2));
     }
 
     #[test]

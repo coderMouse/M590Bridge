@@ -423,6 +423,27 @@ fn run_bridge(
                                 }
                             }
                         }
+                        Some(InboundClipboardResult::AppliedImage {
+                            content_id,
+                            width,
+                            height,
+                            rgba,
+                        }) => {
+                            println!(
+                                "sync_rx_image content_id={content_id} {width}x{height} bytes={}",
+                                rgba.len()
+                            );
+                            if let Some(clip) = clipboard.as_mut() {
+                                match m590_clipboard::ImageClipboard::from_rgba(width, height, rgba)
+                                {
+                                    Ok(image) => match clip.write_image(&image) {
+                                        Ok(()) => println!("clipboard_write_image=ok"),
+                                        Err(err) => println!("clipboard_write_image=error {err}"),
+                                    },
+                                    Err(err) => println!("clipboard_write_image=error {err}"),
+                                }
+                            }
+                        }
                         Some(InboundClipboardResult::DuplicateContentId) => {
                             println!("sync_rx=duplicate_content_id");
                         }
@@ -464,12 +485,57 @@ fn run_bridge(
                             Ok(QueueClipboardResult::UnchangedText) => {
                                 println!("clipboard_poll=skip_echo len={}", text.len());
                             }
+                            Ok(QueueClipboardResult::UnchangedImage)
+                            | Ok(QueueClipboardResult::ImageTooLarge { .. }) => {
+                                println!("sync_tx=skip unexpected_image_result_on_text");
+                            }
                             Err(err) => println!("sync_tx=error {err}"),
                         }
                     }
                 }
                 Ok(None) => {}
                 Err(err) => println!("clipboard_poll=error {err}"),
+            }
+
+            match clip.poll_image_change() {
+                Ok(Some(image)) => {
+                    if session.state() == ConnectionState::Connected {
+                        content_seq += 1;
+                        let cid = format!("clip-img-{}-{content_seq}", process::id());
+                        match session.queue_clipboard_image(
+                            cid,
+                            image.width,
+                            image.height,
+                            image.rgba,
+                        ) {
+                            Ok(QueueClipboardResult::Queued) => {
+                                let out = session.take_outbox();
+                                conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+                                println!(
+                                    "sync_tx_image {}x{}",
+                                    image.width, image.height
+                                );
+                            }
+                            Ok(QueueClipboardResult::DuplicateContentId) => {
+                                println!("sync_tx_image=skip duplicate_content_id");
+                            }
+                            Ok(QueueClipboardResult::UnchangedImage) => {
+                                println!("clipboard_poll_image=skip_echo");
+                            }
+                            Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                println!(
+                                    "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
+                                );
+                            }
+                            Ok(QueueClipboardResult::UnchangedText) => {
+                                println!("sync_tx_image=skip unexpected_text_result");
+                            }
+                            Err(err) => println!("sync_tx_image=error {err}"),
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => println!("clipboard_poll_image=error {err}"),
             }
         }
 

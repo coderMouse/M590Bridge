@@ -34,9 +34,61 @@ impl ClipboardTextPayload {
     }
 }
 
-/// Application messages for pairing, heartbeat, and text clipboard sync.
+/// Image clipboard payload (raw RGBA, row-major) carried inline on the wire.
 ///
-/// File transfer messages are intentionally omitted (V2+).
+/// Large images may exceed the frame payload limit and should be skipped by the sender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardImagePayload {
+    pub device_id: DeviceId,
+    pub content_id: String,
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 4` bytes, RGBA8.
+    pub rgba: Vec<u8>,
+}
+
+impl ClipboardImagePayload {
+    pub fn new(
+        device_id: DeviceId,
+        content_id: impl Into<String>,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> Result<Self, ProtocolError> {
+        if device_id.as_str().is_empty() {
+            return Err(ProtocolError::EmptyDeviceId);
+        }
+        let content_id = content_id.into();
+        if content_id.is_empty() {
+            return Err(ProtocolError::EmptyContentId);
+        }
+        if width == 0 || height == 0 {
+            return Err(ProtocolError::InvalidImage("dimensions must be non-zero"));
+        }
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(ProtocolError::InvalidImage("dimensions overflow"))?;
+        if rgba.len() != expected {
+            return Err(ProtocolError::InvalidImage("rgba length mismatch"));
+        }
+        Ok(Self {
+            device_id,
+            content_id,
+            width,
+            height,
+            rgba,
+        })
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.rgba.len()
+    }
+}
+
+/// Application messages for pairing, heartbeat, and clipboard sync.
+///
+/// File transfer messages are intentionally omitted (later V2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// Initial hello from a device.
@@ -67,6 +119,8 @@ pub enum Message {
     HeartbeatAck { seq: u64 },
     /// MVP text clipboard sync.
     ClipboardText(ClipboardTextPayload),
+    /// V2 image clipboard sync (inline RGBA).
+    ClipboardImage(ClipboardImagePayload),
     /// Graceful teardown.
     Goodbye {
         device_id: DeviceId,
@@ -137,6 +191,10 @@ impl Message {
         Self::ClipboardText(payload)
     }
 
+    pub fn clipboard_image(payload: ClipboardImagePayload) -> Self {
+        Self::ClipboardImage(payload)
+    }
+
     pub fn goodbye(device_id: DeviceId, reason: impl Into<String>) -> Result<Self, ProtocolError> {
         validate_device(&device_id)?;
         Ok(Self::Goodbye {
@@ -155,6 +213,7 @@ impl Message {
             Self::Heartbeat { .. } => "heartbeat",
             Self::HeartbeatAck { .. } => "heartbeat_ack",
             Self::ClipboardText(_) => "clipboard_text",
+            Self::ClipboardImage(_) => "clipboard_image",
             Self::Goodbye { .. } => "goodbye",
         }
     }
@@ -182,5 +241,24 @@ mod tests {
     fn clipboard_payload_requires_content_id() {
         let err = ClipboardTextPayload::new(DeviceId::new("a"), "", "hi").unwrap_err();
         assert_eq!(err, ProtocolError::EmptyContentId);
+    }
+
+    #[test]
+    fn rejects_bad_image_rgba_len() {
+        let err = ClipboardImagePayload::new(DeviceId::new("a"), "c1", 1, 1, vec![0, 0, 0]).unwrap_err();
+        assert_eq!(err, ProtocolError::InvalidImage("rgba length mismatch"));
+    }
+
+    #[test]
+    fn accepts_tiny_image() {
+        let img = ClipboardImagePayload::new(
+            DeviceId::new("a"),
+            "c1",
+            1,
+            1,
+            vec![1, 2, 3, 255],
+        )
+        .unwrap();
+        assert_eq!(img.byte_len(), 4);
     }
 }

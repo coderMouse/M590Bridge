@@ -701,16 +701,36 @@ fn run_session_loop(
                     last_peer_rx = Instant::now();
                     conn.send_all(session.take_outbox().iter())
                         .map_err(|e| e.to_string())?;
-                    if let Some(InboundClipboardResult::Applied { content_id, text }) =
-                        session.take_inbound_clipboard()
-                    {
-                        with_status(&shared, |s| {
-                            s.last_sync_text = Some(text.clone());
-                            s.last_sync_content_id = Some(content_id);
-                        });
-                        if let Some(clip) = clipboard.as_mut() {
-                            let _ = clip.write_text(&text);
+                    match session.take_inbound_clipboard() {
+                        Some(InboundClipboardResult::Applied { content_id, text }) => {
+                            with_status(&shared, |s| {
+                                s.last_sync_text = Some(text.clone());
+                                s.last_sync_content_id = Some(content_id);
+                            });
+                            if let Some(clip) = clipboard.as_mut() {
+                                let _ = clip.write_text(&text);
+                            }
                         }
+                        Some(InboundClipboardResult::AppliedImage {
+                            content_id,
+                            width,
+                            height,
+                            rgba,
+                        }) => {
+                            with_status(&shared, |s| {
+                                s.last_sync_content_id = Some(content_id);
+                                s.last_sync_text =
+                                    Some(format!("[image {width}x{height} {}B]", rgba.len()));
+                            });
+                            if let Some(clip) = clipboard.as_mut() {
+                                if let Ok(image) =
+                                    m590_clipboard::ImageClipboard::from_rgba(width, height, rgba)
+                                {
+                                    let _ = clip.write_image(&image);
+                                }
+                            }
+                        }
+                        Some(InboundClipboardResult::DuplicateContentId) | None => {}
                     }
                 }
                 Ok(None) => break,
@@ -720,9 +740,9 @@ fn run_session_loop(
         }
 
         if let Some(clip) = clipboard.as_mut() {
-            if let Ok(Some(text)) = clip.poll_text_change() {
-                let auto = with_status(&shared, |s| s.auto_sync);
-                if auto {
+            let auto = with_status(&shared, |s| s.auto_sync);
+            if auto {
+                if let Ok(Some(text)) = clip.poll_text_change() {
                     content_seq += 1;
                     let cid = format!("ui-clip-{}-{content_seq}", std::process::id());
                     if let Ok(QueueClipboardResult::Queued) =
@@ -733,6 +753,36 @@ fn run_session_loop(
                         with_status(&shared, |s| {
                             s.last_sync_text = Some(text);
                         });
+                    }
+                }
+                if let Ok(Some(image)) = clip.poll_image_change() {
+                    content_seq += 1;
+                    let cid = format!("ui-clip-img-{}-{content_seq}", std::process::id());
+                    let summary = format!(
+                        "[image {}x{} {}B]",
+                        image.width,
+                        image.height,
+                        image.rgba.len()
+                    );
+                    match session.queue_clipboard_image(
+                        cid,
+                        image.width,
+                        image.height,
+                        image.rgba,
+                    ) {
+                        Ok(QueueClipboardResult::Queued) => {
+                            conn.send_all(session.take_outbox().iter())
+                                .map_err(|e| e.to_string())?;
+                            with_status(&shared, |s| {
+                                s.last_sync_text = Some(summary);
+                            });
+                        }
+                        Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                            eprintln!(
+                                "m590-hub: skip oversized image bytes={byte_len} limit={limit}"
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }

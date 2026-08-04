@@ -84,6 +84,16 @@ mod tests {
             Message::clipboard_text(
                 ClipboardTextPayload::new(DeviceId::new("a"), "cid-1", "你好 clipboard").unwrap(),
             ),
+            Message::clipboard_image(
+                m590_core::ClipboardImagePayload::new(
+                    DeviceId::new("a"),
+                    "img-1",
+                    1,
+                    1,
+                    vec![10, 20, 30, 255],
+                )
+                .unwrap(),
+            ),
             Message::goodbye(DeviceId::new("a"), "bye").unwrap(),
         ];
 
