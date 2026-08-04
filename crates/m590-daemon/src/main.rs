@@ -348,6 +348,10 @@ fn run_bridge(
         }
     }
 
+    if let Some(clip) = clipboard.as_mut() {
+        clip.prime_poll_to_emit_current();
+    }
+
     // Sync loop: network + heartbeat + optional OS clipboard poll.
     loop {
         check_timeout(cfg, started, "sync")?;
@@ -468,6 +472,38 @@ fn run_bridge(
 
         // Poll local clipboard for outbound changes.
         if let Some(clip) = clipboard.as_mut() {
+            // Prefer file-list (Nautilus/Explorer copy) over plain text path heuristics.
+            match clip.poll_file_list_change() {
+                Ok(Some(paths)) => {
+                    if session.state() == ConnectionState::Connected {
+                        if let Ok(Some(image)) = m590_clipboard::image_from_paths(&paths) {
+                            content_seq += 1;
+                            let cid = format!("clip-imgfiles-{}-{content_seq}", process::id());
+                            let w = image.width;
+                            let h = image.height;
+                            match session.queue_clipboard_image(cid, w, h, image.rgba) {
+                                Ok(QueueClipboardResult::Queued) => {
+                                    let out = session.take_outbox();
+                                    conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+                                    println!("sync_tx_image_from_file_list {w}x{h}");
+                                }
+                                Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                    println!(
+                                        "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(err) => println!("sync_tx_image=error {err}"),
+                            }
+                        } else if !paths.is_empty() {
+                            println!("clipboard_files={paths:?} (no image decoded)");
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => println!("clipboard_files_poll=error {err}"),
+            }
+
             match clip.poll_text_change() {
                 Ok(Some(text)) => {
                     if session.state() == ConnectionState::Connected {

@@ -25,7 +25,7 @@ mod linux;
 mod windows;
 
 pub use error::ClipboardError;
-pub use image_file::{image_from_clipboard_text, load_image_file};
+pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
 
 /// Which OS/display backend is selected or available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +132,31 @@ pub trait ClipboardService {
         let _ = self;
         Ok(None)
     }
+
+    /// Read file paths currently offered by the clipboard (file manager copy).
+    fn read_file_list(&mut self) -> Result<Vec<std::path::PathBuf>, ClipboardError> {
+        let _ = self;
+        Ok(Vec::new())
+    }
+
+    /// Poll for file-list change since open / last poll.
+    ///
+    /// Returns `Ok(Some(paths))` when the list changed (including to empty).
+    /// Callers typically care about non-empty image paths.
+    fn poll_file_list_change(
+        &mut self,
+    ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+        let _ = self;
+        Ok(None)
+    }
+
+    /// Drop poll baselines so the next poll reports the *current* clipboard once.
+    ///
+    /// Useful right after a session becomes Connected (baselines may have been
+    /// captured during pairing and would otherwise hide an already-copied image).
+    fn prime_poll_to_emit_current(&mut self) {
+        let _ = self;
+    }
 }
 
 /// No-op clipboard used in tests and headless demos.
@@ -141,6 +166,8 @@ pub struct NullClipboard {
     last_seen: Option<String>,
     image: Option<ImageClipboard>,
     last_image_fp: Option<u64>,
+    files: Vec<std::path::PathBuf>,
+    last_files: Vec<std::path::PathBuf>,
 }
 
 impl NullClipboard {
@@ -191,6 +218,27 @@ impl ClipboardService for NullClipboard {
         } else {
             Ok(None)
         }
+    }
+
+    fn read_file_list(&mut self) -> Result<Vec<std::path::PathBuf>, ClipboardError> {
+        Ok(self.files.clone())
+    }
+
+    fn poll_file_list_change(
+        &mut self,
+    ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+        if self.files != self.last_files {
+            self.last_files = self.files.clone();
+            Ok(Some(self.files.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn prime_poll_to_emit_current(&mut self) {
+        self.last_seen = None;
+        self.last_image_fp = None;
+        self.last_files.clear();
     }
 }
 
@@ -322,6 +370,37 @@ impl ClipboardService for PlatformClipboard {
             Err(ClipboardError::UnsupportedPlatform)
         }
     }
+
+    fn read_file_list(&mut self) -> Result<Vec<std::path::PathBuf>, ClipboardError> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.read_file_list()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Err(ClipboardError::UnsupportedPlatform)
+        }
+    }
+
+    fn poll_file_list_change(
+        &mut self,
+    ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.poll_file_list_change()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Err(ClipboardError::UnsupportedPlatform)
+        }
+    }
+
+    fn prime_poll_to_emit_current(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.prime_poll_to_emit_current();
+        }
+    }
 }
 
 /// Backends compiled into this build (not necessarily usable at runtime).
@@ -367,6 +446,13 @@ mod tests {
         let img2 = ImageClipboard::from_rgba(1, 1, vec![9, 8, 7, 255]).unwrap();
         clip.image = Some(img2.clone());
         assert_eq!(clip.poll_image_change().unwrap(), Some(img2));
+
+        clip.files = vec![std::path::PathBuf::from("/tmp/a.png")];
+        assert_eq!(
+            clip.poll_file_list_change().unwrap(),
+            Some(vec![std::path::PathBuf::from("/tmp/a.png")])
+        );
+        assert_eq!(clip.poll_file_list_change().unwrap(), None);
     }
 
     #[test]

@@ -17,6 +17,7 @@ Linux + Windows 文本剪贴板同步 MVP；托盘常驻；参数可记住、断
 - [x] **task-013** Windows 构建/运行 `m590-ui` 并联调通过（用户实机确认）
 - [x] **task-014** 图片剪贴板同步（小图内联 RGBA）
 - [x] **task-015** 本地图片文件路径提升为图片同步
+- [x] **task-016** 文件管理器 file_list + Wayland 图片同步
 
 ## 进行中
 

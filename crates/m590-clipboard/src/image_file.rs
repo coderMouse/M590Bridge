@@ -13,6 +13,20 @@ const IMAGE_EXTS: &[&str] = &[
 /// - absolute/relative filesystem paths
 /// - `file://` URIs (single or first line)
 /// - simple multi-line paste where one line is a path/URI
+/// Load the first existing local image among `paths`.
+pub fn image_from_paths(paths: &[std::path::PathBuf]) -> Result<Option<ImageClipboard>, ClipboardError> {
+    for path in paths {
+        if !is_likely_image_path(path) {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        return Ok(Some(load_image_file(path)?));
+    }
+    Ok(None)
+}
+
 pub fn image_from_clipboard_text(text: &str) -> Result<Option<ImageClipboard>, ClipboardError> {
     for candidate in candidate_paths(text) {
         if !is_likely_image_path(&candidate) {

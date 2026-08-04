@@ -649,6 +649,12 @@ fn run_session_loop(
         s.reconnect_attempt = 0;
     });
 
+    // Pairing may have taken seconds; re-arm polls so an already-copied image file
+    // is observed once after Connected (instead of being treated as baseline).
+    if let Some(clip) = clipboard.as_mut() {
+        clip.prime_poll_to_emit_current();
+    }
+
     loop {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             let _ = session.handle(SessionEvent::Disconnect);
@@ -742,6 +748,40 @@ fn run_session_loop(
         if let Some(clip) = clipboard.as_mut() {
             let auto = with_status(&shared, |s| s.auto_sync);
             if auto {
+                // File-manager copies expose text/uri-list (file_list), not plain text/image.
+                if let Ok(Some(paths)) = clip.poll_file_list_change() {
+                    if let Ok(Some(image)) = m590_clipboard::image_from_paths(&paths) {
+                        content_seq += 1;
+                        let cid =
+                            format!("ui-clip-imgfiles-{}-{content_seq}", std::process::id());
+                        let summary = format!(
+                            "[image {}x{} {}B from file]",
+                            image.width,
+                            image.height,
+                            image.rgba.len()
+                        );
+                        match session.queue_clipboard_image(
+                            cid,
+                            image.width,
+                            image.height,
+                            image.rgba,
+                        ) {
+                            Ok(QueueClipboardResult::Queued) => {
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|e| e.to_string())?;
+                                with_status(&shared, |s| {
+                                    s.last_sync_text = Some(summary);
+                                });
+                            }
+                            Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                eprintln!(
+                                    "m590-hub: skip oversized image-from-file-list bytes={byte_len} limit={limit}"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if let Ok(Some(text)) = clip.poll_text_change() {
                     content_seq += 1;
                     // File-manager "copy image file" often only places a path/URI as text.

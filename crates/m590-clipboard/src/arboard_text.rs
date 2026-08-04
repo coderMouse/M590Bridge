@@ -75,3 +75,22 @@ pub(crate) fn write_image_raw(
         .set_image(data)
         .map_err(|e| ClipboardError::Backend(e.to_string()))
 }
+
+pub(crate) fn read_file_list_raw(
+    clipboard: &mut arboard::Clipboard,
+) -> Result<Vec<std::path::PathBuf>, ClipboardError> {
+    match clipboard.get().file_list() {
+        Ok(paths) => Ok(paths),
+        Err(arboard::Error::ContentNotAvailable) => Ok(Vec::new()),
+        Err(arboard::Error::ClipboardNotSupported) => Err(ClipboardError::NoDisplay),
+        Err(other) => {
+            let msg = other.to_string();
+            let lower = msg.to_lowercase();
+            if lower.contains("not available") || lower.contains("empty") {
+                Ok(Vec::new())
+            } else {
+                Err(ClipboardError::Backend(msg))
+            }
+        }
+    }
+}
