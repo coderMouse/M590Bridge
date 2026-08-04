@@ -1,0 +1,19 @@
+[package]
+name = "m590-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "M590Bridge background service binary and embeddable hub"
+
+[lib]
+name = "m590_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "m590-daemon"
+path = "src/main.rs"
+
+[dependencies]
+m590-core = { workspace = true }
+m590-clipboard = { workspace = true }
+m590-net = { workspace = true }

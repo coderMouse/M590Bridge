@@ -1,0 +1,304 @@
+//! TCP transport for length-prefixed protocol frames (std only, no async runtime).
+
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+use m590_core::Message;
+
+use crate::frame::{encode_frame, try_decode_frame, FrameError, FRAME_HEADER_LEN, MAX_PAYLOAD_LEN};
+
+/// Errors from TCP framed I/O.
+#[derive(Debug)]
+pub enum TcpError {
+    Io(io::Error),
+    Frame(FrameError),
+    InvalidAddr(String),
+    Disconnected,
+}
+
+impl std::fmt::Display for TcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "tcp io error: {err}"),
+            Self::Frame(err) => write!(f, "tcp frame error: {err}"),
+            Self::InvalidAddr(msg) => write!(f, "invalid address: {msg}"),
+            Self::Disconnected => write!(f, "peer disconnected"),
+        }
+    }
+}
+
+impl std::error::Error for TcpError {}
+
+impl From<io::Error> for TcpError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<FrameError> for TcpError {
+    fn from(value: FrameError) -> Self {
+        Self::Frame(value)
+    }
+}
+
+/// Bidirectional TCP stream that speaks M590 frames.
+pub struct TcpFrameStream {
+    stream: TcpStream,
+    buffer: Vec<u8>,
+}
+
+impl TcpFrameStream {
+    pub fn from_stream(stream: TcpStream) -> io::Result<Self> {
+        stream.set_nodelay(true)?;
+        Ok(Self {
+            stream,
+            buffer: Vec::with_capacity(4096),
+        })
+    }
+
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    pub fn send(&mut self, message: &Message) -> Result<(), TcpError> {
+        let bytes = encode_frame(message)?;
+        self.stream.write_all(&bytes)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    pub fn send_all<'a, I>(&mut self, messages: I) -> Result<(), TcpError>
+    where
+        I: IntoIterator<Item = &'a Message>,
+    {
+        for message in messages {
+            self.send(message)?;
+        }
+        Ok(())
+    }
+
+    /// Blocking read of the next complete frame.
+    pub fn recv(&mut self) -> Result<Message, TcpError> {
+        self.set_nonblocking(false)?;
+        loop {
+            if let Some(msg) = self.try_decode_buffered()? {
+                return Ok(msg);
+            }
+            self.read_more_blocking()?;
+        }
+    }
+
+    /// Non-blocking style: return `Ok(None)` if no complete frame is ready yet.
+    pub fn try_recv(&mut self) -> Result<Option<Message>, TcpError> {
+        // Fill from socket without blocking forever.
+        self.set_nonblocking(true)?;
+        match self.read_more_nonblocking() {
+            Ok(()) => {}
+            Err(TcpError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(TcpError::Io(err)) if err.kind() == io::ErrorKind::TimedOut => {}
+            Err(err) => return Err(err),
+        }
+        self.try_decode_buffered()
+    }
+
+    fn try_decode_buffered(&mut self) -> Result<Option<Message>, TcpError> {
+        match try_decode_frame(&self.buffer)? {
+            None => Ok(None),
+            Some((msg, consumed)) => {
+                self.buffer.drain(..consumed);
+                Ok(Some(msg))
+            }
+        }
+    }
+
+    fn read_more_blocking(&mut self) -> Result<(), TcpError> {
+        let mut chunk = [0u8; 4096];
+        let n = self.stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(TcpError::Disconnected);
+        }
+        self.buffer.extend_from_slice(&chunk[..n]);
+        if self.buffer.len() > FRAME_HEADER_LEN + MAX_PAYLOAD_LEN {
+            return Err(TcpError::Frame(FrameError::PayloadTooLarge(self.buffer.len())));
+        }
+        Ok(())
+    }
+
+    fn read_more_nonblocking(&mut self) -> Result<(), TcpError> {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return Err(TcpError::Disconnected),
+                Ok(n) => {
+                    self.buffer.extend_from_slice(&chunk[..n]);
+                    if self.buffer.len() > FRAME_HEADER_LEN + MAX_PAYLOAD_LEN {
+                        return Err(TcpError::Frame(FrameError::PayloadTooLarge(self.buffer.len())));
+                    }
+                    // Keep reading while the kernel buffer drains; exit on WouldBlock.
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => return Ok(()),
+                Err(err) => return Err(TcpError::Io(err)),
+            }
+        }
+    }
+}
+
+/// Bind a TCP listener (dual-stack as provided by OS default).
+pub fn listen_on(addr: impl ToSocketAddrs) -> Result<TcpListener, TcpError> {
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(false)?;
+    Ok(listener)
+}
+
+/// Accept one client and wrap as framed stream.
+pub fn accept_framed(listener: &TcpListener) -> Result<TcpFrameStream, TcpError> {
+    let (stream, _peer) = listener.accept()?;
+    Ok(TcpFrameStream::from_stream(stream)?)
+}
+
+/// Dial a remote framed peer.
+pub fn connect_framed(addr: impl ToSocketAddrs) -> Result<TcpFrameStream, TcpError> {
+    let stream = TcpStream::connect(addr)?;
+    Ok(TcpFrameStream::from_stream(stream)?)
+}
+
+/// Parse `host:port` (IPv4/hostname). IPv6 with brackets not required for MVP.
+pub fn parse_socket_addr(input: &str) -> Result<std::net::SocketAddr, TcpError> {
+    input
+        .to_socket_addrs()
+        .map_err(|e| TcpError::InvalidAddr(e.to_string()))?
+        .next()
+        .ok_or_else(|| TcpError::InvalidAddr(format!("could not resolve {input}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use m590_core::{
+        ClipboardTextPayload, ConnectionState, DeviceId, Message, Session, SessionEvent,
+    };
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn exchange_until_connected(
+        session: &mut Session,
+        conn: &mut TcpFrameStream,
+        label: &str,
+        deadline: Instant,
+    ) {
+        while session.state() != ConnectionState::Connected {
+            assert!(Instant::now() < deadline, "{label} pairing timeout state={:?}", session.state());
+            conn.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            match conn.recv() {
+                Ok(msg) => {
+                    session.handle(SessionEvent::Message(msg)).unwrap();
+                    let out = session.take_outbox();
+                    conn.send_all(out.iter()).unwrap();
+                }
+                Err(TcpError::Io(err))
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(err) => panic!("{label} recv failed: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_loopback_pairs_and_syncs_clipboard_text() {
+        let listener = listen_on("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut host_conn = accept_framed(&listener).unwrap();
+            let mut host = Session::new(DeviceId::new("host")).unwrap();
+            host.handle(SessionEvent::StartPairing {
+                expected_code: "999888".into(),
+            })
+            .unwrap();
+            let _ = host.take_outbox();
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            exchange_until_connected(&mut host, &mut host_conn, "host", deadline);
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                assert!(Instant::now() < deadline, "host clipboard timeout");
+                host_conn
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
+                match host_conn.recv() {
+                    Ok(msg) => {
+                        host.handle(SessionEvent::Message(msg)).unwrap();
+                        host_conn.send_all(host.take_outbox().iter()).unwrap();
+                        if host.snapshot().last_clipboard_text.as_deref() == Some("tcp-hello") {
+                            break;
+                        }
+                    }
+                    Err(TcpError::Io(err))
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(err) => panic!("host clipboard recv failed: {err}"),
+                }
+            }
+            host.snapshot().last_clipboard_text
+        });
+
+        // Ensure accept is ready.
+        thread::sleep(Duration::from_millis(100));
+        let mut joiner_conn = connect_framed(addr).unwrap();
+        let mut joiner = Session::new(DeviceId::new("joiner")).unwrap();
+        joiner
+            .handle(SessionEvent::StartPairing {
+                expected_code: "999888".into(),
+            })
+            .unwrap();
+        let out = joiner.take_outbox();
+        assert!(out.len() >= 2, "joiner should emit hello+pair_request");
+        joiner_conn.send_all(out.iter()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        exchange_until_connected(&mut joiner, &mut joiner_conn, "joiner", deadline);
+
+        joiner.queue_clipboard_text("cid-tcp", "tcp-hello").unwrap();
+        joiner_conn
+            .send_all(joiner.take_outbox().iter())
+            .unwrap();
+
+        let got = server.join().expect("host thread panicked");
+        assert_eq!(got.as_deref(), Some("tcp-hello"));
+    }
+
+    #[test]
+    fn tcp_frame_roundtrip_single_message() {
+        let listener = listen_on("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut conn = accept_framed(&listener).unwrap();
+            conn.recv().unwrap()
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut client = connect_framed(addr).unwrap();
+        let msg = Message::clipboard_text(
+            ClipboardTextPayload::new(DeviceId::new("a"), "c", "ping").unwrap(),
+        );
+        client.send(&msg).unwrap();
+        assert_eq!(server.join().unwrap(), msg);
+    }
+}

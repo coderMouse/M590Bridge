@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/m590-core",
+    "crates/m590-clipboard",
+    "crates/m590-net",
+    "crates/m590-daemon",
+    "ui/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["M590Bridge"]
+repository = "https://github.com/local/M590Bridge"
+
+[workspace.dependencies]
+m590-core = { path = "crates/m590-core" }
+m590-clipboard = { path = "crates/m590-clipboard" }
+m590-net = { path = "crates/m590-net" }

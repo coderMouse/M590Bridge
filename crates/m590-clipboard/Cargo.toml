@@ -1,0 +1,12 @@
+[package]
+name = "m590-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform clipboard abstraction for M590Bridge (Linux + Windows text)"
+
+[dependencies]
+m590-core = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+arboard = { version = "3", default-features = false }

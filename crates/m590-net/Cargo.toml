@@ -1,0 +1,9 @@
+[package]
+name = "m590-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LAN transport and pairing protocol placeholders for M590Bridge"
+
+[dependencies]
+m590-core = { workspace = true }

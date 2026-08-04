@@ -1,0 +1,41 @@
+# Local agent environment (machine-specific, do not commit)
+.agent/local-environment.md
+.agent/*.local.md
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Build / dist
+/dist/
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs & temp
+*.log
+/tmp/
+.cache/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Node / UI
+node_modules/
+ui/dist/
+ui/.vite/
+*.tsbuildinfo

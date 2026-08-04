@@ -1,0 +1,150 @@
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --font-size: 14px;
+  --background: #F5F7FA;
+  --foreground: #1A2030;
+  --card: #FFFFFF;
+  --card-foreground: #1A2030;
+  --popover: #FFFFFF;
+  --popover-foreground: #1A2030;
+  --primary: #2563EB;
+  --primary-foreground: #FFFFFF;
+  --secondary: #EEF2F8;
+  --secondary-foreground: #1A2030;
+  --muted: #F1F4F7;
+  --muted-foreground: #6B7589;
+  --accent: #DBEAFE;
+  --accent-foreground: #1D4ED8;
+  --destructive: #DC2626;
+  --destructive-foreground: #FFFFFF;
+  --border: rgba(0, 0, 0, 0.08);
+  --input: transparent;
+  --input-background: #F1F4F7;
+  --switch-background: #CBD5E1;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --ring: #2563EB;
+  --radius: 0.625rem;
+  --sidebar: #FFFFFF;
+  --sidebar-foreground: #1A2030;
+  --sidebar-primary: #2563EB;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #DBEAFE;
+  --sidebar-accent-foreground: #1D4ED8;
+  --sidebar-border: rgba(0, 0, 0, 0.08);
+  --sidebar-ring: #2563EB;
+
+  --status-connected: #16A34A;
+  --status-connected-bg: #DCFCE7;
+  --status-syncing: #D97706;
+  --status-syncing-bg: #FEF3C7;
+  --status-error: #DC2626;
+  --status-error-bg: #FEE2E2;
+  --status-paused: #6B7589;
+  --status-paused-bg: #EEF2F8;
+}
+
+.dark {
+  --background: #0F1117;
+  --foreground: #E8EDF5;
+  --card: #1C2030;
+  --card-foreground: #E8EDF5;
+  --popover: #1C2030;
+  --popover-foreground: #E8EDF5;
+  --primary: #3B82F6;
+  --primary-foreground: #FFFFFF;
+  --secondary: #252D3D;
+  --secondary-foreground: #E8EDF5;
+  --muted: #1E2635;
+  --muted-foreground: #8896AC;
+  --accent: #1E3A5F;
+  --accent-foreground: #93C5FD;
+  --destructive: #EF4444;
+  --destructive-foreground: #FFFFFF;
+  --border: rgba(255, 255, 255, 0.08);
+  --input: rgba(255, 255, 255, 0.06);
+  --input-background: #252D3D;
+  --switch-background: #374151;
+  --ring: #3B82F6;
+  --sidebar: #161B27;
+  --sidebar-foreground: #E8EDF5;
+  --sidebar-primary: #3B82F6;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #1E3A5F;
+  --sidebar-accent-foreground: #93C5FD;
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+  --sidebar-ring: #3B82F6;
+  --status-connected: #22C55E;
+  --status-connected-bg: #0D2B17;
+  --status-syncing: #F59E0B;
+  --status-syncing-bg: #2A1A00;
+  --status-error: #F87171;
+  --status-error-bg: #2A0A0A;
+  --status-paused: #8896AC;
+  --status-paused-bg: #252D3D;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-switch-background: var(--switch-background);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-status-connected: var(--status-connected);
+  --color-status-connected-bg: var(--status-connected-bg);
+  --color-status-syncing: var(--status-syncing);
+  --color-status-syncing-bg: var(--status-syncing-bg);
+  --color-status-error: var(--status-error);
+  --color-status-error-bg: var(--status-error-bg);
+  --color-status-paused: var(--status-paused);
+  --color-status-paused-bg: var(--status-paused-bg);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+    margin: 0;
+  }
+
+  html {
+    font-size: var(--font-size);
+  }
+
+  button {
+    font: inherit;
+  }
+}
