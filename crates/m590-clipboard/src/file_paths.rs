@@ -15,6 +15,55 @@ fn scrub_path_string(s: &str) -> String {
         .to_string()
 }
 
+/// Directories where bare clipboard filenames (GNOME desktop icon copy) may resolve.
+pub fn file_search_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push_dir = |p: PathBuf| {
+        if p.is_dir() && !out.iter().any(|e| e == &p) {
+            out.push(p);
+        }
+    };
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        push_dir(home.join("桌面"));
+        push_dir(home.join("Desktop"));
+        // ~/.config/user-dirs.dirs XDG_DESKTOP_DIR=...
+        let user_dirs = home.join(".config/user-dirs.dirs");
+        if let Ok(contents) = fs::read_to_string(&user_dirs) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("XDG_DESKTOP_DIR=") {
+                    let val = rest.trim().trim_matches('"');
+                    let val = val.replace("$HOME", &home.to_string_lossy());
+                    if !val.is_empty() {
+                        push_dir(PathBuf::from(val));
+                    }
+                }
+            }
+        }
+        push_dir(home.join("Downloads"));
+        push_dir(home.join("下载"));
+        push_dir(home);
+    }
+    out
+}
+
+fn is_bare_filename(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return false;
+    }
+    // Reject multi-word sentences without extension-ish token.
+    if name.contains(' ') && !name.contains('.') {
+        return false;
+    }
+    true
+}
+
 fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
@@ -27,8 +76,29 @@ fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // arboard usually returns real paths; still accept file://-looking Path display.
-    normalize_path_token(&cleaned).filter(|p| p.is_file())
+    if let Some(p) = normalize_path_token(&cleaned) {
+        if p.is_file() {
+            return Some(p);
+        }
+        // Bare / relative single component → search desktop dirs.
+        if p.components().count() == 1 || is_bare_filename(&cleaned) {
+            let name = p.file_name()?.to_os_string();
+            for dir in file_search_dirs() {
+                let candidate = dir.join(&name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    } else if is_bare_filename(&cleaned) {
+        for dir in file_search_dirs() {
+            let candidate = dir.join(&cleaned);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// First existing regular file in `paths` (skips dirs / missing).
@@ -36,7 +106,7 @@ pub fn first_regular_file(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find_map(|p| resolve_existing_file(p))
 }
 
-/// If clipboard text is a local **non-image** file path/URI, return it.
+/// If clipboard text is a local **non-image** file path/URI (or bare desktop name), return it.
 pub fn regular_file_from_text(text: &str) -> Option<PathBuf> {
     for candidate in candidate_paths(text) {
         let Some(path) = resolve_existing_file(&candidate) else {
@@ -46,6 +116,31 @@ pub fn regular_file_from_text(text: &str) -> Option<PathBuf> {
             continue;
         }
         return Some(path);
+    }
+    // GNOME desktop icon copy often yields only the basename as text.
+    let trimmed = scrub_path_string(text);
+    // Single-line bare name, or last non-noise line of gnome-copied-files style.
+    let mut names: Vec<&str> = Vec::new();
+    if is_bare_filename(&trimmed) && !trimmed.contains('\n') {
+        names.push(trimmed.as_str());
+    }
+    for line in text.lines() {
+        let line = line.trim();
+        let lower = line.to_ascii_lowercase();
+        if lower == "copy" || lower == "cut" || lower.starts_with("x-special/") {
+            continue;
+        }
+        if is_bare_filename(line) {
+            names.push(line);
+        }
+    }
+    for name in names {
+        for dir in file_search_dirs() {
+            let path = dir.join(name);
+            if path.is_file() && !is_likely_image_path(&path) {
+                return Some(path);
+            }
+        }
     }
     None
 }
@@ -145,5 +240,40 @@ mod tests {
         assert!(regular_file_from_text(img.to_str().unwrap()).is_none());
         let _ = fs::remove_dir_all(p.parent().unwrap());
         let _ = fs::remove_dir_all(img.parent().unwrap());
+    }
+
+    #[test]
+    fn bare_filename_resolves_via_search_dir() {
+        let p = temp_file("desk-note.txt", b"hi");
+        let dir = p.parent().unwrap().to_path_buf();
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(dir.join(name).is_file());
+        assert!(is_bare_filename(name));
+        assert!(!is_bare_filename("hello world"));
+        assert!(!is_bare_filename("/tmp/a.txt"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bare_desktop_name_resolves_under_home_desktop() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("m590-home-{nanos}"));
+        let desk = home.join("桌面");
+        fs::create_dir_all(&desk).unwrap();
+        let file = desk.join("12.txt");
+        fs::write(&file, b"from-desktop").unwrap();
+        // SAFETY: test-only HOME override for path resolution helpers.
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let got = regular_file_from_text("12.txt");
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(got.as_ref(), Some(&file), "got={got:?}");
+        let _ = fs::remove_dir_all(home);
     }
 }

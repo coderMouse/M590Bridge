@@ -2156,6 +2156,7 @@ dependencies = [
 name = "m590-ui"
 version = "0.1.0"
 dependencies = [
+ "gtk",
  "log",
  "m590-daemon",
  "rfd",

@@ -100,13 +100,28 @@ pub(crate) fn normalize_path_token(token: &str) -> Option<PathBuf> {
         return Some(PathBuf::from(decoded));
     }
 
-    // Only treat as path if it looks like one (absolute, ./, ../, or has image ext).
+    // Absolute, relative, image-looking, or bare filename (GNOME desktop icon copy).
     let path = PathBuf::from(token);
-    if path.is_absolute() || token.starts_with('.') || is_likely_image_path(&path) {
+    if path.is_absolute()
+        || token.starts_with('.')
+        || is_likely_image_path(&path)
+        || is_bare_filename_token(token)
+    {
         Some(path)
     } else {
         None
     }
+}
+
+fn is_bare_filename_token(token: &str) -> bool {
+    if token.is_empty() || token == "." || token == ".." {
+        return false;
+    }
+    if token.contains('/') || token.contains('\\') || token.contains('\0') {
+        return false;
+    }
+    // Prefer tokens that look like files (have a dot) to avoid eating plain sentences.
+    token.contains('.')
 }
 
 pub(crate) fn is_likely_image_path(path: &Path) -> bool {

@@ -18,6 +18,7 @@ Linux + Windows 剪贴板与小文件桥；V2 文件走元数据 + 按需传输 
 - [x] **task-025** 文本路径 offer + 发送方 FileComplete 进度 done
 - [x] **task-026** GNOME Wayland 文件复制限制：拖放/选文件 + 提示
 - [x] **task-027** 原生选文件/窗口拖放 + 托盘文案保活 + 关闭焦点
+- [x] **task-028** 桌面裸文件名解析 + 托盘恢复关闭可点
 
 ## 进行中
 

@@ -34,13 +34,23 @@ fn desktop_dir() -> Option<PathBuf> {
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        // Close-to-tray uses minimize+skip_taskbar; reverse that fully on restore.
+        let _ = window.set_skip_taskbar(false);
         let _ = window.unminimize();
         let _ = window.show();
-        // Raise briefly so GNOME actually activates decorations/input.
+        // GNOME/Wayland often ignores set_focus alone after tray restore.
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(gtk_win) = window.gtk_window() {
+                use gtk::prelude::GtkWindowExt;
+                gtk_win.present();
+            }
+        }
         let _ = window.set_always_on_top(true);
         let _ = window.set_focus();
         let _ = window.set_always_on_top(false);
         let _ = window.set_focus();
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
     }
 }
 
@@ -148,9 +158,12 @@ pub fn run() {
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
-                // Close to tray instead of quitting.
+                // Close to tray: minimize + hide from taskbar.
+                // Full `hide()` on GNOME Wayland often leaves title-bar buttons unclickable
+                // until the webview is clicked first.
                 api.prevent_close();
-                let _ = window.hide();
+                let _ = window.set_skip_taskbar(true);
+                let _ = window.minimize();
             }
             WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
                 if let Some(path) = paths.into_iter().find(|p| p.is_file()) {
