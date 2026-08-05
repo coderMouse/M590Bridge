@@ -41,6 +41,38 @@ cd ui && npm run dev
 | `npm run desktop:dev` | Tauri 开发 |
 | `npm run desktop:build` | Tauri 构建 |
 
+## Ubuntu / Debian 安装包
+
+构建机需安装 Tauri Linux 依赖；托盘打包额外依赖
+`libayatana-appindicator3-dev` 提供的 `pkg-config` 元数据：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential curl file libayatana-appindicator3-dev librsvg2-dev \
+  libssl-dev libwebkit2gtk-4.1-dev libxdo-dev wget
+```
+
+从仓库根目录构建 `.deb`：
+
+```bash
+cd ui
+npm ci
+npm run desktop:build -- --bundles deb
+cd ..
+```
+
+产物位于仓库根目录的
+`target/release/bundle/deb/M590Bridge_<version>_amd64.deb`。可先检查，再安装或卸载：
+
+```bash
+dpkg-deb --info target/release/bundle/deb/M590Bridge_*_amd64.deb
+sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
+sudo apt remove m590-bridge
+```
+
+`target/` 是忽略的本机构建产物，不提交仓库。当前安装包未签名，也不包含开机自启。
+
 ## 设计来源
 
 - Figma Make / `docs/ui-spec.md`

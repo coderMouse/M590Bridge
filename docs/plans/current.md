@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-05  
-> 阶段：文本+图片+V2 文件 + mDNS；配对修复；**发现去重/刷新**（task-031）
+> 阶段：文本+图片+V2 文件 + mDNS；**Linux .deb 安装包基线已完成**（task-032）
 
 ## 目标（近期）
 
@@ -22,6 +22,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-029** mDNS 广播 + `GET /api/discover` + UI joiner 点选
 - [x] **task-030** 配对 reject/超时退出 + 错误提示；清理 smoke 配置污染
 - [x] **task-031** 发现列表按 device_id/addr 去重 + 手动刷新
+- [x] **task-032** Linux `.deb` 安装包基线
 
 ## 进行中
 
@@ -35,7 +36,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | V2 · 图片 | 图片剪贴板双向 | **已完成** |
 | V2 · 文件 | 元数据 + 按需 + 进度 | **基本可用**（≤4MiB；无文件夹/OS 桌面粘贴） |
 | V3 · mDNS | 局域网发现 | **第一刀完成**（task-029） |
-| V3 · 安装 | 安装包/自启 | 未做 |
+| V3 · 安装 | 安装包/自启 | **Linux `.deb` 第一刀完成**；Windows/自启未做 |
 
 ### 明确取消
 
@@ -57,13 +58,15 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | UI 拖入/原生选文件发送 | **有**（task-026/027） |
 | 托盘菜单文案保活 | **有**（task-027） |
 | mDNS 发现（`_m590bridge._tcp`） | **有**（task-029；仍需配对码） |
+| Linux `.deb` 安装包 | **有**（task-032；amd64、未签名） |
 | 设置「发现方式」开关 | 无（默认开启 browse） |
 
 ## 下一步（有序）
 
-1. 安装包 / 开机自启  
-2. （可选）设置页发现开关 / 本机显示名  
-3. （可选）多文件 / >4MiB / 文件夹  
+1. Linux 登录自启（用户级、可显式启停）
+2. Windows 安装包 / 开机自启
+3. （可选）设置页发现开关 / 本机显示名
+4. （可选）多文件 / >4MiB / 文件夹
 
 > 「开始开发」→ 新建一个子 task。
 
@@ -71,6 +74,15 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ```bash
 cargo build -p m590-ui && cargo run -p m590-ui
+```
+
+Linux 安装包：
+
+```bash
+cd ui
+npm run desktop:build -- --bundles deb
+cd ..
+sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
 ```
 
 - **创建配对**：本机生成配对码 → 开始等待（会 mDNS 广播）  

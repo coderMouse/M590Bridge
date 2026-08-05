@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-05（task-029）
+> 更新日期：2026-08-05（task-032）
 
 ## 桌面（推荐）
 
@@ -12,6 +12,32 @@ cd ui && npm run build          # 仅前端
 ```
 
 内嵌 hub：`http://127.0.0.1:5910`。
+
+### Linux `.deb`（task-032）
+
+Ubuntu 构建依赖：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential curl file libayatana-appindicator3-dev librsvg2-dev \
+  libssl-dev libwebkit2gtk-4.1-dev libxdo-dev wget
+```
+
+构建、检查与安装（从仓库根目录执行）：
+
+```bash
+cd ui
+npm ci
+npm run desktop:build -- --bundles deb
+cd ..
+dpkg-deb --info target/release/bundle/deb/M590Bridge_*_amd64.deb
+dpkg-deb --contents target/release/bundle/deb/M590Bridge_*_amd64.deb
+sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
+sudo apt remove m590-bridge
+```
+
+产物在 `target/release/bundle/deb/`，不提交仓库。当前仅验证 `amd64`、未签名、不含开机自启。
 
 ## Rust 测试 / CLI
 
@@ -39,6 +65,7 @@ cargo run -p m590-clipboard --example probe_clipboard
 - 发大图：TCP 写满帧，避免 EAGAIN 误判断线  
 - 文件：`FileOffer/Request/Chunk/Complete` + hub 落盘 + UI 发送/进度（≤4MiB）  
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
+- **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
 
 ## 文件 API（task-021+）
 
@@ -79,7 +106,7 @@ UI 加入页「局域网设备」旁有刷新图标。
 ## 未做
 
 - 文件夹 / >4MiB  
-- 安装包 / 开机自启  
+- Windows 安装包 / Linux 与 Windows 开机自启
 - 设置页「发现方式」开关  
 - （已取消）019A  
 
@@ -88,5 +115,5 @@ UI 加入页「局域网设备」旁有刷新图标。
 ```text
 docs/plans/current.md
 docs/domain/protocol-draft.md
-docs/tasks/task-029.md
+docs/tasks/task-032.md
 ```
