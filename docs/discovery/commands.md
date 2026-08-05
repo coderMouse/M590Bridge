@@ -40,8 +40,9 @@ cargo run -p m590-clipboard --example probe_clipboard
 
 ## 未做
 
-- 桌面/文件夹「粘贴出文件」（需文件剪贴板，见 task-019）  
-- 通用文件分片传输、mDNS、安装包  
+- **V2 文件通道**（元数据 + 分片/按需传输 + 进度）  
+- mDNS、安装包  
+- （已取消）收图落盘骗桌面粘贴  
 
 ## 配置
 
@@ -53,6 +54,6 @@ cargo run -p m590-clipboard --example probe_clipboard
 
 ```text
 docs/plans/current.md
-docs/tasks/task-019.md
+docs/plans/current.md
 docs/domain/protocol-draft.md
 ```
