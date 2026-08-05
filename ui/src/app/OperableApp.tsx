@@ -58,6 +58,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const [settingsSaved, setSettingsSaved] = useState<string | null>(null)
   const [settingsFileSaveDir, setSettingsFileSaveDir] = useState('')
   const [fileBusy, setFileBusy] = useState(false)
+  const [fileDragOver, setFileDragOver] = useState(false)
   const [pickedFileLabel, setPickedFileLabel] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
@@ -498,7 +499,36 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                 </PrimaryButton>
               </div>
 
-              <div className="rounded-[10px] border border-black/8 bg-white p-3">
+              <div
+                className={
+                  fileDragOver
+                    ? 'rounded-[10px] border border-primary bg-primary/5 p-3'
+                    : 'rounded-[10px] border border-black/8 bg-white p-3'
+                }
+                onDragEnter={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (!fileBusy) setFileDragOver(true)
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (!fileBusy) setFileDragOver(true)
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  setFileDragOver(false)
+                }}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  setFileDragOver(false)
+                  if (!hubOnline || status?.phase !== 'connected' || fileBusy || busy) return
+                  const f = e.dataTransfer.files?.[0] ?? null
+                  void onPickAndSendFile(f)
+                }}
+              >
                 <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold text-[#6B7589]">
                   <FileUp size={14} /> 文件传输
                   <span className="ml-auto font-medium text-[#1A2030]">
@@ -508,8 +538,15 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                 <div className="mb-2 text-[11px] leading-4 text-[#6B7589]">
                   单文件上限 4MiB；对端自动接收并写入其保存目录。
                   <br />
+                  可「选择并发送」或把文件拖到此区域（GNOME Wayland 下文件管理器复制常不可用）。
+                  <br />
                   两端必须同一版本（含文件通道）。若对端报 unknown message type 11，请升级对端后重连。
                 </div>
+                {status?.file_clipboard_watch_likely === false ? (
+                  <div className="mb-2 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-4 text-amber-900">
+                    当前环境可能读不到「文件管理器复制」。请用下方按钮或拖入文件发送。
+                  </div>
+                ) : null}
                 <input
                   ref={fileInputRef}
                   type="file"

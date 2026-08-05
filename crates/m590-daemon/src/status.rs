@@ -55,6 +55,8 @@ pub struct HubStatus {
     pub last_file_saved_path: Option<String>,
     pub file_bytes_received: Option<u64>,
     pub file_bytes_total: Option<u64>,
+    /// False on Linux Wayland without data-control: file-manager copy may be invisible.
+    pub file_clipboard_watch_likely: bool,
 }
 
 impl Default for HubStatus {
@@ -92,6 +94,7 @@ impl HubStatus {
             last_file_saved_path: None,
             file_bytes_received: None,
             file_bytes_total: None,
+            file_clipboard_watch_likely: m590_clipboard::file_clipboard_watch_likely(),
         }
     }
 
@@ -183,7 +186,8 @@ impl HubStatus {
 \"last_file_bytes\":{file_bytes},\
 \"last_file_saved_path\":{file_path},\
 \"file_bytes_received\":{file_rx},\
-\"file_bytes_total\":{file_total}\
+\"file_bytes_total\":{file_total},\
+\"file_clipboard_watch_likely\":{file_watch}\
 }}",
             phase = self.phase.as_str(),
             role = opt_str(&self.role),
@@ -213,6 +217,7 @@ impl HubStatus {
             file_path = opt_str(&self.last_file_saved_path),
             file_rx = opt_u64(self.file_bytes_received),
             file_total = opt_u64(self.file_bytes_total),
+            file_watch = self.file_clipboard_watch_likely,
         )
     }
 }
@@ -257,5 +262,6 @@ mod tests {
         assert!(json.contains("last_file_name"), "{json}");
         assert!(json.contains("a.txt"), "{json}");
         assert!(json.contains("file_bytes_total"), "{json}");
+        assert!(json.contains("file_clipboard_watch_likely"), "{json}");
     }
 }

@@ -26,6 +26,8 @@ export type HubStatus = {
   last_file_saved_path?: string | null
   file_bytes_received?: number | null
   file_bytes_total?: number | null
+  /** false: OS file-manager copy may not be visible (e.g. GNOME Wayland). */
+  file_clipboard_watch_likely?: boolean
 }
 
 export type HubConfig = {

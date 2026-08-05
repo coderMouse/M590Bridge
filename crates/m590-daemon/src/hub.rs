@@ -29,7 +29,13 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
     with_status(&shared, |s| {
         s.hub_api = Some(format!("http://{api_addr}"));
         s.phase = HubPhase::Idle;
+        s.file_clipboard_watch_likely = m590_clipboard::file_clipboard_watch_likely();
     });
+    if !m590_clipboard::file_clipboard_watch_likely() {
+        println!(
+            "file_clipboard_watch=limited (Wayland without data-control; use UI pick/drag to send files)"
+        );
+    }
 
     let listener = TcpListener::bind(api_addr).map_err(|e| format!("bind hub api failed: {e}"))?;
     println!("hub_api=http://{api_addr}");

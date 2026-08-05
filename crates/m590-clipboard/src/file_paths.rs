@@ -6,14 +6,29 @@ use std::path::{Path, PathBuf};
 use crate::image_file::{candidate_paths, is_likely_image_path, normalize_path_token};
 use crate::ClipboardError;
 
+fn scrub_path_string(s: &str) -> String {
+    // text/uri-list often uses CRLF; arboard may leave trailing \r inside Path.
+    s.trim()
+        .trim_matches(|c| c == '\0' || c == '"')
+        .trim_end_matches('\r')
+        .trim()
+        .to_string()
+}
+
 fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
     }
+    let raw = path.to_str()?;
+    let cleaned = scrub_path_string(raw);
+    if cleaned != raw {
+        let p = PathBuf::from(&cleaned);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     // arboard usually returns real paths; still accept file://-looking Path display.
-    path.to_str()
-        .and_then(normalize_path_token)
-        .filter(|p| p.is_file())
+    normalize_path_token(&cleaned).filter(|p| p.is_file())
 }
 
 /// First existing regular file in `paths` (skips dirs / missing).
@@ -24,13 +39,13 @@ pub fn first_regular_file(paths: &[PathBuf]) -> Option<PathBuf> {
 /// If clipboard text is a local **non-image** file path/URI, return it.
 pub fn regular_file_from_text(text: &str) -> Option<PathBuf> {
     for candidate in candidate_paths(text) {
-        if !candidate.is_file() {
+        let Some(path) = resolve_existing_file(&candidate) else {
+            continue;
+        };
+        if is_likely_image_path(&path) {
             continue;
         }
-        if is_likely_image_path(&candidate) {
-            continue;
-        }
-        return Some(candidate);
+        return Some(path);
     }
     None
 }
@@ -106,6 +121,17 @@ mod tests {
         let (name, data) = read_file_for_offer(&p, 16).unwrap();
         assert_eq!(name, "b.bin");
         assert_eq!(data, b"12345");
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn resolve_trims_trailing_cr() {
+        let p = temp_file("cr.txt", b"x");
+        let mut s = p.to_str().unwrap().to_string();
+        s.push('\r');
+        let dirty = PathBuf::from(&s);
+        assert!(!dirty.is_file());
+        assert_eq!(resolve_existing_file(&dirty).as_ref(), Some(&p));
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 

@@ -489,6 +489,35 @@ impl ClipboardService for PlatformClipboard {
     }
 }
 
+/// Whether background file-list watch is likely to see file-manager copies.
+///
+/// On Linux Wayland without ext/wlr-data-control, `arboard` falls back to X11 and
+/// typically **cannot** observe Nautilus/GNOME file copies (uri-list stays on Wayland).
+/// Text may still work via X11 bridging. UI should offer pick/drag send instead.
+pub fn file_clipboard_watch_likely() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+        if !wayland {
+            return true;
+        }
+        // Same gate arboard uses before selecting the Wayland data-control backend.
+        // Only Ok(_) means ext/wlr-data-control is present; any Err → cannot watch.
+        matches!(
+            wl_clipboard_rs::utils::is_primary_selection_supported(),
+            Ok(_)
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 /// Backends compiled into this build (not necessarily usable at runtime).
 pub fn available_backends() -> Vec<ClipboardBackend> {
     let mut backends = vec![ClipboardBackend::Unspecified];
