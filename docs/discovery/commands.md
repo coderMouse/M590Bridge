@@ -55,17 +55,20 @@ curl -s -X POST http://127.0.0.1:5910/api/send_file_bytes \
 curl -s http://127.0.0.1:5910/api/status
 ```
 
-## 发现 API（task-029）
+## 发现 API（task-029 / task-031）
 
 ```bash
-# host 侧 listen 后会 advertise；任意 hub 可 browse
+# 当前缓存的对端列表（已按 device_id / addr 去重）
 curl -s http://127.0.0.1:5910/api/discover
+# 清空并重新 browse
+curl -s -X POST http://127.0.0.1:5910/api/discover/refresh
 # 示例：
 # {"service_type":"_m590bridge._tcp.local.","advertising":false,
 #  "peers":[{"name":"...","device_id":"...","addr":"192.168.x.x:5901",...}]}
 ```
 
-TXT 仅 `id` / `ver`，**不含**配对码。配对仍需手动输入相同 code。
+TXT 仅 `id` / `ver`，**不含**配对码。配对仍需手动输入相同 code。  
+UI 加入页「局域网设备」旁有刷新图标。
 
 ## 配置
 

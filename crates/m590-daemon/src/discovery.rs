@@ -1,10 +1,12 @@
-//! LAN device discovery via mDNS / DNS-SD (task-029).
+//! LAN device discovery via mDNS / DNS-SD (task-029 / task-031).
 //!
 //! Service type: `_m590bridge._tcp.local.`
 //! TXT: `id=<device_id>`, `ver=<app_version>` — never pairing_code.
+//! Peers are deduped by device_id (preferred) or connect addr.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +36,8 @@ pub struct DiscoveryHandle {
     advertised_fullname: Arc<Mutex<Option<String>>>,
     local_device_id: Arc<Mutex<String>>,
     advertising: Mutex<bool>,
+    /// Bumped on each browse start/refresh so stale browse threads exit.
+    browse_gen: Arc<AtomicU64>,
 }
 
 impl DiscoveryHandle {
@@ -43,32 +47,49 @@ impl DiscoveryHandle {
         let peers = Arc::new(Mutex::new(HashMap::new()));
         let local_device_id = Arc::new(Mutex::new(local_device_id));
         let advertised_fullname = Arc::new(Mutex::new(None));
+        let browse_gen = Arc::new(AtomicU64::new(0));
 
-        let receiver = daemon
+        let handle = Arc::new(Self {
+            daemon,
+            peers,
+            advertised_fullname,
+            local_device_id,
+            advertising: Mutex::new(false),
+            browse_gen,
+        });
+        handle.start_browse_loop()?;
+        Ok(handle)
+    }
+
+    fn start_browse_loop(&self) -> Result<(), String> {
+        let gen = self.browse_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let receiver = self
+            .daemon
             .browse(SERVICE_TYPE)
             .map_err(|e| format!("mdns browse: {e}"))?;
 
-        let peers_thread = Arc::clone(&peers);
-        let local_id_thread = Arc::clone(&local_device_id);
-        let advertised_thread = Arc::clone(&advertised_fullname);
+        let peers_thread = Arc::clone(&self.peers);
+        let local_id_thread = Arc::clone(&self.local_device_id);
+        let advertised_thread = Arc::clone(&self.advertised_fullname);
+        let browse_gen = Arc::clone(&self.browse_gen);
+
         thread::Builder::new()
-            .name("m590-mdns-browse".into())
+            .name(format!("m590-mdns-browse-{gen}"))
             .spawn(move || {
                 while let Ok(event) = receiver.recv() {
+                    if browse_gen.load(Ordering::SeqCst) != gen {
+                        break;
+                    }
                     match event {
                         ServiceEvent::ServiceResolved(info) => {
                             let fullname = info.get_fullname().to_string();
-                            let our_fullname = advertised_thread
-                                .lock()
-                                .ok()
-                                .and_then(|g| g.clone());
+                            let our_fullname =
+                                advertised_thread.lock().ok().and_then(|g| g.clone());
                             if our_fullname.as_deref() == Some(fullname.as_str()) {
                                 continue;
                             }
-                            let device_id = info
-                                .get_property_val_str("id")
-                                .unwrap_or("")
-                                .to_string();
+                            let device_id =
+                                info.get_property_val_str("id").unwrap_or("").to_string();
                             let local_id = local_id_thread
                                 .lock()
                                 .map(|g| g.clone())
@@ -81,7 +102,7 @@ impl DiscoveryHandle {
                             };
                             let name = instance_from_fullname(&fullname, SERVICE_TYPE);
                             let peer = DiscoveredPeer {
-                                fullname: fullname.clone(),
+                                fullname,
                                 name,
                                 device_id,
                                 host: info.get_hostname().to_string(),
@@ -90,12 +111,12 @@ impl DiscoveryHandle {
                                 last_seen_unix_ms: now_unix_ms(),
                             };
                             if let Ok(mut map) = peers_thread.lock() {
-                                map.insert(fullname, peer);
+                                upsert_peer(&mut map, peer);
                             }
                         }
                         ServiceEvent::ServiceRemoved(_ty, fullname) => {
                             if let Ok(mut map) = peers_thread.lock() {
-                                map.remove(&fullname);
+                                map.retain(|_, p| p.fullname != fullname);
                             }
                         }
                         ServiceEvent::SearchStopped(_) => break,
@@ -104,20 +125,28 @@ impl DiscoveryHandle {
                 }
             })
             .map_err(|e| format!("mdns browse thread: {e}"))?;
-
-        Ok(Arc::new(Self {
-            daemon,
-            peers,
-            advertised_fullname,
-            local_device_id,
-            advertising: Mutex::new(false),
-        }))
+        Ok(())
     }
 
     pub fn set_local_device_id(&self, id: &str) {
         if let Ok(mut g) = self.local_device_id.lock() {
             *g = id.to_string();
         }
+    }
+
+    /// Clear cache and re-query the LAN (manual refresh).
+    pub fn refresh(&self) -> Result<(), String> {
+        if let Ok(mut map) = self.peers.lock() {
+            map.clear();
+        }
+        // Invalidate current browse thread, then restart.
+        self.browse_gen.fetch_add(1, Ordering::SeqCst);
+        let _ = self.daemon.stop_browse(SERVICE_TYPE);
+        // Allow SearchStopped / queue drain.
+        thread::sleep(Duration::from_millis(80));
+        self.start_browse_loop()?;
+        println!("mdns_refresh=ok type={SERVICE_TYPE}");
+        Ok(())
     }
 
     /// Advertise this host as listening on `port`. Replaces any previous advertisement.
@@ -154,7 +183,6 @@ impl DiscoveryHandle {
         if let Some(name) = fullname {
             match self.daemon.unregister(&name) {
                 Ok(rx) => {
-                    // Best-effort wait so goodbye packets can go out.
                     let _ = rx.recv_timeout(Duration::from_millis(500));
                 }
                 Err(err) => eprintln!("mdns_unregister_error={err}"),
@@ -176,7 +204,12 @@ impl DiscoveryHandle {
             .lock()
             .map(|g| g.values().cloned().collect())
             .unwrap_or_default();
-        peers.sort_by(|a, b| a.name.cmp(&b.name).then(a.addr.cmp(&b.addr)));
+        peers.sort_by(|a, b| {
+            a.device_id
+                .cmp(&b.device_id)
+                .then(a.name.cmp(&b.name))
+                .then(a.addr.cmp(&b.addr))
+        });
         peers
     }
 
@@ -219,8 +252,37 @@ impl DiscoveryHandle {
 impl Drop for DiscoveryHandle {
     fn drop(&mut self) {
         self.stop_advertise();
+        self.browse_gen.fetch_add(1, Ordering::SeqCst);
+        let _ = self.daemon.stop_browse(SERVICE_TYPE);
         let _ = self.daemon.shutdown();
     }
+}
+
+/// Map key: prefer stable device_id, else connect addr, else fullname.
+pub fn peer_dedupe_key(peer: &DiscoveredPeer) -> String {
+    if !peer.device_id.is_empty() {
+        format!("id:{}", peer.device_id.to_ascii_lowercase())
+    } else if !peer.addr.is_empty() {
+        format!("addr:{}", peer.addr.to_ascii_lowercase())
+    } else {
+        format!("full:{}", peer.fullname.to_ascii_lowercase())
+    }
+}
+
+/// Insert or replace, collapsing same device_id / same addr under one entry.
+/// Incoming peer always wins (fresher mDNS resolve).
+pub fn upsert_peer(map: &mut HashMap<String, DiscoveredPeer>, peer: DiscoveredPeer) {
+    map.retain(|_, existing| {
+        let same_id = !peer.device_id.is_empty()
+            && !existing.device_id.is_empty()
+            && existing.device_id.eq_ignore_ascii_case(&peer.device_id);
+        let same_addr =
+            !peer.addr.is_empty() && existing.addr.eq_ignore_ascii_case(&peer.addr);
+        let same_fullname = !peer.fullname.is_empty() && existing.fullname == peer.fullname;
+        !(same_id || same_addr || same_fullname)
+    });
+    let key = peer_dedupe_key(&peer);
+    map.insert(key, peer);
 }
 
 fn pick_connect_addr(info: &mdns_sd::ResolvedService) -> Option<String> {
@@ -331,8 +393,70 @@ mod tests {
     }
 
     #[test]
+    fn upsert_dedupes_same_device_id_different_fullname() {
+        let mut map = HashMap::new();
+        upsert_peer(
+            &mut map,
+            DiscoveredPeer {
+                fullname: "a-1._m590bridge._tcp.local.".into(),
+                name: "a-1".into(),
+                device_id: "Win-PC".into(),
+                host: "a-1.local.".into(),
+                port: 5901,
+                addr: "192.168.1.10:5901".into(),
+                last_seen_unix_ms: 100,
+            },
+        );
+        upsert_peer(
+            &mut map,
+            DiscoveredPeer {
+                fullname: "a-2._m590bridge._tcp.local.".into(),
+                name: "a-2".into(),
+                device_id: "win-pc".into(), // case-insensitive
+                host: "a-2.local.".into(),
+                port: 5901,
+                addr: "192.168.1.10:5901".into(),
+                last_seen_unix_ms: 200,
+            },
+        );
+        assert_eq!(map.len(), 1);
+        let only = map.values().next().unwrap();
+        assert_eq!(only.fullname, "a-2._m590bridge._tcp.local.");
+        assert_eq!(only.last_seen_unix_ms, 200);
+    }
+
+    #[test]
+    fn upsert_dedupes_same_addr_without_id() {
+        let mut map = HashMap::new();
+        upsert_peer(
+            &mut map,
+            DiscoveredPeer {
+                fullname: "x._m590bridge._tcp.local.".into(),
+                name: "x".into(),
+                device_id: String::new(),
+                host: "x.local.".into(),
+                port: 5901,
+                addr: "10.0.0.5:5901".into(),
+                last_seen_unix_ms: 1,
+            },
+        );
+        upsert_peer(
+            &mut map,
+            DiscoveredPeer {
+                fullname: "y._m590bridge._tcp.local.".into(),
+                name: "y".into(),
+                device_id: String::new(),
+                host: "y.local.".into(),
+                port: 5901,
+                addr: "10.0.0.5:5901".into(),
+                last_seen_unix_ms: 2,
+            },
+        );
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
     fn discover_json_empty_shape() {
-        // Constructing ServiceDaemon may fail in restricted sandboxes — skip then.
         let Ok(handle) = DiscoveryHandle::start("test-device".into()) else {
             return;
         };
@@ -340,6 +464,7 @@ mod tests {
         assert!(json.contains("\"peers\":["));
         assert!(json.contains("\"service_type\":"));
         assert!(json.contains("\"advertising\":false"));
+        let _ = handle.refresh();
         handle.stop_advertise();
     }
 }

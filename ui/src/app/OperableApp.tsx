@@ -11,6 +11,7 @@ import {
   bytesToBase64,
   fetchConfig,
   fetchDiscover,
+  postDiscoverRefresh,
   fetchHealth,
   fetchStatus,
   filePhaseLabel,
@@ -67,6 +68,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const [pickedFileLabel, setPickedFileLabel] = useState<string | null>(null)
   const [discoveredPeers, setDiscoveredPeers] = useState<DiscoveredPeer[]>([])
   const [discoverError, setDiscoverError] = useState<string | null>(null)
+  const [discoverBusy, setDiscoverBusy] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const apiBase = useMemo(() => getApiBase(), [])
@@ -202,6 +204,30 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function onRefreshDiscover() {
+    if (!hubOnline || discoverBusy) return
+    setDiscoverBusy(true)
+    setDiscoverError(null)
+    try {
+      const d = await postDiscoverRefresh()
+      setDiscoveredPeers(Array.isArray(d.peers) ? d.peers : [])
+      setDiscoverError(d.error ?? null)
+      // Give mDNS a moment, then pull again.
+      window.setTimeout(() => {
+        void fetchDiscover()
+          .then((again) => {
+            setDiscoveredPeers(Array.isArray(again.peers) ? again.peers : [])
+            setDiscoverError(again.error ?? null)
+          })
+          .catch(() => {})
+      }, 600)
+    } catch (e) {
+      setDiscoverError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDiscoverBusy(false)
     }
   }
 
@@ -455,28 +481,49 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
             ) : (
               <div className="mb-3 space-y-2">
                 <div className="rounded-[10px] border border-black/8 bg-white p-3">
-                  <div className="mb-2 flex items-center justify-between">
+                  <div className="mb-2 flex items-center justify-between gap-2">
                     <span className="text-[12px] font-semibold text-[#6B7589]">局域网设备</span>
-                    <span className="text-[11px] text-[#9AA3B2]">
-                      {discoveredPeers.length > 0
-                        ? `${discoveredPeers.length} 台`
-                        : discoverError
-                          ? '发现不可用'
-                          : '搜索中…'}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] text-[#9AA3B2]">
+                        {discoveredPeers.length > 0
+                          ? `${discoveredPeers.length} 台`
+                          : discoverError
+                            ? '发现不可用'
+                            : discoverBusy
+                              ? '刷新中…'
+                              : '搜索中…'}
+                      </span>
+                      <button
+                        type="button"
+                        title="刷新局域网设备"
+                        aria-label="刷新局域网设备"
+                        disabled={!hubOnline || discoverBusy}
+                        onClick={() => void onRefreshDiscover()}
+                        className={cn(
+                          'inline-flex size-7 items-center justify-center rounded-md border border-black/8 bg-[#F7F9FC] text-[#1A2030]',
+                          (!hubOnline || discoverBusy) && 'opacity-50',
+                        )}
+                      >
+                        <RefreshCw
+                          size={13}
+                          className={cn(discoverBusy && 'animate-spin')}
+                        />
+                      </button>
+                    </div>
                   </div>
                   {discoveredPeers.length === 0 ? (
                     <div className="text-[11px] leading-4 text-[#9AA3B2]">
                       {discoverError
                         ? `mDNS：${discoverError}（仍可手动输入 IP）`
-                        : '未发现其他 M590Bridge。请确认对端已点「开始等待配对」。'}
+                        : '未发现其他 M590Bridge。请确认对端已点「开始等待配对」，或点刷新。'}
                     </div>
                   ) : (
                     <ul className="m-0 max-h-36 list-none space-y-1 overflow-auto p-0">
                       {discoveredPeers.map((p) => {
                         const selected = addr === p.addr
+                        const rowKey = p.device_id || p.addr || p.fullname
                         return (
-                          <li key={p.fullname || p.addr}>
+                          <li key={rowKey}>
                             <button
                               type="button"
                               onClick={() => setAddr(p.addr)}

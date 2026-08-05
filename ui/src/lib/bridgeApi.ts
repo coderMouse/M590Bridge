@@ -119,6 +119,13 @@ export async function fetchDiscover(): Promise<DiscoverResponse> {
   return request<DiscoverResponse>('/api/discover')
 }
 
+export async function postDiscoverRefresh(): Promise<DiscoverResponse> {
+  return request<DiscoverResponse>('/api/discover/refresh', {
+    method: 'POST',
+    body: '{}',
+  })
+}
+
 export type HubConfigPatch = {
   device_id?: string
   last_role?: string | null

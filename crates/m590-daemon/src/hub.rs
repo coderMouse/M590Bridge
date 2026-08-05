@@ -56,7 +56,7 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
     println!("hub_api=http://{api_addr}");
     println!("hub_status=ready (UI can open operable shell and point API to this address)");
     println!(
-        "endpoints=GET /api/status /api/config /api/discover POST /api/listen /api/connect /api/push /api/send_file /api/disconnect /api/config"
+        "endpoints=GET /api/status /api/config /api/discover POST /api/discover/refresh /api/listen /api/connect /api/push /api/send_file /api/disconnect /api/config"
     );
     let cfg_path = config::default_config_path();
     println!("config_path={}", cfg_path.display());
@@ -111,6 +111,18 @@ fn handle_http(
             };
             write_response(&mut stream, 200, "application/json", &json)
         }
+        ("POST", "/api/discover/refresh") => match discovery.as_ref() {
+            Some(d) => match d.refresh() {
+                Ok(()) => write_response(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    &d.to_json(),
+                ),
+                Err(err) => write_json_err(&mut stream, &err),
+            },
+            None => write_json_err(&mut stream, "mdns unavailable"),
+        },
         ("POST", "/api/config") => match apply_config_update(&shared, &body) {
             Ok(json) => write_response(&mut stream, 200, "application/json", &json),
             Err(err) => write_json_err(&mut stream, &err),
