@@ -75,9 +75,7 @@ impl TcpFrameStream {
 
     pub fn send(&mut self, message: &Message) -> Result<(), TcpError> {
         let bytes = encode_frame(message)?;
-        self.stream.write_all(&bytes)?;
-        self.stream.flush()?;
-        Ok(())
+        self.write_all_blocking(&bytes)
     }
 
     pub fn send_all<'a, I>(&mut self, messages: I) -> Result<(), TcpError>
@@ -87,6 +85,40 @@ impl TcpFrameStream {
         for message in messages {
             self.send(message)?;
         }
+        Ok(())
+    }
+
+    /// Write the full buffer in blocking mode.
+    ///
+    /// `try_recv` switches the socket to non-blocking. Without restoring
+    /// blocking mode, a multi-megabyte `ClipboardImage` frame can fail with
+    /// `WouldBlock` (Linux os error 11) and the hub treats it as disconnect.
+    fn write_all_blocking(&mut self, mut bytes: &[u8]) -> Result<(), TcpError> {
+        self.set_nonblocking(false)?;
+        self.stream
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .ok();
+        while !bytes.is_empty() {
+            match self.stream.write(bytes) {
+                Ok(0) => {
+                    return Err(TcpError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "tcp write returned 0",
+                    )));
+                }
+                Ok(n) => bytes = &bytes[n..],
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(err) => return Err(TcpError::Io(err)),
+            }
+        }
+        self.stream.flush()?;
         Ok(())
     }
 
@@ -300,5 +332,37 @@ mod tests {
         );
         client.send(&msg).unwrap();
         assert_eq!(server.join().unwrap(), msg);
+    }
+
+    #[test]
+    fn tcp_loopback_sends_large_image_after_try_recv() {
+        use m590_core::ClipboardImagePayload;
+
+        let listener = listen_on("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut conn = accept_framed(&listener).unwrap();
+            // Mimic hub: non-blocking poll first (leaves socket non-blocking).
+            let _ = conn.try_recv();
+            conn.recv().unwrap()
+        });
+        thread::sleep(Duration::from_millis(20));
+        let mut client = connect_framed(addr).unwrap();
+        // Leave client in the same state hub uses between polls.
+        let _ = client.try_recv();
+
+        // ~1.2MiB raw RGBA — large enough to stress non-blocking write buffers.
+        let width = 600u32;
+        let height = 500u32;
+        let rgba = vec![7u8; (width as usize) * (height as usize) * 4];
+        let msg = Message::clipboard_image(
+            ClipboardImagePayload::new(DeviceId::new("cam"), "big-img", width, height, rgba)
+                .unwrap(),
+        );
+        client
+            .send(&msg)
+            .expect("large image send must not fail with WouldBlock after try_recv");
+        let got = server.join().unwrap();
+        assert_eq!(got, msg);
     }
 }
