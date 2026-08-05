@@ -218,3 +218,25 @@ export function fileProgressPercent(status: HubStatus | null): number {
   const got = status.file_bytes_received ?? 0
   return Math.max(0, Math.min(100, Math.round((got / total) * 100)))
 }
+
+/** Tauri native file dialog → absolute path. null if cancelled / not in Tauri. */
+export async function pickSendFileNative(): Promise<string | null> {
+  const w = window as unknown as {
+    __TAURI_INTERNALS__?: { invoke: (cmd: string, args?: object) => Promise<unknown> }
+    __TAURI__?: { core?: { invoke: (cmd: string, args?: object) => Promise<unknown> } }
+  }
+  const invoke =
+    w.__TAURI_INTERNALS__?.invoke ??
+    w.__TAURI__?.core?.invoke
+  if (!invoke) return null
+  const path = (await invoke('pick_send_file')) as string | null
+  return path ?? null
+}
+
+export function isTauriShell(): boolean {
+  const w = window as unknown as {
+    __TAURI_INTERNALS__?: unknown
+    __TAURI__?: unknown
+  }
+  return Boolean(w.__TAURI_INTERNALS__ || w.__TAURI__)
+}

@@ -22,7 +22,10 @@ import {
   postDisconnect,
   postListen,
   postPush,
+  postSendFile,
   postSendFileBytes,
+  pickSendFileNative,
+  isTauriShell,
   randomPairCode,
   type HubStatus,
 } from '@/lib/bridgeApi'
@@ -207,6 +210,27 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
       const data_base64 = bytesToBase64(buf)
       await postSendFileBytes({ name: baseName, data_base64 })
       await refresh()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setFileBusy(false)
+    }
+  }
+
+  async function onNativePickAndSend() {
+    setError(null)
+    setFileBusy(true)
+    try {
+      if (isTauriShell()) {
+        const path = await pickSendFileNative()
+        if (!path) return
+        const baseName = path.split(/[/\\]/).pop() || path
+        setPickedFileLabel(baseName)
+        await postSendFile(path)
+        await refresh()
+        return
+      }
+      fileInputRef.current?.click()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -538,7 +562,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                 <div className="mb-2 text-[11px] leading-4 text-[#6B7589]">
                   单文件上限 4MiB；对端自动接收并写入其保存目录。
                   <br />
-                  可「选择并发送」或把文件拖到此区域（GNOME Wayland 下文件管理器复制常不可用）。
+                  可「选择并发送」（原生对话框，默认桌面）或把文件拖到窗口。GNOME 下文件管理器 Ctrl+C 常不可用。
                   <br />
                   两端必须同一版本（含文件通道）。若对端报 unknown message type 11，请升级对端后重连。
                 </div>
@@ -562,7 +586,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                   className="mb-2"
                   loading={fileBusy}
                   disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
-                  onClick={() => fileInputRef.current?.click()}
+                  onClick={() => void onNativePickAndSend()}
                 >
                   <FileUp size={14} /> 选择并发送文件
                 </PrimaryButton>

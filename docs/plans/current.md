@@ -17,6 +17,7 @@ Linux + Windows 剪贴板与小文件桥；V2 文件走元数据 + 按需传输 
 - [x] **task-024** file_list → 非图片原文件 offer
 - [x] **task-025** 文本路径 offer + 发送方 FileComplete 进度 done
 - [x] **task-026** GNOME Wayland 文件复制限制：拖放/选文件 + 提示
+- [x] **task-027** 原生选文件/窗口拖放 + 托盘文案保活 + 关闭焦点
 
 ## 进行中
 
@@ -47,8 +48,9 @@ Linux + Windows 剪贴板与小文件桥；V2 文件走元数据 + 按需传输 
 | file_list 触发原文件 offer（非图片，≤4MiB） | **有** |
 | 路径文本（非图片）→ file offer | **有**（task-025） |
 | 发送方 FileComplete → UI done/满进度 | **有**（task-025） |
-| GNOME Wayland 文件管理器复制自动同步 | **受限**（无 data-control；用选文件/拖入，task-026） |
-| UI 拖入文件发送 | **有**（task-026） |
+| GNOME Wayland 文件管理器复制自动同步 | **受限**（用原生选文件/窗口拖放，task-026/027） |
+| UI 拖入/原生选文件发送 | **有**（task-026/027） |
+| 托盘菜单文案保活 | **有**（task-027） |
 
 ## 下一步（有序）
 
@@ -64,7 +66,7 @@ Linux + Windows 剪贴板与小文件桥；V2 文件走元数据 + 按需传输 
 cargo build -p m590-ui && cargo run -p m590-ui
 ```
 
-配对后主面板「文件传输」选文件发送；设置里可改接收目录。也可用：
+配对后主面板「文件传输」用「选择并发送文件」（原生对话框，默认桌面）或拖文件到窗口；设置里可改接收目录。也可用：
 
 ```bash
 curl -s -X POST http://127.0.0.1:5910/api/send_file_bytes \
