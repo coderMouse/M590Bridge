@@ -41,6 +41,11 @@ impl WindowsClipboard {
     pub fn backend(&self) -> ClipboardBackend {
         ClipboardBackend::Windows
     }
+
+    fn refresh_clipboard(&mut self) -> Result<(), ClipboardError> {
+        self.clipboard = open_clipboard()?;
+        Ok(())
+    }
 }
 
 impl ClipboardService for WindowsClipboard {
@@ -69,7 +74,17 @@ impl ClipboardService for WindowsClipboard {
     }
 
     fn read_image(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
-        read_image_raw(&mut self.clipboard)
+        match read_image_raw(&mut self.clipboard) {
+            Ok(v) => Ok(v),
+            Err(err) => {
+                // Windows clipboard can be transiently locked; reopen once.
+                let _ = self.refresh_clipboard();
+                match read_image_raw(&mut self.clipboard) {
+                    Ok(v) => Ok(v),
+                    Err(_) => Err(err),
+                }
+            }
+        }
     }
 
     fn write_image(&mut self, image: &ImageClipboard) -> Result<(), ClipboardError> {
@@ -79,7 +94,13 @@ impl ClipboardService for WindowsClipboard {
     }
 
     fn poll_image_change(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
-        let current = read_image_raw(&mut self.clipboard)?;
+        let current = match read_image_raw(&mut self.clipboard) {
+            Ok(v) => v,
+            Err(_) => {
+                self.refresh_clipboard()?;
+                read_image_raw(&mut self.clipboard)?
+            }
+        };
         let fp = current.as_ref().map(|img| img.fingerprint());
         if fp != self.last_image_fp {
             self.last_image_fp = fp;
@@ -96,7 +117,13 @@ impl ClipboardService for WindowsClipboard {
     fn poll_file_list_change(
         &mut self,
     ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
-        let current = read_file_list_raw(&mut self.clipboard)?;
+        let current = match read_file_list_raw(&mut self.clipboard) {
+            Ok(v) => v,
+            Err(_) => {
+                self.refresh_clipboard()?;
+                read_file_list_raw(&mut self.clipboard)?
+            }
+        };
         if current != self.last_files {
             self.last_files = current.clone();
             Ok(Some(current))

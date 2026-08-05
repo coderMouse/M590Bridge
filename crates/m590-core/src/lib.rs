@@ -5,7 +5,7 @@ mod protocol;
 mod session;
 
 pub use error::{ProtocolError, SessionError};
-pub use protocol::{ClipboardImagePayload, ClipboardTextPayload, Message, PROTOCOL_VERSION};
+pub use protocol::{ClipboardImagePayload, ClipboardTextPayload, ImageEncoding, Message, PROTOCOL_VERSION};
 pub use session::{
     InboundClipboardResult, QueueClipboardResult, Session, SessionEvent, SessionSnapshot,
     DEFAULT_HEARTBEAT_MISS_THRESHOLD,

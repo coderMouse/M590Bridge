@@ -19,6 +19,7 @@ Linux + Windows 文本剪贴板同步 MVP；托盘常驻；参数可记住、断
 - [x] **task-015** 本地图片文件路径提升为图片同步
 - [x] **task-016** 文件管理器 file_list + Wayland 图片同步
 - [x] **task-017** 发大图 TCP EAGAIN 误判断线修复
+- [x] **task-018** Windows→Linux 图片 PNG 压缩与错误可见
 
 ## 进行中
 

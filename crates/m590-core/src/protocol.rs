@@ -34,26 +34,70 @@ impl ClipboardTextPayload {
     }
 }
 
-/// Image clipboard payload (raw RGBA, row-major) carried inline on the wire.
+/// On-wire image encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ImageEncoding {
+    /// Row-major RGBA8, length must be width*height*4.
+    RawRgba = 0,
+    /// PNG bytes (preferred for large screenshots).
+    Png = 1,
+}
+
+impl ImageEncoding {
+    pub fn from_u8(v: u8) -> Result<Self, ProtocolError> {
+        match v {
+            0 => Ok(Self::RawRgba),
+            1 => Ok(Self::Png),
+            _ => Err(ProtocolError::InvalidImage("unknown image encoding")),
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Image clipboard payload carried inline on the wire.
 ///
-/// Large images may exceed the frame payload limit and should be skipped by the sender.
+/// Prefer [`ImageEncoding::Png`] for screenshots; raw RGBA kept for tiny images / tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardImagePayload {
     pub device_id: DeviceId,
     pub content_id: String,
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes, RGBA8.
-    pub rgba: Vec<u8>,
+    pub encoding: ImageEncoding,
+    /// Encoding-specific bytes (RGBA8 or PNG).
+    pub data: Vec<u8>,
 }
 
 impl ClipboardImagePayload {
+    /// Raw RGBA helper (tests / tiny images).
     pub fn new(
         device_id: DeviceId,
         content_id: impl Into<String>,
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+    ) -> Result<Self, ProtocolError> {
+        Self::encoded(
+            device_id,
+            content_id,
+            width,
+            height,
+            ImageEncoding::RawRgba,
+            rgba,
+        )
+    }
+
+    pub fn encoded(
+        device_id: DeviceId,
+        content_id: impl Into<String>,
+        width: u32,
+        height: u32,
+        encoding: ImageEncoding,
+        data: Vec<u8>,
     ) -> Result<Self, ProtocolError> {
         if device_id.as_str().is_empty() {
             return Err(ProtocolError::EmptyDeviceId);
@@ -65,24 +109,34 @@ impl ClipboardImagePayload {
         if width == 0 || height == 0 {
             return Err(ProtocolError::InvalidImage("dimensions must be non-zero"));
         }
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or(ProtocolError::InvalidImage("dimensions overflow"))?;
-        if rgba.len() != expected {
-            return Err(ProtocolError::InvalidImage("rgba length mismatch"));
+        match encoding {
+            ImageEncoding::RawRgba => {
+                let expected = (width as usize)
+                    .checked_mul(height as usize)
+                    .and_then(|n| n.checked_mul(4))
+                    .ok_or(ProtocolError::InvalidImage("dimensions overflow"))?;
+                if data.len() != expected {
+                    return Err(ProtocolError::InvalidImage("rgba length mismatch"));
+                }
+            }
+            ImageEncoding::Png => {
+                if data.is_empty() {
+                    return Err(ProtocolError::InvalidImage("empty png data"));
+                }
+            }
         }
         Ok(Self {
             device_id,
             content_id,
             width,
             height,
-            rgba,
+            encoding,
+            data,
         })
     }
 
     pub fn byte_len(&self) -> usize {
-        self.rgba.len()
+        self.data.len()
     }
 }
 

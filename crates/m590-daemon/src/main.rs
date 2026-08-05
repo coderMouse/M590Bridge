@@ -431,15 +431,17 @@ fn run_bridge(
                             content_id,
                             width,
                             height,
-                            rgba,
+                            encoding,
+                            data,
                         }) => {
                             println!(
-                                "sync_rx_image content_id={content_id} {width}x{height} bytes={}",
-                                rgba.len()
+                                "sync_rx_image content_id={content_id} {width}x{height} enc={encoding:?} bytes={}",
+                                data.len()
                             );
                             if let Some(clip) = clipboard.as_mut() {
-                                match m590_clipboard::ImageClipboard::from_rgba(width, height, rgba)
-                                {
+                                match m590_clipboard::ImageClipboard::from_wire(
+                                    width, height, encoding, data,
+                                ) {
                                     Ok(image) => match clip.write_image(&image) {
                                         Ok(()) => println!("clipboard_write_image=ok"),
                                         Err(err) => println!("clipboard_write_image=error {err}"),
@@ -481,19 +483,28 @@ fn run_bridge(
                             let cid = format!("clip-imgfiles-{}-{content_seq}", process::id());
                             let w = image.width;
                             let h = image.height;
-                            match session.queue_clipboard_image(cid, w, h, image.rgba) {
-                                Ok(QueueClipboardResult::Queued) => {
-                                    let out = session.take_outbox();
-                                    conn.send_all(out.iter()).map_err(|e| e.to_string())?;
-                                    println!("sync_tx_image_from_file_list {w}x{h}");
+                            match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
+                                Ok((encoding, data)) => {
+                                    match session.queue_clipboard_image_encoded(
+                                        cid, w, h, encoding, data,
+                                    ) {
+                                        Ok(QueueClipboardResult::Queued) => {
+                                            let out = session.take_outbox();
+                                            conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+                                            println!(
+                                                "sync_tx_image_from_file_list {w}x{h} {encoding:?}"
+                                            );
+                                        }
+                                        Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                            println!(
+                                                "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
+                                            );
+                                        }
+                                        Ok(_) => {}
+                                        Err(err) => println!("sync_tx_image=error {err}"),
+                                    }
                                 }
-                                Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
-                                    println!(
-                                        "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(err) => println!("sync_tx_image=error {err}"),
+                                Err(err) => println!("sync_tx_image=prepare_error {err}"),
                             }
                         } else if !paths.is_empty() {
                             println!("clipboard_files={paths:?} (no image decoded)");
@@ -512,27 +523,36 @@ fn run_bridge(
                             let cid = format!("clip-imgfile-{}-{content_seq}", process::id());
                             let w = image.width;
                             let h = image.height;
-                            match session.queue_clipboard_image(cid, w, h, image.rgba) {
-                                Ok(QueueClipboardResult::Queued) => {
-                                    let out = session.take_outbox();
-                                    conn.send_all(out.iter()).map_err(|e| e.to_string())?;
-                                    println!("sync_tx_image_from_path {w}x{h}");
+                            match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
+                                Ok((encoding, data)) => {
+                                    match session.queue_clipboard_image_encoded(
+                                        cid, w, h, encoding, data,
+                                    ) {
+                                        Ok(QueueClipboardResult::Queued) => {
+                                            let out = session.take_outbox();
+                                            conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+                                            println!(
+                                                "sync_tx_image_from_path {w}x{h} {encoding:?}"
+                                            );
+                                        }
+                                        Ok(QueueClipboardResult::DuplicateContentId) => {
+                                            println!("sync_tx_image=skip duplicate_content_id");
+                                        }
+                                        Ok(QueueClipboardResult::UnchangedImage) => {
+                                            println!("clipboard_poll_image=skip_echo");
+                                        }
+                                        Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                            println!(
+                                                "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
+                                            );
+                                        }
+                                        Ok(QueueClipboardResult::UnchangedText) => {
+                                            println!("sync_tx_image=skip unexpected_text_result");
+                                        }
+                                        Err(err) => println!("sync_tx_image=error {err}"),
+                                    }
                                 }
-                                Ok(QueueClipboardResult::DuplicateContentId) => {
-                                    println!("sync_tx_image=skip duplicate_content_id");
-                                }
-                                Ok(QueueClipboardResult::UnchangedImage) => {
-                                    println!("clipboard_poll_image=skip_echo");
-                                }
-                                Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
-                                    println!(
-                                        "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
-                                    );
-                                }
-                                Ok(QueueClipboardResult::UnchangedText) => {
-                                    println!("sync_tx_image=skip unexpected_text_result");
-                                }
-                                Err(err) => println!("sync_tx_image=error {err}"),
+                                Err(err) => println!("sync_tx_image=prepare_error {err}"),
                             }
                         } else {
                             let cid = format!("clip-{}-{content_seq}", process::id());
@@ -566,35 +586,41 @@ fn run_bridge(
                     if session.state() == ConnectionState::Connected {
                         content_seq += 1;
                         let cid = format!("clip-img-{}-{content_seq}", process::id());
-                        match session.queue_clipboard_image(
-                            cid,
-                            image.width,
-                            image.height,
-                            image.rgba,
-                        ) {
-                            Ok(QueueClipboardResult::Queued) => {
-                                let out = session.take_outbox();
-                                conn.send_all(out.iter()).map_err(|e| e.to_string())?;
-                                println!(
-                                    "sync_tx_image {}x{}",
-                                    image.width, image.height
-                                );
+                        match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
+                            Ok((encoding, data)) => {
+                                match session.queue_clipboard_image_encoded(
+                                    cid,
+                                    image.width,
+                                    image.height,
+                                    encoding,
+                                    data,
+                                ) {
+                                    Ok(QueueClipboardResult::Queued) => {
+                                        let out = session.take_outbox();
+                                        conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+                                        println!(
+                                            "sync_tx_image {}x{} {encoding:?}",
+                                            image.width, image.height
+                                        );
+                                    }
+                                    Ok(QueueClipboardResult::DuplicateContentId) => {
+                                        println!("sync_tx_image=skip duplicate_content_id");
+                                    }
+                                    Ok(QueueClipboardResult::UnchangedImage) => {
+                                        println!("clipboard_poll_image=skip_echo");
+                                    }
+                                    Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                        println!(
+                                            "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
+                                        );
+                                    }
+                                    Ok(QueueClipboardResult::UnchangedText) => {
+                                        println!("sync_tx_image=skip unexpected_text_result");
+                                    }
+                                    Err(err) => println!("sync_tx_image=error {err}"),
+                                }
                             }
-                            Ok(QueueClipboardResult::DuplicateContentId) => {
-                                println!("sync_tx_image=skip duplicate_content_id");
-                            }
-                            Ok(QueueClipboardResult::UnchangedImage) => {
-                                println!("clipboard_poll_image=skip_echo");
-                            }
-                            Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
-                                println!(
-                                    "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
-                                );
-                            }
-                            Ok(QueueClipboardResult::UnchangedText) => {
-                                println!("sync_tx_image=skip unexpected_text_result");
-                            }
-                            Err(err) => println!("sync_tx_image=error {err}"),
+                            Err(err) => println!("sync_tx_image=prepare_error {err}"),
                         }
                     }
                 }

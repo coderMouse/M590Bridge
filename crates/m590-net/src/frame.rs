@@ -8,7 +8,7 @@
 //! - payload_len: u32 BE
 //! - payload: type-specific fields (strings = u32 BE len + UTF-8 bytes; u64 = BE)
 
-use m590_core::{ClipboardImagePayload, ClipboardTextPayload, DeviceId, Message, PROTOCOL_VERSION};
+use m590_core::{ClipboardImagePayload, ClipboardTextPayload, DeviceId, ImageEncoding, Message, PROTOCOL_VERSION};
 
 /// Wire magic bytes.
 pub const FRAME_MAGIC: &[u8; 4] = b"M590";
@@ -159,7 +159,8 @@ fn encode_payload(message: &Message) -> Result<(u8, Vec<u8>), FrameError> {
             write_string(&mut payload, &body.content_id)?;
             payload.extend_from_slice(&body.width.to_be_bytes());
             payload.extend_from_slice(&body.height.to_be_bytes());
-            write_bytes(&mut payload, &body.rgba)?;
+            payload.push(body.encoding.as_u8());
+            write_bytes(&mut payload, &body.data)?;
             TYPE_CLIPBOARD_IMAGE
         }
         Message::Goodbye { device_id, reason } => {
@@ -238,15 +239,27 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
             let content_id = read_string(&mut payload)?;
             let width = read_u32(&mut payload)?;
             let height = read_u32(&mut payload)?;
-            let rgba = read_bytes(&mut payload)?;
-            ensure_empty(payload)?;
-            let body = ClipboardImagePayload::new(device_id, content_id, width, height, rgba)
-                .map_err(|e| FrameError::InvalidField(match e {
-                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
-                    m590_core::ProtocolError::EmptyContentId => "content_id",
+            if payload.is_empty() {
+                return Err(FrameError::TruncatedPayload);
+            }
+            let encoding = ImageEncoding::from_u8(payload[0]).map_err(|e| {
+                FrameError::InvalidField(match e {
                     m590_core::ProtocolError::InvalidImage(reason) => reason,
-                    _ => "image",
-                }))?;
+                    _ => "encoding",
+                })
+            })?;
+            payload = &payload[1..];
+            let data = read_bytes(&mut payload)?;
+            ensure_empty(payload)?;
+            let body = ClipboardImagePayload::encoded(
+                device_id, content_id, width, height, encoding, data,
+            )
+            .map_err(|e| FrameError::InvalidField(match e {
+                m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                m590_core::ProtocolError::EmptyContentId => "content_id",
+                m590_core::ProtocolError::InvalidImage(reason) => reason,
+                _ => "image",
+            }))?;
             Ok(Message::ClipboardImage(body))
         }
         TYPE_GOODBYE => {

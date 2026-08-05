@@ -48,7 +48,8 @@ pub enum InboundClipboardResult {
         content_id: String,
         width: u32,
         height: u32,
-        rgba: Vec<u8>,
+        encoding: crate::ImageEncoding,
+        data: Vec<u8>,
     },
     /// `content_id` already seen — ignored.
     DuplicateContentId,
@@ -229,13 +230,31 @@ impl Session {
     /// Maximum raw RGBA bytes accepted for inline image sync.
     pub const INLINE_IMAGE_MAX_BYTES: usize = 12 * 1024 * 1024;
 
-    /// Queue outbound image after connected.
+    /// Queue outbound raw-RGBA image after connected (tests / tiny images).
     pub fn queue_clipboard_image(
         &mut self,
         content_id: impl Into<String>,
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+    ) -> Result<QueueClipboardResult, SessionError> {
+        self.queue_clipboard_image_encoded(
+            content_id,
+            width,
+            height,
+            crate::ImageEncoding::RawRgba,
+            rgba,
+        )
+    }
+
+    /// Queue outbound image with explicit on-wire encoding (PNG preferred).
+    pub fn queue_clipboard_image_encoded(
+        &mut self,
+        content_id: impl Into<String>,
+        width: u32,
+        height: u32,
+        encoding: crate::ImageEncoding,
+        data: Vec<u8>,
     ) -> Result<QueueClipboardResult, SessionError> {
         self.pending_outbox.clear();
         self.last_inbound_clipboard = None;
@@ -249,29 +268,30 @@ impl Session {
         if self.has_seen_content_id(&content_id) {
             return Ok(QueueClipboardResult::DuplicateContentId);
         }
-        let fp = image_fingerprint(width, height, &rgba);
+        let fp = image_fingerprint(width, height, encoding.as_u8(), &data);
         if self.last_clipboard_image_fp == Some(fp) {
             return Ok(QueueClipboardResult::UnchangedImage);
         }
-        if rgba.len() > Self::INLINE_IMAGE_MAX_BYTES {
+        if data.len() > Self::INLINE_IMAGE_MAX_BYTES {
             return Ok(QueueClipboardResult::ImageTooLarge {
-                byte_len: rgba.len(),
+                byte_len: data.len(),
                 limit: Self::INLINE_IMAGE_MAX_BYTES,
             });
         }
-        let payload = crate::ClipboardImagePayload::new(
+        let payload = crate::ClipboardImagePayload::encoded(
             self.local_device.clone(),
             content_id,
             width,
             height,
-            rgba,
+            encoding,
+            data,
         )?;
         self.sync_state = SyncState::Syncing;
         self.remember_content_id(payload.content_id.clone());
         self.last_clipboard_content_id = Some(payload.content_id.clone());
         self.last_clipboard_image_content_id = Some(payload.content_id.clone());
         self.last_clipboard_image_fp = Some(fp);
-        self.last_clipboard_image_bytes = Some(payload.rgba.len());
+        self.last_clipboard_image_bytes = Some(payload.data.len());
         self.pending_outbox
             .push(Message::clipboard_image(payload));
         self.sync_state = SyncState::Idle;
@@ -539,7 +559,7 @@ impl Session {
             self.last_inbound_clipboard = Some(InboundClipboardResult::DuplicateContentId);
             return Ok(());
         }
-        if payload.rgba.len() > Self::INLINE_IMAGE_MAX_BYTES {
+        if payload.data.len() > Self::INLINE_IMAGE_MAX_BYTES {
             return Err(SessionError::Protocol(ProtocolError::InvalidImage(
                 "image exceeds inline limit",
             )));
@@ -549,14 +569,20 @@ impl Session {
         self.remember_content_id(payload.content_id.clone());
         self.last_clipboard_content_id = Some(payload.content_id.clone());
         self.last_clipboard_image_content_id = Some(payload.content_id.clone());
-        let fp = image_fingerprint(payload.width, payload.height, &payload.rgba);
+        let fp = image_fingerprint(
+            payload.width,
+            payload.height,
+            payload.encoding.as_u8(),
+            &payload.data,
+        );
         self.last_clipboard_image_fp = Some(fp);
-        self.last_clipboard_image_bytes = Some(payload.rgba.len());
+        self.last_clipboard_image_bytes = Some(payload.data.len());
         self.last_inbound_clipboard = Some(InboundClipboardResult::AppliedImage {
             content_id: payload.content_id,
             width: payload.width,
             height: payload.height,
-            rgba: payload.rgba,
+            encoding: payload.encoding,
+            data: payload.data,
         });
         self.sync_state = SyncState::Idle;
         Ok(())
@@ -616,13 +642,14 @@ impl Session {
     }
 }
 
-fn image_fingerprint(width: u32, height: u32, rgba: &[u8]) -> u64 {
+fn image_fingerprint(width: u32, height: u32, encoding: u8, data: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     width.hash(&mut hasher);
     height.hash(&mut hasher);
-    rgba.hash(&mut hasher);
+    encoding.hash(&mut hasher);
+    data.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -838,7 +865,8 @@ mod tests {
                 content_id: "img-1".into(),
                 width: 1,
                 height: 1,
-                rgba: rgba.clone(),
+                encoding: crate::ImageEncoding::RawRgba,
+                data: rgba.clone(),
             })
         );
         assert_eq!(

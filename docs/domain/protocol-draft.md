@@ -39,9 +39,9 @@
 | 7 | HeartbeatAck | seq |
 | 8 | ClipboardText | device_id, content_id, text |
 | 9 | Goodbye | device_id, reason |
-| 10 | ClipboardImage | device_id, content_id, width u32, height u32, rgba bytes |
+| 10 | ClipboardImage | device_id, content_id, width u32, height u32, encoding u8 (0=RGBA,1=PNG), data bytes |
 
-`ClipboardImage` 的 `rgba` 为 row-major **RGBA8**，长度必须为 `width * height * 4`。
+`ClipboardImage`：`encoding=0` 时 data 为 row-major **RGBA8**（长度 `width*height*4`）；`encoding=1` 时 data 为 **PNG**（推荐，截图更小）。
 
 所有业务消息在类型上携带或保留 `DeviceId`，便于以后扩展；**运行时 MVP 仅 1 peer**。
 

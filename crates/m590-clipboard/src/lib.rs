@@ -96,6 +96,71 @@ impl ImageClipboard {
         self.rgba.hash(&mut hasher);
         hasher.finish()
     }
+
+    /// Encode as PNG (for compact on-wire transfer).
+    pub fn to_png_bytes(&self) -> Result<Vec<u8>, ClipboardError> {
+        let img = image::RgbaImage::from_raw(self.width, self.height, self.rgba.clone())
+            .ok_or_else(|| ClipboardError::Backend("rgba buffer rejected by image crate".into()))?;
+        let mut out = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut out);
+        use image::ImageEncoder;
+        encoder
+            .write_image(
+                img.as_raw(),
+                self.width,
+                self.height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| ClipboardError::Backend(format!("png encode: {e}")))?;
+        Ok(out)
+    }
+
+    /// Decode wire payload (raw RGBA or PNG) into an OS-clipboard image.
+    pub fn from_wire(
+        width: u32,
+        height: u32,
+        encoding: m590_core::ImageEncoding,
+        data: Vec<u8>,
+    ) -> Result<Self, ClipboardError> {
+        match encoding {
+            m590_core::ImageEncoding::RawRgba => Self::from_rgba(width, height, data),
+            m590_core::ImageEncoding::Png => {
+                let dyn_img = image::load_from_memory(&data)
+                    .map_err(|e| ClipboardError::Backend(format!("png decode: {e}")))?;
+                let rgba = dyn_img.to_rgba8();
+                // Trust decoded dimensions; peer width/height are advisory.
+                Self::from_rgba(rgba.width(), rgba.height(), rgba.into_raw())
+            }
+        }
+    }
+
+    /// Choose PNG when it fits the inline budget (typical screenshots); else raw if it fits.
+    pub fn prepare_inline(
+        &self,
+        max_bytes: usize,
+    ) -> Result<(m590_core::ImageEncoding, Vec<u8>), ClipboardError> {
+        match self.to_png_bytes() {
+            Ok(png) if png.len() <= max_bytes => {
+                return Ok((m590_core::ImageEncoding::Png, png));
+            }
+            Ok(png) if self.rgba.len() <= max_bytes => {
+                // PNG larger than budget somehow but raw fits — rare.
+                let _ = png;
+                return Ok((m590_core::ImageEncoding::RawRgba, self.rgba.clone()));
+            }
+            Ok(png) => {
+                return Err(ClipboardError::Backend(format!(
+                    "image too large for inline sync png={}B raw={}B limit={max_bytes}B",
+                    png.len(),
+                    self.rgba.len()
+                )));
+            }
+            Err(_png_err) if self.rgba.len() <= max_bytes => {
+                return Ok((m590_core::ImageEncoding::RawRgba, self.rgba.clone()));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Trait boundary for clipboard backends.
@@ -463,6 +528,26 @@ mod tests {
     #[test]
     fn owner_label_uses_app_name() {
         assert!(placeholder_owner_label().contains(m590_core::APP_NAME));
+    }
+
+    #[test]
+    fn prepare_inline_prefers_png_and_roundtrips() {
+        // Smooth image compresses well vs raw RGBA.
+        let mut rgba = vec![0u8; 200 * 100 * 4];
+        for px in rgba.chunks_mut(4) {
+            px[0] = 10;
+            px[1] = 20;
+            px[2] = 30;
+            px[3] = 255;
+        }
+        let img = ImageClipboard::from_rgba(200, 100, rgba).unwrap();
+        let raw_len = img.rgba.len();
+        let (enc, data) = img.prepare_inline(12 * 1024 * 1024).unwrap();
+        assert_eq!(enc, m590_core::ImageEncoding::Png);
+        assert!(data.len() < raw_len);
+        let back = ImageClipboard::from_wire(200, 100, enc, data).unwrap();
+        assert_eq!((back.width, back.height), (200, 100));
+        assert_eq!(back.rgba.len(), raw_len);
     }
 
     #[test]

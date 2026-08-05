@@ -721,18 +721,37 @@ fn run_session_loop(
                             content_id,
                             width,
                             height,
-                            rgba,
+                            encoding,
+                            data,
                         }) => {
+                            let summary = format!(
+                                "[image {width}x{height} {}B {encoding:?}]",
+                                data.len()
+                            );
                             with_status(&shared, |s| {
                                 s.last_sync_content_id = Some(content_id);
-                                s.last_sync_text =
-                                    Some(format!("[image {width}x{height} {}B]", rgba.len()));
+                                s.last_sync_text = Some(summary);
+                                s.last_error = None;
                             });
                             if let Some(clip) = clipboard.as_mut() {
-                                if let Ok(image) =
-                                    m590_clipboard::ImageClipboard::from_rgba(width, height, rgba)
-                                {
-                                    let _ = clip.write_image(&image);
+                                match m590_clipboard::ImageClipboard::from_wire(
+                                    width, height, encoding, data,
+                                ) {
+                                    Ok(image) => {
+                                        if let Err(err) = clip.write_image(&image) {
+                                            with_status(&shared, |s| {
+                                                s.last_error = Some(format!(
+                                                    "clipboard_write_image: {err}"
+                                                ));
+                                            });
+                                        }
+                                    }
+                                    Err(err) => {
+                                        with_status(&shared, |s| {
+                                            s.last_error =
+                                                Some(format!("image_decode: {err}"));
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -754,31 +773,49 @@ fn run_session_loop(
                         content_seq += 1;
                         let cid =
                             format!("ui-clip-imgfiles-{}-{content_seq}", std::process::id());
-                        let summary = format!(
-                            "[image {}x{} {}B from file]",
-                            image.width,
-                            image.height,
-                            image.rgba.len()
-                        );
-                        match session.queue_clipboard_image(
-                            cid,
-                            image.width,
-                            image.height,
-                            image.rgba,
-                        ) {
-                            Ok(QueueClipboardResult::Queued) => {
-                                conn.send_all(session.take_outbox().iter())
-                                    .map_err(|e| e.to_string())?;
+                        match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
+                            Ok((encoding, data)) => {
+                                let summary = format!(
+                                    "[image {}x{} {}B {encoding:?} from file]",
+                                    image.width,
+                                    image.height,
+                                    data.len()
+                                );
+                                match session.queue_clipboard_image_encoded(
+                                    cid,
+                                    image.width,
+                                    image.height,
+                                    encoding,
+                                    data,
+                                ) {
+                                    Ok(QueueClipboardResult::Queued) => {
+                                        conn.send_all(session.take_outbox().iter())
+                                            .map_err(|e| e.to_string())?;
+                                        with_status(&shared, |s| {
+                                            s.last_sync_text = Some(summary);
+                                            s.last_error = None;
+                                        });
+                                    }
+                                    Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                        with_status(&shared, |s| {
+                                            s.last_error = Some(format!(
+                                                "图片过大已跳过 {byte_len}B > {limit}B"
+                                            ));
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        with_status(&shared, |s| {
+                                            s.last_error = Some(format!("queue_image: {err}"));
+                                        });
+                                    }
+                                }
+                            }
+                            Err(err) => {
                                 with_status(&shared, |s| {
-                                    s.last_sync_text = Some(summary);
+                                    s.last_error = Some(format!("prepare_image: {err}"));
                                 });
                             }
-                            Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
-                                eprintln!(
-                                    "m590-hub: skip oversized image-from-file-list bytes={byte_len} limit={limit}"
-                                );
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -788,31 +825,49 @@ fn run_session_loop(
                     // Prefer decoding local image files into ClipboardImage.
                     if let Ok(Some(image)) = m590_clipboard::image_from_clipboard_text(&text) {
                         let cid = format!("ui-clip-imgfile-{}-{content_seq}", std::process::id());
-                        let summary = format!(
-                            "[image {}x{} {}B]",
-                            image.width,
-                            image.height,
-                            image.rgba.len()
-                        );
-                        match session.queue_clipboard_image(
-                            cid,
-                            image.width,
-                            image.height,
-                            image.rgba,
-                        ) {
-                            Ok(QueueClipboardResult::Queued) => {
-                                conn.send_all(session.take_outbox().iter())
-                                    .map_err(|e| e.to_string())?;
+                        match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
+                            Ok((encoding, data)) => {
+                                let summary = format!(
+                                    "[image {}x{} {}B {encoding:?} from path]",
+                                    image.width,
+                                    image.height,
+                                    data.len()
+                                );
+                                match session.queue_clipboard_image_encoded(
+                                    cid,
+                                    image.width,
+                                    image.height,
+                                    encoding,
+                                    data,
+                                ) {
+                                    Ok(QueueClipboardResult::Queued) => {
+                                        conn.send_all(session.take_outbox().iter())
+                                            .map_err(|e| e.to_string())?;
+                                        with_status(&shared, |s| {
+                                            s.last_sync_text = Some(summary);
+                                            s.last_error = None;
+                                        });
+                                    }
+                                    Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                        with_status(&shared, |s| {
+                                            s.last_error = Some(format!(
+                                                "图片过大已跳过 {byte_len}B > {limit}B"
+                                            ));
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        with_status(&shared, |s| {
+                                            s.last_error = Some(format!("queue_image: {err}"));
+                                        });
+                                    }
+                                }
+                            }
+                            Err(err) => {
                                 with_status(&shared, |s| {
-                                    s.last_sync_text = Some(summary);
+                                    s.last_error = Some(format!("prepare_image: {err}"));
                                 });
                             }
-                            Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
-                                eprintln!(
-                                    "m590-hub: skip oversized image-from-path bytes={byte_len} limit={limit}"
-                                );
-                            }
-                            _ => {}
                         }
                     } else {
                         let cid = format!("ui-clip-{}-{content_seq}", std::process::id());
@@ -827,34 +882,60 @@ fn run_session_loop(
                         }
                     }
                 }
-                if let Ok(Some(image)) = clip.poll_image_change() {
-                    content_seq += 1;
-                    let cid = format!("ui-clip-img-{}-{content_seq}", std::process::id());
-                    let summary = format!(
-                        "[image {}x{} {}B]",
-                        image.width,
-                        image.height,
-                        image.rgba.len()
-                    );
-                    match session.queue_clipboard_image(
-                        cid,
-                        image.width,
-                        image.height,
-                        image.rgba,
-                    ) {
-                        Ok(QueueClipboardResult::Queued) => {
-                            conn.send_all(session.take_outbox().iter())
-                                .map_err(|e| e.to_string())?;
-                            with_status(&shared, |s| {
-                                s.last_sync_text = Some(summary);
-                            });
+                match clip.poll_image_change() {
+                    Ok(Some(image)) => {
+                        content_seq += 1;
+                        let cid = format!("ui-clip-img-{}-{content_seq}", std::process::id());
+                        match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
+                            Ok((encoding, data)) => {
+                                let summary = format!(
+                                    "[image {}x{} {}B {encoding:?}]",
+                                    image.width,
+                                    image.height,
+                                    data.len()
+                                );
+                                match session.queue_clipboard_image_encoded(
+                                    cid,
+                                    image.width,
+                                    image.height,
+                                    encoding,
+                                    data,
+                                ) {
+                                    Ok(QueueClipboardResult::Queued) => {
+                                        conn.send_all(session.take_outbox().iter())
+                                            .map_err(|e| e.to_string())?;
+                                        with_status(&shared, |s| {
+                                            s.last_sync_text = Some(summary);
+                                            s.last_error = None;
+                                        });
+                                    }
+                                    Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                        with_status(&shared, |s| {
+                                            s.last_error = Some(format!(
+                                                "图片过大已跳过 {byte_len}B > {limit}B"
+                                            ));
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        with_status(&shared, |s| {
+                                            s.last_error = Some(format!("queue_image: {err}"));
+                                        });
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                with_status(&shared, |s| {
+                                    s.last_error = Some(format!("prepare_image: {err}"));
+                                });
+                            }
                         }
-                        Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
-                            eprintln!(
-                                "m590-hub: skip oversized image bytes={byte_len} limit={limit}"
-                            );
-                        }
-                        _ => {}
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        with_status(&shared, |s| {
+                            s.last_error = Some(format!("clipboard_image_poll: {err}"));
+                        });
                     }
                 }
             }
