@@ -37,6 +37,8 @@ pub enum SessionError {
     },
     Protocol(ProtocolError),
     UnexpectedPeer(String),
+    /// Peer rejected pairing (wrong/expired code, etc.).
+    PairRejected(String),
 }
 
 impl fmt::Display for SessionError {
@@ -47,6 +49,13 @@ impl fmt::Display for SessionError {
             }
             Self::Protocol(err) => write!(f, "protocol error: {err}"),
             Self::UnexpectedPeer(id) => write!(f, "unexpected peer device id: {id}"),
+            Self::PairRejected(reason) => {
+                if reason.is_empty() {
+                    write!(f, "pairing rejected by peer")
+                } else {
+                    write!(f, "pairing rejected by peer: {reason}")
+                }
+            }
         }
     }
 }

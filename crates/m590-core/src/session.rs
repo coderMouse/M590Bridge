@@ -548,9 +548,9 @@ impl Session {
                 pairing_code,
             } => self.on_pair_request(device_id, pairing_code),
             Message::PairAccept { device_id } => self.on_pair_accept(device_id),
-            Message::PairReject { .. } => {
+            Message::PairReject { reason, .. } => {
                 self.reset_to_disconnected(true);
-                Ok(())
+                Err(SessionError::PairRejected(reason))
             }
             Message::Heartbeat { seq } => {
                 if self.state != ConnectionState::Connected {
@@ -1153,6 +1153,27 @@ mod tests {
             [Message::PairReject { reason, .. }] if reason == "pairing code mismatch"
         ));
         assert_eq!(host.state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn pair_reject_message_surfaces_error() {
+        let mut joiner = Session::new(DeviceId::new("joiner")).unwrap();
+        joiner
+            .handle(SessionEvent::StartPairing {
+                expected_code: "111111".into(),
+            })
+            .unwrap();
+        let _ = joiner.take_outbox();
+        let err = joiner
+            .handle(SessionEvent::Message(
+                Message::pair_reject(DeviceId::new("host"), "pairing code mismatch").unwrap(),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::PairRejected(reason) if reason == "pairing code mismatch"
+        ));
+        assert_eq!(joiner.state(), ConnectionState::Disconnected);
     }
 
     #[test]

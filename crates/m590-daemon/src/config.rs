@@ -24,7 +24,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            device_id: format!("ui-{}", std::process::id()),
+            device_id: default_device_id(),
             last_role: None,
             pairing_code: None,
             listen_port: DEFAULT_PORT,
@@ -34,6 +34,49 @@ impl Default for AppConfig {
             file_save_dir: default_file_save_dir().display().to_string(),
         }
     }
+}
+
+/// Stable-ish id: hostname + short random suffix (not PID — survives restarts without colliding as often across machines).
+fn default_device_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "m590".into());
+    let mut label = String::with_capacity(host.len());
+    let mut prev_hyphen = false;
+    for c in host.chars() {
+        if label.len() >= 24 {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            label.push(c.to_ascii_lowercase());
+            prev_hyphen = false;
+        } else if !label.is_empty() && !prev_hyphen {
+            // Collapse any run of non-alnum into a single hyphen.
+            label.push('-');
+            prev_hyphen = true;
+        }
+    }
+    while label.ends_with('-') {
+        label.pop();
+    }
+    if label.is_empty() {
+        label.push_str("m590");
+    }
+    // 4 hex from mixed entropy so two fresh installs on same host rarely share id.
+    let mix = std::process::id() as u64
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+    format!("{label}-{:04x}", (mix & 0xffff) as u16)
 }
 
 /// Default inbox for received files (platform data dir / m590bridge/inbox).

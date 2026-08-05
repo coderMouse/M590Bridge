@@ -547,8 +547,8 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
             }
             Err(err) => {
                 let friendly = humanize_bridge_error(&err);
-                // Version skew cannot self-heal by reconnecting; stop and show upgrade hint.
-                if is_protocol_mismatch(&err) {
+                // Version skew / bad pair code / timeout cannot self-heal by reconnecting.
+                if is_protocol_mismatch(&err) || is_non_retriable_pair_error(&err) {
                     with_status(&shared, |s| {
                         s.phase = HubPhase::Error;
                         s.last_error = Some(friendly);
@@ -602,6 +602,19 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
 
 fn humanize_bridge_error(err: &str) -> String {
     let lower = err.to_ascii_lowercase();
+    if lower.contains("pairing rejected") || lower.contains("pairing code mismatch") {
+        return format!(
+            "配对码错误或已过期（两端请使用同一 6 位码）。详情：{err}"
+        );
+    }
+    if lower.contains("pairing timeout") {
+        return err.to_string();
+    }
+    if lower.contains("unexpected peer device id") {
+        return format!(
+            "两端 device_id 冲突或异常（设置里改成本机唯一名称后重试）。详情：{err}"
+        );
+    }
     if lower.contains("unknown message type") {
         let ty = lower
             .split("unknown message type")
@@ -632,6 +645,16 @@ fn humanize_bridge_error(err: &str) -> String {
 fn is_protocol_mismatch(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("unknown message type") || lower.contains("unsupported protocol version")
+}
+
+/// Failures that will not heal by blind reconnect (wrong code, timeout, id clash).
+fn is_non_retriable_pair_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("pairing rejected")
+        || lower.contains("pairing code mismatch")
+        || lower.contains("pairing timeout")
+        || lower.contains("unexpected peer device id")
+        || lower.contains("pairing failed")
 }
 
 fn reconnect_delay_secs(attempt: u32) -> u64 {
@@ -800,28 +823,42 @@ fn run_session_loop(
     let mut last_heartbeat = Instant::now();
     let mut last_peer_rx = Instant::now();
     let mut content_seq = 0u64;
+    const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
+    let pairing_started = Instant::now();
 
     while session.state() != ConnectionState::Connected {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             let _ = session.handle(SessionEvent::Disconnect);
             return Ok(());
         }
+        if pairing_started.elapsed() > PAIRING_TIMEOUT {
+            let _ = session.handle(SessionEvent::Disconnect);
+            return Err(format!(
+                "pairing timeout ({}s): 请确认对端已开始等待/连接、配对码一致、防火墙放行端口",
+                PAIRING_TIMEOUT.as_secs()
+            ));
+        }
         conn.set_read_timeout(Some(Duration::from_millis(200)))
             .map_err(|e| e.to_string())?;
         conn.set_nonblocking(false).map_err(|e| e.to_string())?;
         match conn.recv() {
             Ok(msg) => {
-                session
-                    .handle(SessionEvent::Message(msg))
-                    .map_err(|e| e.to_string())?;
-                conn.send_all(session.take_outbox().iter())
-                    .map_err(|e| e.to_string())?;
+                // Drain reject/outbox even when handle returns PairRejected.
+                let handle_result = session.handle(SessionEvent::Message(msg));
+                let send_result = conn.send_all(session.take_outbox().iter());
+                send_result.map_err(|e| e.to_string())?;
+                handle_result.map_err(|e| e.to_string())?;
                 last_peer_rx = Instant::now();
+                if session.state() == ConnectionState::Disconnected {
+                    return Err("pairing failed: session disconnected".into());
+                }
             }
             Err(m590_net::TcpError::Io(err))
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(m590_net::TcpError::Disconnected) => return Err("peer disconnected".into()),
+            Err(m590_net::TcpError::Disconnected) => {
+                return Err("peer disconnected during pairing".into())
+            }
             Err(err) => return Err(err.to_string()),
         }
     }

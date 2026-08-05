@@ -514,13 +514,21 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
 
             <div className="mb-4 text-center text-[12px] text-[#6B7589]">
               {status?.phase === 'waiting_peer' && '正在等待另一台电脑…'}
-              {status?.phase === 'pairing' && '正在配对…'}
+              {status?.phase === 'pairing' &&
+                (status.last_error
+                  ? `配对中…（${status.last_error}）`
+                  : '正在配对…（约 30 秒超时）')}
               {status?.phase === 'connected' && '配对成功'}
               {status?.phase === 'idle' && '就绪'}
               {status?.phase === 'error' && (
                 <span className="text-destructive">失败：{status.last_error ?? '未知错误'}</span>
               )}
             </div>
+            {status?.phase === 'error' && status.last_error ? (
+              <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-left text-[11px] leading-4 text-destructive">
+                {status.last_error}
+              </div>
+            ) : null}
 
             <PrimaryButton
               loading={busy || status?.phase === 'pairing'}
