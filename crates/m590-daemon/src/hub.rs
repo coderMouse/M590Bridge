@@ -485,11 +485,23 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob) {
                 break;
             }
             Err(err) => {
+                let friendly = humanize_bridge_error(&err);
+                // Version skew cannot self-heal by reconnecting; stop and show upgrade hint.
+                if is_protocol_mismatch(&err) {
+                    with_status(&shared, |s| {
+                        s.phase = HubPhase::Error;
+                        s.last_error = Some(friendly);
+                        s.connection = Some(ConnectionState::Disconnected);
+                        s.peer_device = None;
+                        s.reconnect_attempt = 0;
+                    });
+                    break;
+                }
                 let auto = with_status(&shared, |s| s.auto_reconnect);
                 if !auto {
                     with_status(&shared, |s| {
                         s.phase = HubPhase::Error;
-                        s.last_error = Some(err);
+                        s.last_error = Some(friendly);
                         s.connection = Some(ConnectionState::Disconnected);
                         s.peer_device = None;
                         s.reconnect_attempt = 0;
@@ -501,7 +513,7 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob) {
                 with_status(&shared, |s| {
                     s.phase = HubPhase::Pairing;
                     s.last_error = Some(format!(
-                        "disconnected ({err}); auto-reconnect in {delay_secs}s (#{attempt})"
+                        "disconnected ({friendly}); auto-reconnect in {delay_secs}s (#{attempt})"
                     ));
                     s.connection = Some(ConnectionState::Disconnected);
                     s.peer_device = None;
@@ -522,6 +534,40 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob) {
         }
     }
     BRIDGE_RUNNING.store(false, Ordering::SeqCst);
+}
+
+fn humanize_bridge_error(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("unknown message type") {
+        let ty = lower
+            .split("unknown message type")
+            .nth(1)
+            .and_then(|s| {
+                let digits: String = s
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if digits.is_empty() {
+                    None
+                } else {
+                    Some(digits)
+                }
+            })
+            .unwrap_or_else(|| "?".into());
+        return format!(
+            "协议不兼容：未知消息类型 {ty}（11+=文件通道）。请 Linux 与 Windows 两端同时升级到同一版本后重连：git pull && cargo build -p m590-ui。详情：{err}"
+        );
+    }
+    if lower.contains("unsupported protocol version") {
+        return format!("协议版本不匹配，请两端升级到同一版本。详情：{err}");
+    }
+    err.to_string()
+}
+
+fn is_protocol_mismatch(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("unknown message type") || lower.contains("unsupported protocol version")
 }
 
 fn reconnect_delay_secs(attempt: u32) -> u64 {

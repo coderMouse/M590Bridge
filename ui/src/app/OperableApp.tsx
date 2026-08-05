@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Copy, Link2, RefreshCw, Settings, WifiOff, Monitor, Info, FileUp } from 'lucide-react'
 import { AppIcon } from '@/components/AppIcon'
 import { PrimaryButton } from '@/components/PrimaryButton'
@@ -59,6 +59,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const [settingsFileSaveDir, setSettingsFileSaveDir] = useState('')
   const [fileBusy, setFileBusy] = useState(false)
   const [pickedFileLabel, setPickedFileLabel] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const apiBase = useMemo(() => getApiBase(), [])
 
@@ -504,21 +505,30 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                     {filePhaseLabel(status?.file_transfer_phase)}
                   </span>
                 </div>
-                <div className="mb-2 text-[11px] text-[#6B7589]">
+                <div className="mb-2 text-[11px] leading-4 text-[#6B7589]">
                   单文件上限 4MiB；对端自动接收并写入其保存目录。
+                  <br />
+                  两端必须同一版本（含文件通道）。若对端报 unknown message type 11，请升级对端后重连。
                 </div>
-                <label className="mb-2 block">
-                  <input
-                    type="file"
-                    className="block w-full text-[12px] file:mr-3 file:rounded-md file:border-0 file:bg-[#EEF2FF] file:px-3 file:py-1.5 file:text-[12px] file:font-semibold file:text-primary"
-                    disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
-                    onChange={(e) => {
-                      const f = e.target.files?.[0] ?? null
-                      void onPickAndSendFile(f)
-                      e.target.value = ''
-                    }}
-                  />
-                </label>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="hidden"
+                  disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0] ?? null
+                    void onPickAndSendFile(f)
+                    e.target.value = ''
+                  }}
+                />
+                <PrimaryButton
+                  className="mb-2"
+                  loading={fileBusy}
+                  disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <FileUp size={14} /> 选择并发送文件
+                </PrimaryButton>
                 {pickedFileLabel ? (
                   <div className="mb-2 truncate text-[11px] text-[#6B7589]">已选：{pickedFileLabel}</div>
                 ) : null}

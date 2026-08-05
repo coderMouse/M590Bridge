@@ -13,6 +13,7 @@ Linux + Windows 剪贴板与小文件桥；V2 文件走元数据 + 按需传输 
 - [x] **task-020** 文件协议 + Session loopback
 - [x] **task-021** hub 落盘 / send_file / status
 - [x] **task-022** UI 选文件发送、进度条、保存目录设置；`send_file_bytes`
+- [x] **task-023** 协议不兼容提示（type 11）+ Win 选文件按钮
 
 ## 进行中
 

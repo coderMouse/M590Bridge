@@ -54,7 +54,9 @@ curl -s -X POST http://127.0.0.1:5910/api/send_file_bytes \
 curl -s http://127.0.0.1:5910/api/status   # file_transfer_phase / last_file_* / file_bytes_*
 ```
 
-UI：`m590-ui` 主面板选文件发送；设置页可改 `file_save_dir`。
+UI：`m590-ui` 主面板「选择并发送文件」；设置页可改 `file_save_dir`。
+
+**重要**：Linux/Windows **必须同一构建**。若一端报 `unknown message type 11`，对端仍是旧版——两端 `git pull && cargo build -p m590-ui` 后重开。
 
 默认保存目录：平台 data 目录下 `m590bridge/inbox`。单文件 ≤ 4MiB。
 

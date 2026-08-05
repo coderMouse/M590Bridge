@@ -41,7 +41,10 @@ impl std::fmt::Display for FrameError {
             Self::BufferTooShort => write!(f, "buffer too short for frame header"),
             Self::InvalidMagic => write!(f, "invalid frame magic"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported protocol version {v}"),
-            Self::UnknownMessageType(t) => write!(f, "unknown message type {t}"),
+            Self::UnknownMessageType(t) => write!(
+                f,
+                "unknown message type {t} (protocol mismatch; upgrade both peers to the same build — type 11+ is file channel)"
+            ),
             Self::PayloadTooLarge(n) => write!(f, "payload too large: {n} bytes"),
             Self::TruncatedPayload => write!(f, "truncated payload"),
             Self::InvalidUtf8 => write!(f, "invalid utf-8 in payload"),
@@ -514,6 +517,13 @@ mod tests {
         );
         let decoded = decode_frame(&encode_frame(&msg).unwrap()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn unknown_message_type_mentions_upgrade() {
+        let msg = FrameError::UnknownMessageType(11).to_string();
+        assert!(msg.contains("11"), "{msg}");
+        assert!(msg.contains("protocol mismatch") || msg.contains("upgrade"), "{msg}");
     }
 
     #[test]
