@@ -1,7 +1,7 @@
 # 协议草案 · M590Bridge
 
-> 状态：draft（至 task-018 图片 PNG）  
-> 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；文件分片仍后置（task-019+）
+> 状态：draft（至 task-020 文件通道第一刀）  
+> 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；**文件 offer/request/chunk/complete（会话内存 loopback）**
 
 ## 版本
 
@@ -24,7 +24,8 @@
 `u32` / `u64` 字段：大端。
 
 最大 payload：`MAX_PAYLOAD_LEN = 16 MiB`。  
-内联图片软上限：`Session::INLINE_IMAGE_MAX_BYTES = 12 MiB`（超出则发送侧 skip）。
+内联图片软上限：`Session::INLINE_IMAGE_MAX_BYTES = 12 MiB`（超出则发送侧 skip）。  
+文件会话内存上限（第一刀）：`Session::MAX_FILE_BYTES = 4 MiB`；分片 `FILE_CHUNK_SIZE = 64 KiB`。
 
 ## 消息类型（msg_type）
 
@@ -40,8 +41,25 @@
 | 8 | ClipboardText | device_id, content_id, text |
 | 9 | Goodbye | device_id, reason |
 | 10 | ClipboardImage | device_id, content_id, width u32, height u32, encoding u8 (0=RGBA,1=PNG), data bytes |
+| 11 | FileOffer | device_id, transfer_id, file_name, size u64 |
+| 12 | FileRequest | device_id, transfer_id |
+| 13 | FileChunk | device_id, transfer_id, offset u64, data bytes |
+| 14 | FileComplete | device_id, transfer_id, ok u8 (0/1), message string |
 
 `ClipboardImage`：`encoding=0` 时 data 为 row-major **RGBA8**（长度 `width*height*4`）；`encoding=1` 时 data 为 **PNG**（推荐，截图更小）。
+
+### 文件通道（task-020）
+
+按需拉取语义：
+
+1. 发送方 `offer_file`：内存 staged + 发 `FileOffer`（`file_name` 仅为 basename，禁止路径分隔符）
+2. 接收方见 offer 后 `request_file` → `FileRequest`
+3. 发送方按 `FILE_CHUNK_SIZE` 连续 `FileChunk`（offset 从 0 递增），再 `FileComplete(ok=1)`
+4. 空文件：无 chunk，直接 `FileComplete`
+5. 未知 transfer / 校验失败：`FileComplete(ok=0, message=…)` 或接收侧 `InboundFileResult::Failed`
+
+**hub（task-021）**：自动 request + `file_save_dir` 落盘；`POST /api/send_file`；status 进度字段。  
+**仍未做**：进度 UI、OS 文件剪贴板、文件夹、断点续传、>4MiB。
 
 所有业务消息在类型上携带或保留 `DeviceId`，便于以后扩展；**运行时 MVP 仅 1 peer**。
 
@@ -57,7 +75,7 @@
 
 - QUIC / 公网中继
 - 加密套件定稿（见 open-questions Q7）
-- 文件分片 / 按需拉文件
+- 文件 UI / OS 文件剪贴板 / >4MiB
 - 多 peer 网格
 
 ## 传输（task-006）
@@ -68,6 +86,7 @@
 - 配对：host listen 持有 pairing code；joiner connect 发送 Hello + PairRequest
 - 文本：Connected 后发送 `ClipboardText`；接收方可写 OS 剪贴板
 - 图片（task-014..018）：Connected 后发送 `ClipboardImage`（优先 PNG）；超限 `ImageTooLarge` / `last_error`；TCP send 前恢复 blocking
+- 文件（task-020）：Connected 后 `FileOffer` → `FileRequest` → `FileChunk`* → `FileComplete`；当前仅 session/memory loopback
 
 ## 运行时硬化（task-007）
 

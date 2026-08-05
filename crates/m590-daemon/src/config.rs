@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub connect_addr: Option<String>,
     pub auto_sync: bool,
     pub auto_reconnect: bool,
+    /// Directory for received file-channel payloads (created on demand).
+    pub file_save_dir: String,
 }
 
 impl Default for AppConfig {
@@ -29,7 +31,32 @@ impl Default for AppConfig {
             connect_addr: None,
             auto_sync: true,
             auto_reconnect: true,
+            file_save_dir: default_file_save_dir().display().to_string(),
         }
+    }
+}
+
+/// Default inbox for received files (platform data dir / m590bridge/inbox).
+pub fn default_file_save_dir() -> PathBuf {
+    if let Some(mut base) = platform_data_dir() {
+        base.push("m590bridge");
+        base.push("inbox");
+        return base;
+    }
+    PathBuf::from("m590bridge-inbox")
+}
+
+fn platform_data_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            return Some(PathBuf::from(xdg));
+        }
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
     }
 }
 
@@ -100,6 +127,11 @@ impl AppConfig {
         if let Some(v) = json_bool(body, "auto_reconnect") {
             self.auto_reconnect = v;
         }
+        if let Some(v) = json_str(body, "file_save_dir") {
+            if !v.is_empty() {
+                self.file_save_dir = v;
+            }
+        }
     }
 }
 
@@ -167,6 +199,7 @@ pub fn format_config(cfg: &AppConfig) -> String {
         format!("listen_port={}", cfg.listen_port),
         format!("auto_sync={}", cfg.auto_sync),
         format!("auto_reconnect={}", cfg.auto_reconnect),
+        format!("file_save_dir={}", cfg.file_save_dir),
     ];
     if let Some(role) = &cfg.last_role {
         lines.push(format!("last_role={role}"));
@@ -205,6 +238,7 @@ pub fn parse_config(raw: &str) -> AppConfig {
             "connect_addr" if !v.is_empty() => cfg.connect_addr = Some(v.to_string()),
             "auto_sync" => cfg.auto_sync = parse_bool(v, cfg.auto_sync),
             "auto_reconnect" => cfg.auto_reconnect = parse_bool(v, cfg.auto_reconnect),
+            "file_save_dir" if !v.is_empty() => cfg.file_save_dir = v.to_string(),
             _ => {}
         }
     }
@@ -286,6 +320,7 @@ mod tests {
         cfg.connect_addr = Some("192.168.1.10:5901".into());
         cfg.auto_sync = false;
         cfg.auto_reconnect = true;
+        cfg.file_save_dir = "/tmp/m590-inbox-test".into();
         save_config_to(&path, &cfg).expect("save");
         let loaded = load_config_from(&path);
         let _ = fs::remove_file(&path);
@@ -296,14 +331,16 @@ mod tests {
         assert_eq!(loaded.connect_addr.as_deref(), Some("192.168.1.10:5901"));
         assert!(!loaded.auto_sync);
         assert!(loaded.auto_reconnect);
+        assert_eq!(loaded.file_save_dir, "/tmp/m590-inbox-test");
     }
 
     #[test]
     fn apply_json_patch_partial() {
         let mut cfg = AppConfig::default();
-        cfg.apply_json_patch(r#"{"auto_reconnect":false,"listen_port":5911,"connect_addr":"10.0.0.2:5901"}"#);
+        cfg.apply_json_patch(r#"{"auto_reconnect":false,"listen_port":5911,"connect_addr":"10.0.0.2:5901","file_save_dir":"/tmp/inbox2"}"#);
         assert!(!cfg.auto_reconnect);
         assert_eq!(cfg.listen_port, 5911);
         assert_eq!(cfg.connect_addr.as_deref(), Some("10.0.0.2:5901"));
+        assert_eq!(cfg.file_save_dir, "/tmp/inbox2");
     }
 }

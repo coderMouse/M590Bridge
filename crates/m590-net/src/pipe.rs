@@ -44,7 +44,7 @@ pub fn deliver(
     flush_outbox(session_a, pipe, true)?;
     flush_outbox(session_b, pipe, false)?;
 
-    for _ in 0..64 {
+    for _ in 0..256 {
         let mut progress = false;
 
         while let Some(frame) = pipe.a_to_b.first().cloned() {
@@ -157,6 +157,68 @@ mod tests {
         assert_eq!(
             host.snapshot().last_clipboard_content_id.as_deref(),
             Some("n1")
+        );
+    }
+
+    #[test]
+    fn memory_pipe_transfers_small_file_on_demand() {
+        use m590_core::{InboundFileResult, QueueFileResult, FILE_CHUNK_SIZE};
+
+        let mut host = Session::new(DeviceId::new("host")).unwrap();
+        host.handle(SessionEvent::StartPairing {
+            expected_code: "111222".into(),
+        })
+        .unwrap();
+        let _ = host.take_outbox();
+
+        let mut joiner = Session::new(DeviceId::new("joiner")).unwrap();
+        joiner
+            .handle(SessionEvent::StartPairing {
+                expected_code: "111222".into(),
+            })
+            .unwrap();
+
+        let mut pipe = MemoryPipe::new();
+        flush_outbox(&mut joiner, &mut pipe, true).unwrap();
+        deliver(&mut pipe, &mut joiner, &mut host).unwrap();
+        assert_eq!(host.state(), ConnectionState::Connected);
+
+        let mut data = vec![0u8; FILE_CHUNK_SIZE + 32];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 199) as u8;
+        }
+
+        assert_eq!(
+            joiner
+                .offer_file("pipe-xfer", "doc.bin", data.clone())
+                .unwrap(),
+            QueueFileResult::Queued
+        );
+        flush_outbox(&mut joiner, &mut pipe, true).unwrap();
+        deliver(&mut pipe, &mut joiner, &mut host).unwrap();
+        assert_eq!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Offered {
+                transfer_id: "pipe-xfer".into(),
+                file_name: "doc.bin".into(),
+                size: data.len() as u64,
+            })
+        );
+
+        assert_eq!(
+            host.request_file("pipe-xfer").unwrap(),
+            QueueFileResult::Queued
+        );
+        flush_outbox(&mut host, &mut pipe, false).unwrap();
+        deliver(&mut pipe, &mut joiner, &mut host).unwrap();
+
+        assert_eq!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Applied {
+                transfer_id: "pipe-xfer".into(),
+                file_name: "doc.bin".into(),
+                data,
+            })
         );
     }
 }

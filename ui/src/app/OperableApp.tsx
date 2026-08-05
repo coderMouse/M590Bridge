@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Copy, Link2, RefreshCw, Settings, WifiOff, Monitor, Info } from 'lucide-react'
+import { Copy, Link2, RefreshCw, Settings, WifiOff, Monitor, Info, FileUp } from 'lucide-react'
 import { AppIcon } from '@/components/AppIcon'
 import { PrimaryButton } from '@/components/PrimaryButton'
 import { StatusPill } from '@/components/StatusPill'
@@ -8,16 +8,21 @@ import { ClipboardPreview } from '@/components/ClipboardPreview'
 import { Toggle } from '@/components/Toggle'
 import { cn } from '@/lib/cn'
 import {
+  bytesToBase64,
   fetchConfig,
   fetchHealth,
   fetchStatus,
+  filePhaseLabel,
+  fileProgressPercent,
   getApiBase,
+  MAX_SEND_FILE_BYTES,
   phaseToStatusLabel,
   postConfig,
   postConnect,
   postDisconnect,
   postListen,
   postPush,
+  postSendFileBytes,
   randomPairCode,
   type HubStatus,
 } from '@/lib/bridgeApi'
@@ -51,6 +56,9 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const [settingsAddr, setSettingsAddr] = useState('127.0.0.1:5901')
   const [settingsCode, setSettingsCode] = useState('')
   const [settingsSaved, setSettingsSaved] = useState<string | null>(null)
+  const [settingsFileSaveDir, setSettingsFileSaveDir] = useState('')
+  const [fileBusy, setFileBusy] = useState(false)
+  const [pickedFileLabel, setPickedFileLabel] = useState<string | null>(null)
 
   const apiBase = useMemo(() => getApiBase(), [])
 
@@ -69,6 +77,9 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
       setAutoReconnect(s.auto_reconnect)
       if (s.device_id) {
         setSettingsDeviceId((prev) => prev || s.device_id)
+      }
+      if (s.file_save_dir) {
+        setSettingsFileSaveDir((prev) => prev || s.file_save_dir || '')
       }
       if (s.phase === 'connected') setTab((t) => (t === 'pair' ? 'home' : t))
     } catch (e) {
@@ -99,6 +110,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
         setSettingsCode((cfg.pairing_code || '').replace(/\D/g, '').slice(0, 6))
         setAutoSync(cfg.auto_sync)
         setAutoReconnect(cfg.auto_reconnect)
+        if (cfg.file_save_dir) setSettingsFileSaveDir(cfg.file_save_dir)
         setPrefsLoaded(true)
       } catch {
         setPrefsLoaded(true)
@@ -173,6 +185,33 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
     }
   }
 
+  async function onPickAndSendFile(file: File | null) {
+    if (!file) return
+    setError(null)
+    setPickedFileLabel(`${file.name} (${file.size}B)`)
+    if (file.size > MAX_SEND_FILE_BYTES) {
+      setError(`文件过大：${file.size}B > 上限 ${MAX_SEND_FILE_BYTES}B`)
+      return
+    }
+    // Basename only for wire protocol safety.
+    const baseName = file.name.split(/[/\\]/).pop() || file.name
+    if (!baseName || baseName.includes('..')) {
+      setError('无效文件名')
+      return
+    }
+    setFileBusy(true)
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer())
+      const data_base64 = bytesToBase64(buf)
+      await postSendFileBytes({ name: baseName, data_base64 })
+      await refresh()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setFileBusy(false)
+    }
+  }
+
   async function copyCode() {
     try {
       await navigator.clipboard.writeText(code.replace(/\D/g, ''))
@@ -220,6 +259,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
         last_role: role,
         auto_sync: autoSync,
         auto_reconnect: autoReconnect,
+        file_save_dir: settingsFileSaveDir.trim() || undefined,
       })
       // Keep pair tab fields in sync with saved defaults
       setPort(listenPort)
@@ -456,6 +496,61 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                   推送到对端
                 </PrimaryButton>
               </div>
+
+              <div className="rounded-[10px] border border-black/8 bg-white p-3">
+                <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold text-[#6B7589]">
+                  <FileUp size={14} /> 文件传输
+                  <span className="ml-auto font-medium text-[#1A2030]">
+                    {filePhaseLabel(status?.file_transfer_phase)}
+                  </span>
+                </div>
+                <div className="mb-2 text-[11px] text-[#6B7589]">
+                  单文件上限 4MiB；对端自动接收并写入其保存目录。
+                </div>
+                <label className="mb-2 block">
+                  <input
+                    type="file"
+                    className="block w-full text-[12px] file:mr-3 file:rounded-md file:border-0 file:bg-[#EEF2FF] file:px-3 file:py-1.5 file:text-[12px] file:font-semibold file:text-primary"
+                    disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0] ?? null
+                      void onPickAndSendFile(f)
+                      e.target.value = ''
+                    }}
+                  />
+                </label>
+                {pickedFileLabel ? (
+                  <div className="mb-2 truncate text-[11px] text-[#6B7589]">已选：{pickedFileLabel}</div>
+                ) : null}
+                <div className="mb-1 flex items-center justify-between text-[11px] text-[#6B7589]">
+                  <span className="truncate pr-2">
+                    {status?.last_file_name || '尚无文件传输'}
+                  </span>
+                  <span className="shrink-0 tabular-nums">{fileProgressPercent(status)}%</span>
+                </div>
+                <div className="mb-2 h-2 overflow-hidden rounded-full bg-[#EEF2F8]">
+                  <div
+                    className="h-full rounded-full bg-primary transition-[width] duration-300"
+                    style={{ width: `${fileProgressPercent(status)}%` }}
+                  />
+                </div>
+                <div className="space-y-1 text-[11px] leading-4 text-[#6B7589]">
+                  <div>
+                    进度字节：{status?.file_bytes_received ?? 0} / {status?.file_bytes_total ?? 0}
+                  </div>
+                  {status?.last_file_saved_path ? (
+                    <div className="break-all text-[#1A2030]">
+                      已保存：{status.last_file_saved_path}
+                    </div>
+                  ) : null}
+                  {status?.file_save_dir ? (
+                    <div className="break-all">本机保存目录：{status.file_save_dir}</div>
+                  ) : null}
+                </div>
+                {fileBusy ? (
+                  <div className="mt-2 text-[11px] font-medium text-primary">正在发送报价…</div>
+                ) : null}
+              </div>
             </div>
 
             <footer className="space-y-3 border-t border-black/6 bg-white px-4 py-3">
@@ -573,6 +668,31 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
 
             <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
               <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
+                文件
+              </div>
+              <div className="space-y-3 px-4 py-3">
+                <label className="block">
+                  <span className="mb-1 block text-[12px] text-[#6B7589]">接收文件保存目录</span>
+                  <input
+                    className="w-full rounded-lg border border-black/10 bg-[#F8FAFC] px-3 py-2 font-mono text-[12px]"
+                    value={settingsFileSaveDir}
+                    onChange={(e) => setSettingsFileSaveDir(e.target.value)}
+                    placeholder="例如 /home/you/.local/share/m590bridge/inbox"
+                  />
+                </label>
+                <p className="text-[11px] leading-4 text-[#6B7589]">
+                  对端发来的文件会写入此目录（自动创建）。单文件上限 4MiB。
+                </p>
+                {status?.last_file_saved_path ? (
+                  <div className="break-all text-[11px] text-[#1A2030]">
+                    最近落盘：{status.last_file_saved_path}
+                  </div>
+                ) : null}
+              </div>
+            </section>
+
+            <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
+              <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
                 运行状态
               </div>
               <div className="divide-y divide-black/5 text-[13px]">
@@ -599,6 +719,10 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                   <span className="max-w-[60%] truncate font-mono text-[11px] text-[#6B7589]">
                     {status?.hub_api || apiBase}
                   </span>
+                </div>
+                <div className="flex items-center justify-between gap-3 px-4 py-3">
+                  <span className="text-[#6B7589]">文件传输</span>
+                  <span>{filePhaseLabel(status?.file_transfer_phase)}</span>
                 </div>
                 {status?.last_error ? (
                   <div className="px-4 py-3">

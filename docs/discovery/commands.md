@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-05
+> 更新日期：2026-08-05（task-022）
 
 ## 桌面（推荐）
 
@@ -37,12 +37,33 @@ cargo run -p m590-clipboard --example probe_clipboard
 - 图片位图：Linux ↔ Windows 双向（线载优先 PNG；Word 等可粘贴）  
 - 复制图片**文件**：可提升为图片同步（非传原文件字节流）  
 - 发大图：TCP 写满帧，避免 EAGAIN 误判断线  
+- 文件：`FileOffer/Request/Chunk/Complete` 帧 + Session 小文件 memory loopback（task-020）  
+
+## 文件 API（task-021）
+
+```bash
+curl -s -X POST http://127.0.0.1:5910/api/config \
+  -H 'content-type: application/json' \
+  -d '{"file_save_dir":"/path/to/inbox"}'
+curl -s -X POST http://127.0.0.1:5910/api/send_file \
+  -H 'content-type: application/json' \
+  -d '{"path":"/path/to/file.bin"}'
+curl -s -X POST http://127.0.0.1:5910/api/send_file_bytes \
+  -H 'content-type: application/json' \
+  -d '{"name":"a.txt","data_base64":"aGVsbG8="}'
+curl -s http://127.0.0.1:5910/api/status   # file_transfer_phase / last_file_* / file_bytes_*
+```
+
+UI：`m590-ui` 主面板选文件发送；设置页可改 `file_save_dir`。
+
+默认保存目录：平台 data 目录下 `m590bridge/inbox`。单文件 ≤ 4MiB。
 
 ## 未做
 
-- **V2 文件通道**（元数据 + 分片/按需传输 + 进度）  
+- file_list → 原文件 offer  
+- 文件夹 / >4MiB  
 - mDNS、安装包  
-- （已取消）收图落盘骗桌面粘贴  
+- （已取消）019A  
 
 ## 配置
 

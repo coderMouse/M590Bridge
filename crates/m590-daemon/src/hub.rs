@@ -1,7 +1,9 @@
 //! Localhost HTTP control API for the operable UI shell.
 
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -9,12 +11,13 @@ use std::time::{Duration, Instant};
 
 use m590_clipboard::{ClipboardService, PlatformClipboard};
 use m590_core::{
-    ConnectionState, DeviceId, InboundClipboardResult, QueueClipboardResult, Session,
-    SessionEvent, DEFAULT_HEARTBEAT_MISS_THRESHOLD,
+    ConnectionState, DeviceId, InboundClipboardResult, InboundFileResult, QueueClipboardResult,
+    QueueFileResult, Session, SessionEvent, DEFAULT_HEARTBEAT_MISS_THRESHOLD, MAX_FILE_BYTES,
 };
 use m590_net::{accept_framed, connect_framed, listen_on, TcpFrameStream};
 
 use crate::config;
+use crate::file_save;
 use crate::status::{persist_status_config, with_status, HubPhase, SharedStatus};
 
 static STOP_BRIDGE: AtomicBool = AtomicBool::new(false);
@@ -31,7 +34,7 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
     println!("hub_api=http://{api_addr}");
     println!("hub_status=ready (UI can open operable shell and point API to this address)");
     println!(
-        "endpoints=GET /api/status /api/config POST /api/listen /api/connect /api/push /api/disconnect /api/config"
+        "endpoints=GET /api/status /api/config POST /api/listen /api/connect /api/push /api/send_file /api/disconnect /api/config"
     );
     let cfg_path = config::default_config_path();
     println!("config_path={}", cfg_path.display());
@@ -103,6 +106,21 @@ fn handle_http(mut stream: TcpStream, shared: SharedStatus) -> Result<(), String
         ("POST", "/api/push") => {
             let text = json_get(&body, "text").unwrap_or_default();
             match push_text(&shared, text) {
+                Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
+                Err(err) => write_json_err(&mut stream, &err),
+            }
+        }
+        ("POST", "/api/send_file") => {
+            let file_path = json_get(&body, "path").unwrap_or_default();
+            match push_file(&shared, file_path) {
+                Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
+                Err(err) => write_json_err(&mut stream, &err),
+            }
+        }
+        ("POST", "/api/send_file_bytes") => {
+            let name = json_get(&body, "name").unwrap_or_default();
+            let data_b64 = json_get(&body, "data_base64").unwrap_or_default();
+            match push_file_bytes(&shared, name, data_b64) {
                 Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
                 Err(err) => write_json_err(&mut stream, &err),
             }
@@ -538,7 +556,64 @@ fn push_text(shared: &SharedStatus, text: String) -> Result<(), String> {
     Ok(())
 }
 
+fn push_file(shared: &SharedStatus, path: String) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("path required".into());
+    }
+    let p = PathBuf::from(&path);
+    if !p.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    let meta = fs::metadata(&p).map_err(|e| format!("stat file: {e}"))?;
+    if meta.len() as usize > MAX_FILE_BYTES {
+        return Err(format!(
+            "file too large: {}B > limit {MAX_FILE_BYTES}B",
+            meta.len()
+        ));
+    }
+    PENDING_FILE.lock().expect("file lock").replace(path);
+    let phase = with_status(shared, |s| s.phase);
+    if phase != HubPhase::Connected {
+        return Err("not connected".into());
+    }
+    Ok(())
+}
+
 static PENDING_PUSH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static PENDING_FILE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static PENDING_FILE_BYTES: std::sync::Mutex<Option<(String, Vec<u8>)>> =
+    std::sync::Mutex::new(None);
+
+fn push_file_bytes(shared: &SharedStatus, name: String, data_b64: String) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name required".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err("name must be a basename".into());
+    }
+    if data_b64.is_empty() {
+        return Err("data_base64 required".into());
+    }
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.trim())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if data.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "file too large: {}B > limit {MAX_FILE_BYTES}B",
+            data.len()
+        ));
+    }
+    PENDING_FILE_BYTES
+        .lock()
+        .expect("file bytes lock")
+        .replace((name, data));
+    let phase = with_status(shared, |s| s.phase);
+    if phase != HubPhase::Connected {
+        return Err("not connected".into());
+    }
+    Ok(())
+}
 
 fn listen_worker(
     shared: SharedStatus,
@@ -698,6 +773,38 @@ fn run_session_loop(
             }
         }
 
+        if let Some(path) = PENDING_FILE.lock().expect("file").take() {
+            match offer_local_file(session, &mut content_seq, &path) {
+                Ok((summary, transfer_id, file_name, bytes)) => {
+                    conn.send_all(session.take_outbox().iter())
+                        .map_err(|e| e.to_string())?;
+                    mark_file_sending(&shared, summary, transfer_id, file_name, bytes);
+                }
+                Err(err) => {
+                    with_status(&shared, |s| {
+                        s.file_transfer_phase = Some("failed".into());
+                        s.last_error = Some(err);
+                    });
+                }
+            }
+        }
+
+        if let Some((name, data)) = PENDING_FILE_BYTES.lock().expect("file bytes").take() {
+            match offer_file_bytes(session, &mut content_seq, name, data) {
+                Ok((summary, transfer_id, file_name, bytes)) => {
+                    conn.send_all(session.take_outbox().iter())
+                        .map_err(|e| e.to_string())?;
+                    mark_file_sending(&shared, summary, transfer_id, file_name, bytes);
+                }
+                Err(err) => {
+                    with_status(&shared, |s| {
+                        s.file_transfer_phase = Some("failed".into());
+                        s.last_error = Some(err);
+                    });
+                }
+            }
+        }
+
         loop {
             match conn.try_recv() {
                 Ok(Some(msg)) => {
@@ -756,6 +863,17 @@ fn run_session_loop(
                             }
                         }
                         Some(InboundClipboardResult::DuplicateContentId) | None => {}
+                    }
+
+                    if let Some(file_event) = session.take_inbound_file() {
+                        handle_inbound_file(&shared, session, conn, file_event)?;
+                    } else if let Some((tid, got, total)) = session.inbound_file_progress() {
+                        with_status(&shared, |s| {
+                            s.file_transfer_phase = Some("receiving".into());
+                            s.last_file_transfer_id = Some(tid);
+                            s.file_bytes_received = Some(got);
+                            s.file_bytes_total = Some(total);
+                        });
                     }
                 }
                 Ok(None) => break,
@@ -942,5 +1060,167 @@ fn run_session_loop(
         }
 
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+
+fn mark_file_sending(
+    shared: &SharedStatus,
+    summary: String,
+    transfer_id: String,
+    file_name: String,
+    bytes: u64,
+) {
+    with_status(shared, |s| {
+        s.file_transfer_phase = Some("sending".into());
+        s.last_file_transfer_id = Some(transfer_id);
+        s.last_file_name = Some(file_name);
+        s.last_file_bytes = Some(bytes);
+        s.last_file_saved_path = None;
+        s.file_bytes_received = Some(0);
+        s.file_bytes_total = Some(bytes);
+        s.last_sync_text = Some(summary);
+        s.last_error = None;
+    });
+}
+
+fn offer_local_file(
+    session: &mut Session,
+    content_seq: &mut u64,
+    path: &str,
+) -> Result<(String, String, String, u64), String> {
+    let p = PathBuf::from(path);
+    let data = fs::read(&p).map_err(|e| format!("read file: {e}"))?;
+    let file_name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "file name missing".to_string())?
+        .to_string();
+    offer_file_bytes(session, content_seq, file_name, data)
+}
+
+fn offer_file_bytes(
+    session: &mut Session,
+    content_seq: &mut u64,
+    file_name: String,
+    data: Vec<u8>,
+) -> Result<(String, String, String, u64), String> {
+    if data.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "file too large: {}B > limit {MAX_FILE_BYTES}B",
+            data.len()
+        ));
+    }
+    *content_seq += 1;
+    let transfer_id = format!("ui-file-{}-{content_seq}", std::process::id());
+    let bytes = data.len() as u64;
+    match session.offer_file(transfer_id.clone(), file_name.clone(), data) {
+        Ok(QueueFileResult::Queued) => Ok((
+            format!("[file offer {file_name} {bytes}B id={transfer_id}]"),
+            transfer_id,
+            file_name,
+            bytes,
+        )),
+        Ok(QueueFileResult::DuplicateTransferId) => Err("duplicate transfer id".into()),
+        Ok(QueueFileResult::FileTooLarge { byte_len, limit }) => {
+            Err(format!("file too large: {byte_len}B > {limit}B"))
+        }
+        Ok(QueueFileResult::UnknownTransferId) => Err("unexpected unknown transfer".into()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn handle_inbound_file(
+    shared: &SharedStatus,
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    event: InboundFileResult,
+) -> Result<(), String> {
+    match event {
+        InboundFileResult::Offered {
+            transfer_id,
+            file_name,
+            size,
+        } => {
+            with_status(shared, |s| {
+                s.file_transfer_phase = Some("offered".into());
+                s.last_file_transfer_id = Some(transfer_id.clone());
+                s.last_file_name = Some(file_name.clone());
+                s.last_file_bytes = Some(size);
+                s.last_file_saved_path = None;
+                s.file_bytes_received = Some(0);
+                s.file_bytes_total = Some(size);
+                s.last_sync_text = Some(format!("[file offer {file_name} {size}B]"));
+                s.last_error = None;
+            });
+            match session.request_file(&transfer_id) {
+                Ok(QueueFileResult::Queued) => {
+                    conn.send_all(session.take_outbox().iter())
+                        .map_err(|e| e.to_string())?;
+                    with_status(shared, |s| {
+                        s.file_transfer_phase = Some("receiving".into());
+                    });
+                }
+                Ok(other) => {
+                    with_status(shared, |s| {
+                        s.file_transfer_phase = Some("failed".into());
+                        s.last_error = Some(format!("auto request failed: {other:?}"));
+                    });
+                }
+                Err(err) => {
+                    with_status(shared, |s| {
+                        s.file_transfer_phase = Some("failed".into());
+                        s.last_error = Some(format!("auto request error: {err}"));
+                    });
+                }
+            }
+            Ok(())
+        }
+        InboundFileResult::Applied {
+            transfer_id,
+            file_name,
+            data,
+        } => {
+            let dir = with_status(shared, |s| PathBuf::from(s.file_save_dir.clone()));
+            match file_save::save_received_file(&dir, &file_name, &data) {
+                Ok(saved) => {
+                    let saved_s = saved.display().to_string();
+                    with_status(shared, |s| {
+                        s.file_transfer_phase = Some("done".into());
+                        s.last_file_transfer_id = Some(transfer_id);
+                        s.last_file_name = Some(file_name.clone());
+                        s.last_file_bytes = Some(data.len() as u64);
+                        s.last_file_saved_path = Some(saved_s.clone());
+                        s.file_bytes_received = Some(data.len() as u64);
+                        s.file_bytes_total = Some(data.len() as u64);
+                        s.last_sync_text =
+                            Some(format!("[file saved {file_name} {}B]", data.len()));
+                        s.last_error = None;
+                    });
+                    println!("file_saved={saved_s}");
+                }
+                Err(err) => {
+                    with_status(shared, |s| {
+                        s.file_transfer_phase = Some("failed".into());
+                        s.last_file_transfer_id = Some(transfer_id);
+                        s.last_file_name = Some(file_name);
+                        s.last_error = Some(format!("file save: {err}"));
+                    });
+                }
+            }
+            Ok(())
+        }
+        InboundFileResult::Failed {
+            transfer_id,
+            message,
+        } => {
+            with_status(shared, |s| {
+                s.file_transfer_phase = Some("failed".into());
+                s.last_file_transfer_id = Some(transfer_id);
+                s.last_error = Some(format!("file transfer failed: {message}"));
+            });
+            Ok(())
+        }
     }
 }

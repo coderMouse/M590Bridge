@@ -140,9 +140,144 @@ impl ClipboardImagePayload {
     }
 }
 
-/// Application messages for pairing, heartbeat, and clipboard sync.
-///
-/// File transfer messages are intentionally omitted (later V2).
+fn validate_file_name(file_name: &str) -> Result<(), ProtocolError> {
+    if file_name.is_empty() {
+        return Err(ProtocolError::InvalidFile("file name must not be empty"));
+    }
+    if file_name.contains('/') || file_name.contains('\\') || file_name.contains('\0') {
+        return Err(ProtocolError::InvalidFile("file name must be a basename"));
+    }
+    if file_name == "." || file_name == ".." {
+        return Err(ProtocolError::InvalidFile("file name must be a basename"));
+    }
+    Ok(())
+}
+
+/// Peer announces a file is available for on-demand pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileOfferPayload {
+    pub device_id: DeviceId,
+    pub transfer_id: String,
+    pub file_name: String,
+    pub size: u64,
+}
+
+impl FileOfferPayload {
+    pub fn new(
+        device_id: DeviceId,
+        transfer_id: impl Into<String>,
+        file_name: impl Into<String>,
+        size: u64,
+    ) -> Result<Self, ProtocolError> {
+        if device_id.as_str().is_empty() {
+            return Err(ProtocolError::EmptyDeviceId);
+        }
+        let transfer_id = transfer_id.into();
+        if transfer_id.is_empty() {
+            return Err(ProtocolError::EmptyTransferId);
+        }
+        let file_name = file_name.into();
+        validate_file_name(&file_name)?;
+        Ok(Self {
+            device_id,
+            transfer_id,
+            file_name,
+            size,
+        })
+    }
+}
+
+/// Receiver asks the offerer to start (or continue) sending bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRequestPayload {
+    pub device_id: DeviceId,
+    pub transfer_id: String,
+}
+
+impl FileRequestPayload {
+    pub fn new(device_id: DeviceId, transfer_id: impl Into<String>) -> Result<Self, ProtocolError> {
+        if device_id.as_str().is_empty() {
+            return Err(ProtocolError::EmptyDeviceId);
+        }
+        let transfer_id = transfer_id.into();
+        if transfer_id.is_empty() {
+            return Err(ProtocolError::EmptyTransferId);
+        }
+        Ok(Self {
+            device_id,
+            transfer_id,
+        })
+    }
+}
+
+/// One slice of file bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChunkPayload {
+    pub device_id: DeviceId,
+    pub transfer_id: String,
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+impl FileChunkPayload {
+    pub fn new(
+        device_id: DeviceId,
+        transfer_id: impl Into<String>,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Self, ProtocolError> {
+        if device_id.as_str().is_empty() {
+            return Err(ProtocolError::EmptyDeviceId);
+        }
+        let transfer_id = transfer_id.into();
+        if transfer_id.is_empty() {
+            return Err(ProtocolError::EmptyTransferId);
+        }
+        if data.is_empty() {
+            return Err(ProtocolError::InvalidFile("chunk data must not be empty"));
+        }
+        Ok(Self {
+            device_id,
+            transfer_id,
+            offset,
+            data,
+        })
+    }
+}
+
+/// Transfer finished (success or failure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCompletePayload {
+    pub device_id: DeviceId,
+    pub transfer_id: String,
+    pub ok: bool,
+    pub message: String,
+}
+
+impl FileCompletePayload {
+    pub fn new(
+        device_id: DeviceId,
+        transfer_id: impl Into<String>,
+        ok: bool,
+        message: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        if device_id.as_str().is_empty() {
+            return Err(ProtocolError::EmptyDeviceId);
+        }
+        let transfer_id = transfer_id.into();
+        if transfer_id.is_empty() {
+            return Err(ProtocolError::EmptyTransferId);
+        }
+        Ok(Self {
+            device_id,
+            transfer_id,
+            ok,
+            message: message.into(),
+        })
+    }
+}
+
+/// Application messages for pairing, heartbeat, clipboard, and file transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// Initial hello from a device.
@@ -173,8 +308,16 @@ pub enum Message {
     HeartbeatAck { seq: u64 },
     /// MVP text clipboard sync.
     ClipboardText(ClipboardTextPayload),
-    /// V2 image clipboard sync (inline RGBA).
+    /// V2 image clipboard sync (inline RGBA/PNG).
     ClipboardImage(ClipboardImagePayload),
+    /// File available for on-demand pull.
+    FileOffer(FileOfferPayload),
+    /// Request bytes for a previously offered transfer.
+    FileRequest(FileRequestPayload),
+    /// File bytes slice.
+    FileChunk(FileChunkPayload),
+    /// Transfer finished.
+    FileComplete(FileCompletePayload),
     /// Graceful teardown.
     Goodbye {
         device_id: DeviceId,
@@ -249,6 +392,22 @@ impl Message {
         Self::ClipboardImage(payload)
     }
 
+    pub fn file_offer(payload: FileOfferPayload) -> Self {
+        Self::FileOffer(payload)
+    }
+
+    pub fn file_request(payload: FileRequestPayload) -> Self {
+        Self::FileRequest(payload)
+    }
+
+    pub fn file_chunk(payload: FileChunkPayload) -> Self {
+        Self::FileChunk(payload)
+    }
+
+    pub fn file_complete(payload: FileCompletePayload) -> Self {
+        Self::FileComplete(payload)
+    }
+
     pub fn goodbye(device_id: DeviceId, reason: impl Into<String>) -> Result<Self, ProtocolError> {
         validate_device(&device_id)?;
         Ok(Self::Goodbye {
@@ -268,6 +427,10 @@ impl Message {
             Self::HeartbeatAck { .. } => "heartbeat_ack",
             Self::ClipboardText(_) => "clipboard_text",
             Self::ClipboardImage(_) => "clipboard_image",
+            Self::FileOffer(_) => "file_offer",
+            Self::FileRequest(_) => "file_request",
+            Self::FileChunk(_) => "file_chunk",
+            Self::FileComplete(_) => "file_complete",
             Self::Goodbye { .. } => "goodbye",
         }
     }
@@ -314,5 +477,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(img.byte_len(), 4);
+    }
+
+    #[test]
+    fn file_offer_rejects_path_separators() {
+        let err = FileOfferPayload::new(DeviceId::new("a"), "t1", "a/b.txt", 1).unwrap_err();
+        assert_eq!(err, ProtocolError::InvalidFile("file name must be a basename"));
+    }
+
+    #[test]
+    fn file_offer_accepts_basename() {
+        let offer = FileOfferPayload::new(DeviceId::new("a"), "t1", "note.txt", 12).unwrap();
+        assert_eq!(offer.file_name, "note.txt");
+        assert_eq!(offer.size, 12);
     }
 }

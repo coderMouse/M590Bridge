@@ -1866,6 +1866,7 @@ version = "0.1.0"
 name = "m590-daemon"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "m590-clipboard",
  "m590-core",
  "m590-net",

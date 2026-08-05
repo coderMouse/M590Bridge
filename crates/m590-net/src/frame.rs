@@ -8,7 +8,10 @@
 //! - payload_len: u32 BE
 //! - payload: type-specific fields (strings = u32 BE len + UTF-8 bytes; u64 = BE)
 
-use m590_core::{ClipboardImagePayload, ClipboardTextPayload, DeviceId, ImageEncoding, Message, PROTOCOL_VERSION};
+use m590_core::{
+    ClipboardImagePayload, ClipboardTextPayload, DeviceId, FileChunkPayload, FileCompletePayload,
+    FileOfferPayload, FileRequestPayload, ImageEncoding, Message, PROTOCOL_VERSION,
+};
 
 /// Wire magic bytes.
 pub const FRAME_MAGIC: &[u8; 4] = b"M590";
@@ -59,6 +62,10 @@ const TYPE_HEARTBEAT_ACK: u8 = 7;
 const TYPE_CLIPBOARD_TEXT: u8 = 8;
 const TYPE_GOODBYE: u8 = 9;
 const TYPE_CLIPBOARD_IMAGE: u8 = 10;
+const TYPE_FILE_OFFER: u8 = 11;
+const TYPE_FILE_REQUEST: u8 = 12;
+const TYPE_FILE_CHUNK: u8 = 13;
+const TYPE_FILE_COMPLETE: u8 = 14;
 
 /// Encode one message into a single frame buffer.
 pub fn encode_frame(message: &Message) -> Result<Vec<u8>, FrameError> {
@@ -163,6 +170,32 @@ fn encode_payload(message: &Message) -> Result<(u8, Vec<u8>), FrameError> {
             write_bytes(&mut payload, &body.data)?;
             TYPE_CLIPBOARD_IMAGE
         }
+        Message::FileOffer(body) => {
+            write_string(&mut payload, body.device_id.as_str())?;
+            write_string(&mut payload, &body.transfer_id)?;
+            write_string(&mut payload, &body.file_name)?;
+            payload.extend_from_slice(&body.size.to_be_bytes());
+            TYPE_FILE_OFFER
+        }
+        Message::FileRequest(body) => {
+            write_string(&mut payload, body.device_id.as_str())?;
+            write_string(&mut payload, &body.transfer_id)?;
+            TYPE_FILE_REQUEST
+        }
+        Message::FileChunk(body) => {
+            write_string(&mut payload, body.device_id.as_str())?;
+            write_string(&mut payload, &body.transfer_id)?;
+            payload.extend_from_slice(&body.offset.to_be_bytes());
+            write_bytes(&mut payload, &body.data)?;
+            TYPE_FILE_CHUNK
+        }
+        Message::FileComplete(body) => {
+            write_string(&mut payload, body.device_id.as_str())?;
+            write_string(&mut payload, &body.transfer_id)?;
+            payload.push(u8::from(body.ok));
+            write_string(&mut payload, &body.message)?;
+            TYPE_FILE_COMPLETE
+        }
         Message::Goodbye { device_id, reason } => {
             write_string(&mut payload, device_id.as_str())?;
             write_string(&mut payload, reason)?;
@@ -261,6 +294,70 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
                 _ => "image",
             }))?;
             Ok(Message::ClipboardImage(body))
+        }
+        TYPE_FILE_OFFER => {
+            let device_id = DeviceId::new(read_string(&mut payload)?);
+            let transfer_id = read_string(&mut payload)?;
+            let file_name = read_string(&mut payload)?;
+            let size = read_u64(&mut payload)?;
+            ensure_empty(payload)?;
+            let body = FileOfferPayload::new(device_id, transfer_id, file_name, size).map_err(
+                |e| FrameError::InvalidField(match e {
+                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                    m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                    m590_core::ProtocolError::InvalidFile(reason) => reason,
+                    _ => "file_offer",
+                }),
+            )?;
+            Ok(Message::FileOffer(body))
+        }
+        TYPE_FILE_REQUEST => {
+            let device_id = DeviceId::new(read_string(&mut payload)?);
+            let transfer_id = read_string(&mut payload)?;
+            ensure_empty(payload)?;
+            let body = FileRequestPayload::new(device_id, transfer_id).map_err(|e| {
+                FrameError::InvalidField(match e {
+                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                    m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                    _ => "file_request",
+                })
+            })?;
+            Ok(Message::FileRequest(body))
+        }
+        TYPE_FILE_CHUNK => {
+            let device_id = DeviceId::new(read_string(&mut payload)?);
+            let transfer_id = read_string(&mut payload)?;
+            let offset = read_u64(&mut payload)?;
+            let data = read_bytes(&mut payload)?;
+            ensure_empty(payload)?;
+            let body = FileChunkPayload::new(device_id, transfer_id, offset, data).map_err(|e| {
+                FrameError::InvalidField(match e {
+                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                    m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                    m590_core::ProtocolError::InvalidFile(reason) => reason,
+                    _ => "file_chunk",
+                })
+            })?;
+            Ok(Message::FileChunk(body))
+        }
+        TYPE_FILE_COMPLETE => {
+            let device_id = DeviceId::new(read_string(&mut payload)?);
+            let transfer_id = read_string(&mut payload)?;
+            if payload.is_empty() {
+                return Err(FrameError::TruncatedPayload);
+            }
+            let ok = payload[0] != 0;
+            payload = &payload[1..];
+            let message = read_string(&mut payload)?;
+            ensure_empty(payload)?;
+            let body = FileCompletePayload::new(device_id, transfer_id, ok, message).map_err(
+                |e| FrameError::InvalidField(match e {
+                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                    m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                    _ => "file_complete",
+                }),
+            )?;
+            Ok(Message::FileComplete(body))
         }
         TYPE_GOODBYE => {
             let device_id = DeviceId::new(read_string(&mut payload)?);
@@ -417,5 +514,28 @@ mod tests {
         );
         let decoded = decode_frame(&encode_frame(&msg).unwrap()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn roundtrip_file_messages() {
+        let samples = vec![
+            Message::file_offer(
+                FileOfferPayload::new(DeviceId::new("a"), "t1", "a.txt", 3).unwrap(),
+            ),
+            Message::file_request(FileRequestPayload::new(DeviceId::new("b"), "t1").unwrap()),
+            Message::file_chunk(
+                FileChunkPayload::new(DeviceId::new("a"), "t1", 0, b"abc".to_vec()).unwrap(),
+            ),
+            Message::file_complete(
+                FileCompletePayload::new(DeviceId::new("a"), "t1", true, "").unwrap(),
+            ),
+            Message::file_complete(
+                FileCompletePayload::new(DeviceId::new("a"), "t1", false, "nope").unwrap(),
+            ),
+        ];
+        for msg in samples {
+            let decoded = decode_frame(&encode_frame(&msg).unwrap()).unwrap();
+            assert_eq!(decoded, msg);
+        }
     }
 }

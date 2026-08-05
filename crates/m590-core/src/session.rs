@@ -1,11 +1,18 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::{
-    ConnectionState, DeviceId, Message, ProtocolError, SessionError, SyncState, PROTOCOL_VERSION,
+    ConnectionState, DeviceId, FileChunkPayload, FileCompletePayload, FileOfferPayload,
+    FileRequestPayload, Message, ProtocolError, SessionError, SyncState, PROTOCOL_VERSION,
 };
 
 /// Max remembered clipboard content IDs for dedup (send + receive).
 const SEEN_CONTENT_ID_CAP: usize = 64;
+
+/// Outbound file chunk size for staged transfers (first file-channel slice).
+pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Max staged / received file bytes kept in session memory for this slice.
+pub const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Default missed heartbeat-ack ticks before the peer is considered suspect.
 pub const DEFAULT_HEARTBEAT_MISS_THRESHOLD: u32 = 3;
@@ -55,6 +62,66 @@ pub enum InboundClipboardResult {
     DuplicateContentId,
 }
 
+/// Result of offering / requesting a file transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueFileResult {
+    /// Offer or request placed in outbox.
+    Queued,
+    /// Same `transfer_id` already staged locally.
+    DuplicateTransferId,
+    /// File exceeds in-memory staging budget for this slice.
+    FileTooLarge { byte_len: usize, limit: usize },
+    /// No matching inbound offer to request.
+    UnknownTransferId,
+}
+
+/// Result of handling inbound file-channel messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundFileResult {
+    /// Peer announced a file available for pull.
+    Offered {
+        transfer_id: String,
+        file_name: String,
+        size: u64,
+    },
+    /// Transfer finished successfully with bytes reassembled in memory.
+    Applied {
+        transfer_id: String,
+        file_name: String,
+        data: Vec<u8>,
+    },
+    /// Transfer failed or was aborted by peer.
+    Failed {
+        transfer_id: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct StagedOutboundFile {
+    #[allow(dead_code)]
+    file_name: String,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct InboundOffer {
+    file_name: String,
+    size: u64,
+    #[allow(dead_code)]
+    from: DeviceId,
+}
+
+#[derive(Debug, Clone)]
+struct IncomingFile {
+    file_name: String,
+    expected_size: u64,
+    #[allow(dead_code)]
+    from: DeviceId,
+    buf: Vec<u8>,
+    next_offset: u64,
+}
+
 /// Read-only view of session fields useful for daemon logging / UI later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSnapshot {
@@ -68,6 +135,9 @@ pub struct SessionSnapshot {
     pub last_clipboard_text: Option<String>,
     pub last_clipboard_image_content_id: Option<String>,
     pub last_clipboard_image_bytes: Option<usize>,
+    pub last_file_transfer_id: Option<String>,
+    pub last_file_name: Option<String>,
+    pub last_file_bytes: Option<usize>,
     pub missed_heartbeat_acks: u32,
     pub outstanding_heartbeat_seq: Option<u64>,
 }
@@ -93,6 +163,17 @@ pub struct Session {
     seen_content_ids: VecDeque<String>,
     /// Filled when an inbound clipboard payload is newly applied (daemon should consume).
     last_inbound_clipboard: Option<InboundClipboardResult>,
+    /// Local files staged after `offer_file` (bytes kept until sent or disconnect).
+    staged_outbound_files: HashMap<String, StagedOutboundFile>,
+    /// Offers announced by the peer, keyed by transfer_id.
+    inbound_offers: HashMap<String, InboundOffer>,
+    /// In-progress reassembly of peer file bytes.
+    incoming_files: HashMap<String, IncomingFile>,
+    /// Filled when an inbound file event is newly observed (daemon/UI should consume).
+    last_inbound_file: Option<InboundFileResult>,
+    last_file_transfer_id: Option<String>,
+    last_file_name: Option<String>,
+    last_file_bytes: Option<usize>,
     /// Outbound messages produced by the last `handle` / queue call.
     pending_outbox: Vec<Message>,
 }
@@ -118,6 +199,13 @@ impl Session {
             last_clipboard_image_bytes: None,
             seen_content_ids: VecDeque::new(),
             last_inbound_clipboard: None,
+            staged_outbound_files: HashMap::new(),
+            inbound_offers: HashMap::new(),
+            incoming_files: HashMap::new(),
+            last_inbound_file: None,
+            last_file_transfer_id: None,
+            last_file_name: None,
+            last_file_bytes: None,
             pending_outbox: Vec::new(),
         })
     }
@@ -159,6 +247,9 @@ impl Session {
             last_clipboard_text: self.last_clipboard_text.clone(),
             last_clipboard_image_content_id: self.last_clipboard_image_content_id.clone(),
             last_clipboard_image_bytes: self.last_clipboard_image_bytes,
+            last_file_transfer_id: self.last_file_transfer_id.clone(),
+            last_file_name: self.last_file_name.clone(),
+            last_file_bytes: self.last_file_bytes,
             missed_heartbeat_acks: self.missed_heartbeat_acks,
             outstanding_heartbeat_seq: self.outstanding_heartbeat_seq,
         }
@@ -174,9 +265,31 @@ impl Session {
         self.last_inbound_clipboard.take()
     }
 
+    /// Take the last inbound file-channel event (if any).
+    pub fn take_inbound_file(&mut self) -> Option<InboundFileResult> {
+        self.last_inbound_file.take()
+    }
+
+    /// Best-effort receive progress for the first in-flight inbound transfer.
+    ///
+    /// Returns `(transfer_id, bytes_received, bytes_total)`.
+    pub fn inbound_file_progress(&self) -> Option<(String, u64, u64)> {
+        if let Some((id, incoming)) = self.incoming_files.iter().next() {
+            return Some((id.clone(), incoming.next_offset, incoming.expected_size));
+        }
+        if let Some((id, offer)) = self.inbound_offers.iter().next() {
+            // Offer known but no chunks yet (or empty file not started).
+            if self.incoming_files.is_empty() {
+                return Some((id.clone(), 0, offer.size));
+            }
+        }
+        None
+    }
+
     pub fn handle(&mut self, event: SessionEvent) -> Result<(), SessionError> {
         self.pending_outbox.clear();
         self.last_inbound_clipboard = None;
+        self.last_inbound_file = None;
         match event {
             SessionEvent::StartPairing { expected_code } => self.on_start_pairing(expected_code),
             SessionEvent::Message(message) => self.on_message(message),
@@ -298,6 +411,88 @@ impl Session {
         Ok(QueueClipboardResult::Queued)
     }
 
+    /// Stage file bytes in memory and announce a [`Message::FileOffer`] to the peer.
+    ///
+    /// The peer must call [`Self::request_file`] before chunks are sent (on-demand pull).
+    pub fn offer_file(
+        &mut self,
+        transfer_id: impl Into<String>,
+        file_name: impl Into<String>,
+        data: Vec<u8>,
+    ) -> Result<QueueFileResult, SessionError> {
+        self.pending_outbox.clear();
+        self.last_inbound_clipboard = None;
+        self.last_inbound_file = None;
+        if self.state != ConnectionState::Connected {
+            return Err(SessionError::InvalidTransition {
+                from: self.state,
+                event: "offer_file",
+            });
+        }
+        let transfer_id = transfer_id.into();
+        if transfer_id.is_empty() {
+            return Err(ProtocolError::EmptyTransferId.into());
+        }
+        if self.staged_outbound_files.contains_key(&transfer_id) {
+            return Ok(QueueFileResult::DuplicateTransferId);
+        }
+        if data.len() > MAX_FILE_BYTES {
+            return Ok(QueueFileResult::FileTooLarge {
+                byte_len: data.len(),
+                limit: MAX_FILE_BYTES,
+            });
+        }
+        let file_name = file_name.into();
+        let offer = FileOfferPayload::new(
+            self.local_device.clone(),
+            transfer_id.clone(),
+            file_name.clone(),
+            data.len() as u64,
+        )?;
+        self.staged_outbound_files.insert(
+            transfer_id.clone(),
+            StagedOutboundFile {
+                file_name: file_name.clone(),
+                data,
+            },
+        );
+        self.sync_state = SyncState::Syncing;
+        self.last_file_transfer_id = Some(transfer_id);
+        self.last_file_name = Some(file_name);
+        self.last_file_bytes = Some(offer.size as usize);
+        self.pending_outbox.push(Message::file_offer(offer));
+        self.sync_state = SyncState::Idle;
+        Ok(QueueFileResult::Queued)
+    }
+
+    /// Request bytes for a peer offer previously observed via [`InboundFileResult::Offered`].
+    pub fn request_file(
+        &mut self,
+        transfer_id: impl Into<String>,
+    ) -> Result<QueueFileResult, SessionError> {
+        self.pending_outbox.clear();
+        self.last_inbound_clipboard = None;
+        self.last_inbound_file = None;
+        if self.state != ConnectionState::Connected {
+            return Err(SessionError::InvalidTransition {
+                from: self.state,
+                event: "request_file",
+            });
+        }
+        let transfer_id = transfer_id.into();
+        if transfer_id.is_empty() {
+            return Err(ProtocolError::EmptyTransferId.into());
+        }
+        if !self.inbound_offers.contains_key(&transfer_id) {
+            return Ok(QueueFileResult::UnknownTransferId);
+        }
+        let req = FileRequestPayload::new(self.local_device.clone(), transfer_id)?;
+        self.sync_state = SyncState::Syncing;
+        self.pending_outbox.push(Message::file_request(req));
+        self.sync_state = SyncState::Idle;
+        Ok(QueueFileResult::Queued)
+    }
+
     fn on_start_pairing(&mut self, expected_code: String) -> Result<(), SessionError> {
         if expected_code.is_empty() {
             return Err(ProtocolError::EmptyPairingCode.into());
@@ -392,6 +587,10 @@ impl Session {
             }
             Message::ClipboardText(payload) => self.on_clipboard_text(payload),
             Message::ClipboardImage(payload) => self.on_clipboard_image(payload),
+            Message::FileOffer(payload) => self.on_file_offer(payload),
+            Message::FileRequest(payload) => self.on_file_request(payload),
+            Message::FileChunk(payload) => self.on_file_chunk(payload),
+            Message::FileComplete(payload) => self.on_file_complete(payload),
             Message::Goodbye { .. } => {
                 self.reset_to_disconnected(true);
                 Ok(())
@@ -588,6 +787,227 @@ impl Session {
         Ok(())
     }
 
+    fn ensure_connected_file_peer(
+        &mut self,
+        device_id: &DeviceId,
+        event: &'static str,
+    ) -> Result<(), SessionError> {
+        if self.state != ConnectionState::Connected {
+            return Err(SessionError::InvalidTransition {
+                from: self.state,
+                event,
+            });
+        }
+        if let Some(peer) = &self.peer_device {
+            if peer != device_id {
+                return Err(SessionError::UnexpectedPeer(device_id.to_string()));
+            }
+        } else {
+            self.peer_device = Some(device_id.clone());
+        }
+        Ok(())
+    }
+
+    fn on_file_offer(&mut self, payload: FileOfferPayload) -> Result<(), SessionError> {
+        self.ensure_connected_file_peer(&payload.device_id, "file_offer")?;
+        if payload.size > MAX_FILE_BYTES as u64 {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: format!(
+                    "offer too large: {} > limit {}",
+                    payload.size, MAX_FILE_BYTES
+                ),
+            });
+            return Ok(());
+        }
+        self.inbound_offers.insert(
+            payload.transfer_id.clone(),
+            InboundOffer {
+                file_name: payload.file_name.clone(),
+                size: payload.size,
+                from: payload.device_id,
+            },
+        );
+        self.last_inbound_file = Some(InboundFileResult::Offered {
+            transfer_id: payload.transfer_id,
+            file_name: payload.file_name,
+            size: payload.size,
+        });
+        Ok(())
+    }
+
+    fn on_file_request(&mut self, payload: FileRequestPayload) -> Result<(), SessionError> {
+        self.ensure_connected_file_peer(&payload.device_id, "file_request")?;
+        let Some(staged) = self.staged_outbound_files.get(&payload.transfer_id).cloned() else {
+            let complete = FileCompletePayload::new(
+                self.local_device.clone(),
+                payload.transfer_id,
+                false,
+                "unknown transfer id",
+            )?;
+            self.pending_outbox
+                .push(Message::file_complete(complete));
+            return Ok(());
+        };
+
+        self.sync_state = SyncState::Syncing;
+        let mut offset: u64 = 0;
+        while (offset as usize) < staged.data.len() {
+            let start = offset as usize;
+            let end = (start + FILE_CHUNK_SIZE).min(staged.data.len());
+            let chunk = FileChunkPayload::new(
+                self.local_device.clone(),
+                payload.transfer_id.clone(),
+                offset,
+                staged.data[start..end].to_vec(),
+            )?;
+            self.pending_outbox.push(Message::file_chunk(chunk));
+            offset = end as u64;
+        }
+        let complete = FileCompletePayload::new(
+            self.local_device.clone(),
+            payload.transfer_id.clone(),
+            true,
+            "",
+        )?;
+        self.pending_outbox
+            .push(Message::file_complete(complete));
+        self.sync_state = SyncState::Idle;
+        Ok(())
+    }
+
+    fn on_file_chunk(&mut self, payload: FileChunkPayload) -> Result<(), SessionError> {
+        self.ensure_connected_file_peer(&payload.device_id, "file_chunk")?;
+
+        if let Some(incoming) = self.incoming_files.get_mut(&payload.transfer_id) {
+            if payload.offset != incoming.next_offset {
+                self.incoming_files.remove(&payload.transfer_id);
+                self.last_inbound_file = Some(InboundFileResult::Failed {
+                    transfer_id: payload.transfer_id,
+                    message: "chunk offset mismatch".into(),
+                });
+                return Ok(());
+            }
+            let new_len = incoming.buf.len().saturating_add(payload.data.len());
+            if new_len > MAX_FILE_BYTES || new_len as u64 > incoming.expected_size {
+                self.incoming_files.remove(&payload.transfer_id);
+                self.last_inbound_file = Some(InboundFileResult::Failed {
+                    transfer_id: payload.transfer_id,
+                    message: "incoming file exceeds expected size".into(),
+                });
+                return Ok(());
+            }
+            incoming.buf.extend_from_slice(&payload.data);
+            incoming.next_offset = payload.offset + payload.data.len() as u64;
+            return Ok(());
+        }
+
+        let Some(offer) = self.inbound_offers.get(&payload.transfer_id).cloned() else {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: "chunk for unknown transfer".into(),
+            });
+            return Ok(());
+        };
+        if payload.offset != 0 {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: "first chunk offset must be 0".into(),
+            });
+            return Ok(());
+        }
+        if payload.data.len() > MAX_FILE_BYTES || payload.data.len() as u64 > offer.size {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: "incoming file exceeds expected size".into(),
+            });
+            return Ok(());
+        }
+        let mut buf = Vec::with_capacity(offer.size as usize);
+        buf.extend_from_slice(&payload.data);
+        let next_offset = payload.data.len() as u64;
+        self.incoming_files.insert(
+            payload.transfer_id,
+            IncomingFile {
+                file_name: offer.file_name,
+                expected_size: offer.size,
+                from: payload.device_id,
+                buf,
+                next_offset,
+            },
+        );
+        Ok(())
+    }
+
+    fn on_file_complete(&mut self, payload: FileCompletePayload) -> Result<(), SessionError> {
+        self.ensure_connected_file_peer(&payload.device_id, "file_complete")?;
+
+        let offer = self.inbound_offers.remove(&payload.transfer_id);
+        let incoming = self.incoming_files.remove(&payload.transfer_id);
+
+        if !payload.ok {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: if payload.message.is_empty() {
+                    "transfer failed".into()
+                } else {
+                    payload.message
+                },
+            });
+            self.sync_state = SyncState::Idle;
+            return Ok(());
+        }
+
+        let (file_name, expected_size, data) = match (offer, incoming) {
+            (_, Some(incoming)) => (
+                incoming.file_name,
+                incoming.expected_size,
+                incoming.buf,
+            ),
+            (Some(offer), None) if offer.size == 0 => (offer.file_name, 0, Vec::new()),
+            (Some(offer), None) => {
+                self.last_inbound_file = Some(InboundFileResult::Failed {
+                    transfer_id: payload.transfer_id,
+                    message: format!(
+                        "complete missing chunks for {} byte file",
+                        offer.size
+                    ),
+                });
+                return Ok(());
+            }
+            (None, None) => {
+                self.last_inbound_file = Some(InboundFileResult::Failed {
+                    transfer_id: payload.transfer_id,
+                    message: "complete for unknown transfer".into(),
+                });
+                return Ok(());
+            }
+        };
+
+        if data.len() as u64 != expected_size {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: format!(
+                    "size mismatch: got {} expected {}",
+                    data.len(),
+                    expected_size
+                ),
+            });
+            return Ok(());
+        }
+
+        self.last_file_transfer_id = Some(payload.transfer_id.clone());
+        self.last_file_name = Some(file_name.clone());
+        self.last_file_bytes = Some(data.len());
+        self.last_inbound_file = Some(InboundFileResult::Applied {
+            transfer_id: payload.transfer_id,
+            file_name,
+            data,
+        });
+        self.sync_state = SyncState::Idle;
+        Ok(())
+    }
+
     fn remember_peer(&mut self, device_id: DeviceId) -> Result<(), SessionError> {
         if device_id.as_str().is_empty() {
             return Err(ProtocolError::EmptyDeviceId.into());
@@ -636,6 +1056,13 @@ impl Session {
         self.last_clipboard_image_bytes = None;
         self.seen_content_ids.clear();
         self.last_inbound_clipboard = None;
+        self.staged_outbound_files.clear();
+        self.inbound_offers.clear();
+        self.incoming_files.clear();
+        self.last_inbound_file = None;
+        self.last_file_transfer_id = None;
+        self.last_file_name = None;
+        self.last_file_bytes = None;
         if clear_outbox {
             self.pending_outbox.clear();
         }
@@ -880,6 +1307,87 @@ mod tests {
                 .queue_clipboard_image("img-2", 1, 1, rgba)
                 .unwrap(),
             QueueClipboardResult::UnchangedImage
+        );
+    }
+
+    #[test]
+    fn file_offer_request_chunk_complete_small_file() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        // Multi-chunk: slightly over one FILE_CHUNK_SIZE.
+        let mut data = vec![0u8; FILE_CHUNK_SIZE + 100];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        assert_eq!(
+            joiner
+                .offer_file("xfer-1", "note.bin", data.clone())
+                .unwrap(),
+            QueueFileResult::Queued
+        );
+        let offer_msg = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer_msg)).unwrap();
+        assert_eq!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Offered {
+                transfer_id: "xfer-1".into(),
+                file_name: "note.bin".into(),
+                size: data.len() as u64,
+            })
+        );
+
+        assert_eq!(
+            host.request_file("xfer-1").unwrap(),
+            QueueFileResult::Queued
+        );
+        let req_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(req_msg)).unwrap();
+        let out = joiner.take_outbox();
+        // 2 chunks + complete
+        assert!(out.len() >= 3, "out len {}", out.len());
+
+        for msg in out {
+            host.handle(SessionEvent::Message(msg)).unwrap();
+        }
+        assert_eq!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Applied {
+                transfer_id: "xfer-1".into(),
+                file_name: "note.bin".into(),
+                data,
+            })
+        );
+        assert_eq!(host.snapshot().last_file_name.as_deref(), Some("note.bin"));
+    }
+
+    #[test]
+    fn file_empty_completes_without_chunks() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        assert_eq!(
+            joiner.offer_file("empty-1", "empty.txt", Vec::new()).unwrap(),
+            QueueFileResult::Queued
+        );
+        let offer_msg = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer_msg)).unwrap();
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Offered { size: 0, .. })
+        ));
+        host.request_file("empty-1").unwrap();
+        let req = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(req)).unwrap();
+        let out = joiner.take_outbox();
+        assert_eq!(out.len(), 1, "empty file should only send complete");
+        for msg in out {
+            host.handle(SessionEvent::Message(msg)).unwrap();
+        }
+        assert_eq!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Applied {
+                transfer_id: "empty-1".into(),
+                file_name: "empty.txt".into(),
+                data: Vec::new(),
+            })
         );
     }
 }

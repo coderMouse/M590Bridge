@@ -46,6 +46,15 @@ pub struct HubStatus {
     pub listen_port: u16,
     pub connect_addr: Option<String>,
     pub hub_api: Option<String>,
+    pub file_save_dir: String,
+    /// idle | offered | sending | receiving | done | failed
+    pub file_transfer_phase: Option<String>,
+    pub last_file_transfer_id: Option<String>,
+    pub last_file_name: Option<String>,
+    pub last_file_bytes: Option<u64>,
+    pub last_file_saved_path: Option<String>,
+    pub file_bytes_received: Option<u64>,
+    pub file_bytes_total: Option<u64>,
 }
 
 impl Default for HubStatus {
@@ -75,21 +84,27 @@ impl HubStatus {
             listen_port: cfg.listen_port,
             connect_addr: cfg.connect_addr.clone(),
             hub_api: None,
+            file_save_dir: cfg.file_save_dir.clone(),
+            file_transfer_phase: None,
+            last_file_transfer_id: None,
+            last_file_name: None,
+            last_file_bytes: None,
+            last_file_saved_path: None,
+            file_bytes_received: None,
+            file_bytes_total: None,
         }
     }
 
     pub fn snapshot_config(&self) -> AppConfig {
         AppConfig {
             device_id: self.device_id.clone(),
-            last_role: self
-                .last_role
-                .clone()
-                .or_else(|| self.role.clone()),
+            last_role: self.last_role.clone().or_else(|| self.role.clone()),
             pairing_code: self.pairing_code.clone(),
             listen_port: self.listen_port,
             connect_addr: self.connect_addr.clone(),
             auto_sync: self.auto_sync,
             auto_reconnect: self.auto_reconnect,
+            file_save_dir: self.file_save_dir.clone(),
         }
     }
 
@@ -101,6 +116,17 @@ impl HubStatus {
         self.connect_addr = cfg.connect_addr.clone();
         self.auto_sync = cfg.auto_sync;
         self.auto_reconnect = cfg.auto_reconnect;
+        self.file_save_dir = cfg.file_save_dir.clone();
+    }
+
+    pub fn clear_file_transfer(&mut self) {
+        self.file_transfer_phase = None;
+        self.last_file_transfer_id = None;
+        self.last_file_name = None;
+        self.last_file_bytes = None;
+        self.last_file_saved_path = None;
+        self.file_bytes_received = None;
+        self.file_bytes_total = None;
     }
 
     pub fn to_json(&self) -> String {
@@ -125,6 +151,12 @@ impl HubStatus {
                 None => "null".into(),
             }
         }
+        fn opt_u64(v: Option<u64>) -> String {
+            match v {
+                Some(n) => n.to_string(),
+                None => "null".into(),
+            }
+        }
         format!(
             "{{\
 \"phase\":\"{phase}\",\
@@ -143,7 +175,15 @@ impl HubStatus {
 \"last_role\":{last_role},\
 \"listen_port\":{listen_port},\
 \"connect_addr\":{connect_addr},\
-\"hub_api\":{api}\
+\"hub_api\":{api},\
+\"file_save_dir\":\"{file_save_dir}\",\
+\"file_transfer_phase\":{file_phase},\
+\"last_file_transfer_id\":{file_tid},\
+\"last_file_name\":{file_name},\
+\"last_file_bytes\":{file_bytes},\
+\"last_file_saved_path\":{file_path},\
+\"file_bytes_received\":{file_rx},\
+\"file_bytes_total\":{file_total}\
 }}",
             phase = self.phase.as_str(),
             role = opt_str(&self.role),
@@ -165,6 +205,14 @@ impl HubStatus {
             listen_port = self.listen_port,
             connect_addr = opt_str(&self.connect_addr),
             api = opt_str(&self.hub_api),
+            file_save_dir = esc(&self.file_save_dir),
+            file_phase = opt_str(&self.file_transfer_phase),
+            file_tid = opt_str(&self.last_file_transfer_id),
+            file_name = opt_str(&self.last_file_name),
+            file_bytes = opt_u64(self.last_file_bytes),
+            file_path = opt_str(&self.last_file_saved_path),
+            file_rx = opt_u64(self.file_bytes_received),
+            file_total = opt_u64(self.file_bytes_total),
         )
     }
 }
@@ -185,5 +233,29 @@ pub fn persist_status_config(shared: &SharedStatus) {
     let cfg = with_status(shared, |s| s.snapshot_config());
     if let Err(err) = crate::config::save_config(&cfg) {
         eprintln!("config_save_error={err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_json_includes_file_fields() {
+        let mut s = HubStatus::default();
+        s.file_save_dir = "/tmp/inbox".into();
+        s.file_transfer_phase = Some("done".into());
+        s.last_file_name = Some("a.txt".into());
+        s.last_file_bytes = Some(3);
+        s.last_file_saved_path = Some("/tmp/inbox/a.txt".into());
+        s.file_bytes_received = Some(3);
+        s.file_bytes_total = Some(3);
+        let json = s.to_json();
+        assert!(json.contains("file_save_dir"), "{json}");
+        assert!(json.contains("/tmp/inbox"), "{json}");
+        assert!(json.contains("file_transfer_phase"), "{json}");
+        assert!(json.contains("last_file_name"), "{json}");
+        assert!(json.contains("a.txt"), "{json}");
+        assert!(json.contains("file_bytes_total"), "{json}");
     }
 }

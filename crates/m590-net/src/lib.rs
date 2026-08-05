@@ -94,6 +94,19 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            Message::file_offer(
+                m590_core::FileOfferPayload::new(DeviceId::new("a"), "t1", "f.bin", 2).unwrap(),
+            ),
+            Message::file_request(
+                m590_core::FileRequestPayload::new(DeviceId::new("b"), "t1").unwrap(),
+            ),
+            Message::file_chunk(
+                m590_core::FileChunkPayload::new(DeviceId::new("a"), "t1", 0, b"hi".to_vec())
+                    .unwrap(),
+            ),
+            Message::file_complete(
+                m590_core::FileCompletePayload::new(DeviceId::new("a"), "t1", true, "").unwrap(),
+            ),
             Message::goodbye(DeviceId::new("a"), "bye").unwrap(),
         ];
 
