@@ -18,11 +18,14 @@ use m590_core::{
 use m590_net::{accept_framed, connect_framed, listen_on, TcpFrameStream};
 
 use crate::config;
+use crate::discovery::DiscoveryHandle;
 use crate::file_save;
 use crate::status::{persist_status_config, with_status, HubPhase, SharedStatus};
 
 static STOP_BRIDGE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+type SharedDiscovery = Arc<Option<Arc<DiscoveryHandle>>>;
 
 pub fn run_hub(api_addr: &str) -> Result<(), String> {
     let shared = crate::status::new_shared_status();
@@ -37,11 +40,23 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
         );
     }
 
+    let device_id = with_status(&shared, |s| s.device_id.clone());
+    let discovery: SharedDiscovery = match DiscoveryHandle::start(device_id) {
+        Ok(h) => {
+            println!("mdns_browse=on type={}", crate::discovery::SERVICE_TYPE);
+            Arc::new(Some(h))
+        }
+        Err(err) => {
+            eprintln!("mdns_browse=off error={err}");
+            Arc::new(None)
+        }
+    };
+
     let listener = TcpListener::bind(api_addr).map_err(|e| format!("bind hub api failed: {e}"))?;
     println!("hub_api=http://{api_addr}");
     println!("hub_status=ready (UI can open operable shell and point API to this address)");
     println!(
-        "endpoints=GET /api/status /api/config POST /api/listen /api/connect /api/push /api/send_file /api/disconnect /api/config"
+        "endpoints=GET /api/status /api/config /api/discover POST /api/listen /api/connect /api/push /api/send_file /api/disconnect /api/config"
     );
     let cfg_path = config::default_config_path();
     println!("config_path={}", cfg_path.display());
@@ -50,8 +65,9 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
         match stream {
             Ok(stream) => {
                 let shared = Arc::clone(&shared);
+                let discovery = Arc::clone(&discovery);
                 thread::spawn(move || {
-                    if let Err(err) = handle_http(stream, shared) {
+                    if let Err(err) = handle_http(stream, shared, discovery) {
                         eprintln!("hub_http_error={err}");
                     }
                 });
@@ -62,7 +78,11 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn handle_http(mut stream: TcpStream, shared: SharedStatus) -> Result<(), String> {
+fn handle_http(
+    mut stream: TcpStream,
+    shared: SharedStatus,
+    discovery: SharedDiscovery,
+) -> Result<(), String> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let (method, path, body) = read_http_request(&mut stream)?;
 
@@ -82,6 +102,15 @@ fn handle_http(mut stream: TcpStream, shared: SharedStatus) -> Result<(), String
             let json = with_status(&shared, |s| s.snapshot_config().to_json());
             write_response(&mut stream, 200, "application/json", &json)
         }
+        ("GET", "/api/discover") => {
+            let json = match discovery.as_ref() {
+                Some(d) => d.to_json(),
+                None => {
+                    "{\"service_type\":\"_m590bridge._tcp.local.\",\"advertising\":false,\"peers\":[],\"error\":\"mdns unavailable\"}".into()
+                }
+            };
+            write_response(&mut stream, 200, "application/json", &json)
+        }
         ("POST", "/api/config") => match apply_config_update(&shared, &body) {
             Ok(json) => write_response(&mut stream, 200, "application/json", &json),
             Err(err) => write_json_err(&mut stream, &err),
@@ -92,7 +121,7 @@ fn handle_http(mut stream: TcpStream, shared: SharedStatus) -> Result<(), String
                 .and_then(|p| p.parse().ok())
                 .unwrap_or_else(|| with_status(&shared, |s| s.listen_port));
             let device_id = json_get(&body, "device_id").filter(|s| !s.is_empty());
-            match start_listen(shared, code, port, device_id) {
+            match start_listen(shared, code, port, device_id, discovery) {
                 Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
                 Err(err) => write_json_err(&mut stream, &err),
             }
@@ -105,7 +134,7 @@ fn handle_http(mut stream: TcpStream, shared: SharedStatus) -> Result<(), String
                     with_status(&shared, |s| s.connect_addr.clone().unwrap_or_default())
                 });
             let device_id = json_get(&body, "device_id").filter(|s| !s.is_empty());
-            match start_connect(shared, code, addr, device_id) {
+            match start_connect(shared, code, addr, device_id, discovery) {
                 Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
                 Err(err) => write_json_err(&mut stream, &err),
             }
@@ -134,6 +163,9 @@ fn handle_http(mut stream: TcpStream, shared: SharedStatus) -> Result<(), String
         }
         ("POST", "/api/disconnect") => {
             STOP_BRIDGE.store(true, Ordering::SeqCst);
+            if let Some(d) = discovery.as_ref() {
+                d.stop_advertise();
+            }
             with_status(&shared, |s| {
                 s.phase = HubPhase::Idle;
                 s.connection = Some(ConnectionState::Disconnected);
@@ -329,6 +361,7 @@ fn start_listen(
     mut code: String,
     port: u16,
     device_id: Option<String>,
+    discovery: SharedDiscovery,
 ) -> Result<(), String> {
     code = normalize_pairing_code(&code);
     if code.is_empty() {
@@ -355,8 +388,22 @@ fn start_listen(
     });
     persist_status_config(&shared);
 
+    if let Some(d) = discovery.as_ref() {
+        if let Err(err) = d.advertise(&device_id, port) {
+            eprintln!("mdns_advertise_error={err}");
+        }
+    }
+
     thread::spawn(move || {
-        run_with_reconnect(shared, BridgeJob::Listen { code, port, device_id });
+        run_with_reconnect(
+            shared,
+            BridgeJob::Listen {
+                code,
+                port,
+                device_id,
+            },
+            discovery,
+        );
     });
     Ok(())
 }
@@ -366,6 +413,7 @@ fn start_connect(
     mut code: String,
     addr: String,
     device_id: Option<String>,
+    discovery: SharedDiscovery,
 ) -> Result<(), String> {
     code = normalize_pairing_code(&code);
     let addr = addr.trim().to_string();
@@ -395,6 +443,11 @@ fn start_connect(
     });
     persist_status_config(&shared);
 
+    // Joiner does not advertise; ensure any leftover host ad is stopped.
+    if let Some(d) = discovery.as_ref() {
+        d.stop_advertise();
+    }
+
     thread::spawn(move || {
         run_with_reconnect(
             shared,
@@ -403,6 +456,7 @@ fn start_connect(
                 addr,
                 device_id,
             },
+            discovery,
         );
     });
     Ok(())
@@ -421,7 +475,7 @@ enum BridgeJob {
     },
 }
 
-fn run_with_reconnect(shared: SharedStatus, job: BridgeJob) {
+fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDiscovery) {
     let mut attempt: u32 = 0;
     loop {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
@@ -539,6 +593,9 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob) {
                 }
             }
         }
+    }
+    if let Some(d) = discovery.as_ref() {
+        d.stop_advertise();
     }
     BRIDGE_RUNNING.store(false, Ordering::SeqCst);
 }

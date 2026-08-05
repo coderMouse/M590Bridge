@@ -10,6 +10,7 @@ import { cn } from '@/lib/cn'
 import {
   bytesToBase64,
   fetchConfig,
+  fetchDiscover,
   fetchHealth,
   fetchStatus,
   filePhaseLabel,
@@ -27,6 +28,7 @@ import {
   pickSendFileNative,
   isTauriShell,
   randomPairCode,
+  type DiscoveredPeer,
   type HubStatus,
 } from '@/lib/bridgeApi'
 import type { ConnectionStatus } from '@/lib/tokens'
@@ -63,6 +65,8 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const [fileBusy, setFileBusy] = useState(false)
   const [fileDragOver, setFileDragOver] = useState(false)
   const [pickedFileLabel, setPickedFileLabel] = useState<string | null>(null)
+  const [discoveredPeers, setDiscoveredPeers] = useState<DiscoveredPeer[]>([])
+  const [discoverError, setDiscoverError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const apiBase = useMemo(() => getApiBase(), [])
@@ -97,6 +101,31 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
     const id = window.setInterval(() => void refresh(), 1000)
     return () => window.clearInterval(id)
   }, [refresh])
+
+  useEffect(() => {
+    if (!hubOnline || role !== 'joiner' || tab !== 'pair') {
+      return
+    }
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const d = await fetchDiscover()
+        if (cancelled) return
+        setDiscoveredPeers(Array.isArray(d.peers) ? d.peers : [])
+        setDiscoverError(d.error ?? null)
+      } catch (e) {
+        if (!cancelled) {
+          setDiscoverError(e instanceof Error ? e.message : String(e))
+        }
+      }
+    }
+    void poll()
+    const id = window.setInterval(() => void poll(), 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [hubOnline, role, tab])
 
   useEffect(() => {
     if (!hubOnline || prefsLoaded) return
@@ -353,7 +382,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
               <AppIcon size={40} />
               <h1 className="mt-3 mb-1 text-[18px] font-bold">连接另一台电脑</h1>
               <p className="m-0 max-w-[300px] text-[12px] leading-5 text-[#6B7589]">
-                两台电脑需在同一局域网。一端「创建配对」，另一端「加入」并填写 IP。
+                两台电脑需在同一局域网。一端「创建配对」，另一端「加入」可从局域网列表点选或手动填 IP。
               </p>
             </div>
 
@@ -424,15 +453,63 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                 />
               </label>
             ) : (
-              <label className="mb-3 block text-[12px]">
-                <span className="mb-1 block text-[#6B7589]">对端地址 host:port</span>
-                <input
-                  className="w-full rounded-lg border border-black/10 bg-white px-3 py-2 font-mono"
-                  value={addr}
-                  onChange={(e) => setAddr(e.target.value)}
-                  placeholder="192.168.1.10:5901"
-                />
-              </label>
+              <div className="mb-3 space-y-2">
+                <div className="rounded-[10px] border border-black/8 bg-white p-3">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="text-[12px] font-semibold text-[#6B7589]">局域网设备</span>
+                    <span className="text-[11px] text-[#9AA3B2]">
+                      {discoveredPeers.length > 0
+                        ? `${discoveredPeers.length} 台`
+                        : discoverError
+                          ? '发现不可用'
+                          : '搜索中…'}
+                    </span>
+                  </div>
+                  {discoveredPeers.length === 0 ? (
+                    <div className="text-[11px] leading-4 text-[#9AA3B2]">
+                      {discoverError
+                        ? `mDNS：${discoverError}（仍可手动输入 IP）`
+                        : '未发现其他 M590Bridge。请确认对端已点「开始等待配对」。'}
+                    </div>
+                  ) : (
+                    <ul className="m-0 max-h-36 list-none space-y-1 overflow-auto p-0">
+                      {discoveredPeers.map((p) => {
+                        const selected = addr === p.addr
+                        return (
+                          <li key={p.fullname || p.addr}>
+                            <button
+                              type="button"
+                              onClick={() => setAddr(p.addr)}
+                              className={cn(
+                                'flex w-full items-center justify-between rounded-md px-2.5 py-2 text-left text-[12px]',
+                                selected
+                                  ? 'bg-primary/10 text-primary'
+                                  : 'bg-[#F7F9FC] text-[#1A2030] hover:bg-[#EEF2F8]',
+                              )}
+                            >
+                              <span className="min-w-0 truncate font-medium">
+                                {p.device_id || p.name || '设备'}
+                              </span>
+                              <span className="ml-2 shrink-0 font-mono text-[11px] opacity-80">
+                                {p.addr}
+                              </span>
+                            </button>
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  )}
+                </div>
+                <label className="block text-[12px]">
+                  <span className="mb-1 block text-[#6B7589]">对端地址 host:port</span>
+                  <input
+                    className="w-full rounded-lg border border-black/10 bg-white px-3 py-2 font-mono"
+                    value={addr}
+                    onChange={(e) => setAddr(e.target.value)}
+                    placeholder="192.168.1.10:5901"
+                  />
+                </label>
+              </div>
             )}
 
             <div className="mb-4 text-center text-[12px] text-[#6B7589]">

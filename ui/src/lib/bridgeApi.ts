@@ -41,6 +41,23 @@ export type HubConfig = {
   file_save_dir?: string
 }
 
+export type DiscoveredPeer = {
+  name: string
+  device_id: string
+  host: string
+  port: number
+  addr: string
+  fullname: string
+  last_seen_unix_ms: number
+}
+
+export type DiscoverResponse = {
+  service_type: string
+  advertising: boolean
+  peers: DiscoveredPeer[]
+  error?: string
+}
+
 const DEFAULT_API = 'http://127.0.0.1:5910'
 /** Keep in sync with Session::MAX_FILE_BYTES */
 export const MAX_SEND_FILE_BYTES = 4 * 1024 * 1024
@@ -96,6 +113,10 @@ export async function fetchStatus(): Promise<HubStatus> {
 
 export async function fetchConfig(): Promise<HubConfig> {
   return request<HubConfig>('/api/config')
+}
+
+export async function fetchDiscover(): Promise<DiscoverResponse> {
+  return request<DiscoverResponse>('/api/discover')
 }
 
 export type HubConfigPatch = {

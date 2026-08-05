@@ -18,3 +18,4 @@ m590-core = { workspace = true }
 m590-clipboard = { workspace = true }
 m590-net = { workspace = true }
 base64 = "0.22"
+mdns-sd = { version = "0.20", default-features = false, features = ["logging"] }

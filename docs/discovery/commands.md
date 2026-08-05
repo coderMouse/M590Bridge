@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-05（task-022）
+> 更新日期：2026-08-05（task-029）
 
 ## 桌面（推荐）
 
@@ -37,9 +37,10 @@ cargo run -p m590-clipboard --example probe_clipboard
 - 图片位图：Linux ↔ Windows 双向（线载优先 PNG；Word 等可粘贴）  
 - 复制图片**文件**：可提升为图片同步（非传原文件字节流）  
 - 发大图：TCP 写满帧，避免 EAGAIN 误判断线  
-- 文件：`FileOffer/Request/Chunk/Complete` 帧 + Session 小文件 memory loopback（task-020）  
+- 文件：`FileOffer/Request/Chunk/Complete` + hub 落盘 + UI 发送/进度（≤4MiB）  
+- **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
 
-## 文件 API（task-021）
+## 文件 API（task-021+）
 
 ```bash
 curl -s -X POST http://127.0.0.1:5910/api/config \
@@ -51,23 +52,20 @@ curl -s -X POST http://127.0.0.1:5910/api/send_file \
 curl -s -X POST http://127.0.0.1:5910/api/send_file_bytes \
   -H 'content-type: application/json' \
   -d '{"name":"a.txt","data_base64":"aGVsbG8="}'
-curl -s http://127.0.0.1:5910/api/status   # file_transfer_phase / last_file_* / file_bytes_*
+curl -s http://127.0.0.1:5910/api/status
 ```
 
-UI：`m590-ui` 主面板「选择并发送文件」；设置页可改 `file_save_dir`。
+## 发现 API（task-029）
 
-**重要**：Linux/Windows **必须同一构建**。若一端报 `unknown message type 11`，对端仍是旧版——两端 `git pull && cargo build -p m590-ui` 后重开。
+```bash
+# host 侧 listen 后会 advertise；任意 hub 可 browse
+curl -s http://127.0.0.1:5910/api/discover
+# 示例：
+# {"service_type":"_m590bridge._tcp.local.","advertising":false,
+#  "peers":[{"name":"...","device_id":"...","addr":"192.168.x.x:5901",...}]}
+```
 
-文件管理器复制：图片仍走位图同步；**非图片**单文件 ≤4MiB 自动 FileOffer（对端落盘到 `file_save_dir`）。
-
-默认保存目录：平台 data 目录下 `m590bridge/inbox`。单文件 ≤ 4MiB。
-
-## 未做
-
-- file_list → 原文件 offer  
-- 文件夹 / >4MiB  
-- mDNS、安装包  
-- （已取消）019A  
+TXT 仅 `id` / `ver`，**不含**配对码。配对仍需手动输入相同 code。
 
 ## 配置
 
@@ -75,10 +73,17 @@ UI：`m590-ui` 主面板「选择并发送文件」；设置页可改 `file_save
 - 默认：Linux `~/.config/m590bridge/config.cfg`；Windows `%APPDATA%\M590Bridge\config.cfg`  
 - `GET/POST /api/config`；status 含 `last_sync_text` / `last_error` / `auto_reconnect`
 
+## 未做
+
+- 文件夹 / >4MiB  
+- 安装包 / 开机自启  
+- 设置页「发现方式」开关  
+- （已取消）019A  
+
 ## 文档
 
 ```text
 docs/plans/current.md
-docs/plans/current.md
 docs/domain/protocol-draft.md
+docs/tasks/task-029.md
 ```
