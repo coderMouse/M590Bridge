@@ -933,6 +933,8 @@ fn run_session_loop(
             if auto {
                 // File-manager copies expose text/uri-list (file_list), not plain text/image.
                 if let Ok(Some(paths)) = clip.poll_file_list_change() {
+                    // Images: keep bitmap clipboard path (Word/paint paste).
+                    let mut handled = false;
                     if let Ok(Some(image)) = m590_clipboard::image_from_paths(&paths) {
                         content_seq += 1;
                         let cid =
@@ -959,6 +961,7 @@ fn run_session_loop(
                                             s.last_sync_text = Some(summary);
                                             s.last_error = None;
                                         });
+                                        handled = true;
                                     }
                                     Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
                                         with_status(&shared, |s| {
@@ -966,12 +969,16 @@ fn run_session_loop(
                                                 "图片过大已跳过 {byte_len}B > {limit}B"
                                             ));
                                         });
+                                        handled = true;
                                     }
-                                    Ok(_) => {}
+                                    Ok(_) => {
+                                        handled = true;
+                                    }
                                     Err(err) => {
                                         with_status(&shared, |s| {
                                             s.last_error = Some(format!("queue_image: {err}"));
                                         });
+                                        handled = true;
                                     }
                                 }
                             }
@@ -979,6 +986,48 @@ fn run_session_loop(
                                 with_status(&shared, |s| {
                                     s.last_error = Some(format!("prepare_image: {err}"));
                                 });
+                                handled = true;
+                            }
+                        }
+                    }
+                    // Non-image regular files: V2 file offer (first path only, ≤ MAX_FILE_BYTES).
+                    if !handled {
+                        if let Some(path) = m590_clipboard::first_regular_file(&paths) {
+                            match m590_clipboard::read_file_for_offer(&path, MAX_FILE_BYTES) {
+                                Ok((name, data)) => {
+                                    match offer_file_bytes(
+                                        session,
+                                        &mut content_seq,
+                                        name,
+                                        data,
+                                    ) {
+                                        Ok((summary, transfer_id, file_name, bytes)) => {
+                                            conn.send_all(session.take_outbox().iter())
+                                                .map_err(|e| e.to_string())?;
+                                            mark_file_sending(
+                                                &shared,
+                                                summary,
+                                                transfer_id,
+                                                file_name,
+                                                bytes,
+                                            );
+                                        }
+                                        Err(err) => {
+                                            with_status(&shared, |s| {
+                                                s.file_transfer_phase = Some("failed".into());
+                                                s.last_error = Some(format!(
+                                                    "file_list offer: {err}"
+                                                ));
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    with_status(&shared, |s| {
+                                        s.last_error =
+                                            Some(format!("file_list skip: {err}"));
+                                    });
+                                }
                             }
                         }
                     }

@@ -14,6 +14,7 @@
 
 mod error;
 mod image_file;
+mod file_paths;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod arboard_text;
@@ -26,6 +27,7 @@ mod windows;
 
 pub use error::ClipboardError;
 pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
+pub use file_paths::{first_regular_file, read_file_for_offer};
 
 /// Which OS/display backend is selected or available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

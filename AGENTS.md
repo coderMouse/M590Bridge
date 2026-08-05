@@ -24,7 +24,7 @@ M590Bridge 是局域网双机剪贴板与文件桥：在 A 电脑复制，用罗
 ## 当前阶段
 
 文本 + 图片剪贴板双向已在 Linux↔Windows 实机可用（见 `docs/plans/current.md`）。  
-**V2 图片已完成；V2 文件小文件通道基本可用**（task-020..022：协议+hub+UI；无文件夹/>4MiB/OS 桌面粘贴）。  
+**V2 图片已完成；V2 文件小文件通道基本可用**（task-020..024：协议+hub+UI+file_list 非图片 offer；无文件夹/>4MiB/OS 桌面粘贴）。  
 原 task-019A（收图落盘捷径）已 **cancelled**。  
 用户说「开始开发」后：只做一个后续子 task（如 file_list→offer 或 V3），勿做 019A。
 

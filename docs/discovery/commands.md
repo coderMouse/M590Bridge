@@ -58,6 +58,8 @@ UI：`m590-ui` 主面板「选择并发送文件」；设置页可改 `file_save
 
 **重要**：Linux/Windows **必须同一构建**。若一端报 `unknown message type 11`，对端仍是旧版——两端 `git pull && cargo build -p m590-ui` 后重开。
 
+文件管理器复制：图片仍走位图同步；**非图片**单文件 ≤4MiB 自动 FileOffer（对端落盘到 `file_save_dir`）。
+
 默认保存目录：平台 data 目录下 `m590bridge/inbox`。单文件 ≤ 4MiB。
 
 ## 未做

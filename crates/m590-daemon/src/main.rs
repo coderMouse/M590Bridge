@@ -11,9 +11,9 @@ use m590_clipboard::{
     available_backends, ClipboardService, NullClipboard, PlatformClipboard,
 };
 use m590_core::{
-    ConnectionState, DeviceId, Message, QueueClipboardResult, Session, SessionEvent,
-    APP_NAME, DEFAULT_HEARTBEAT_MISS_THRESHOLD, PROTOCOL_VERSION, VERSION,
-    InboundClipboardResult,
+    ConnectionState, DeviceId, InboundClipboardResult, Message, QueueClipboardResult,
+    QueueFileResult, Session, SessionEvent, APP_NAME, DEFAULT_HEARTBEAT_MISS_THRESHOLD,
+    MAX_FILE_BYTES, PROTOCOL_VERSION, VERSION,
 };
 use m590_net::{
     accept_framed, connect_framed, deliver, listen_on, MemoryPipe, NullTransport, TcpFrameStream,
@@ -478,6 +478,7 @@ fn run_bridge(
             match clip.poll_file_list_change() {
                 Ok(Some(paths)) => {
                     if session.state() == ConnectionState::Connected {
+                        let mut handled = false;
                         if let Ok(Some(image)) = m590_clipboard::image_from_paths(&paths) {
                             content_seq += 1;
                             let cid = format!("clip-imgfiles-{}-{content_seq}", process::id());
@@ -494,20 +495,59 @@ fn run_bridge(
                                             println!(
                                                 "sync_tx_image_from_file_list {w}x{h} {encoding:?}"
                                             );
+                                            handled = true;
                                         }
                                         Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
                                             println!(
                                                 "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
                                             );
+                                            handled = true;
                                         }
-                                        Ok(_) => {}
-                                        Err(err) => println!("sync_tx_image=error {err}"),
+                                        Ok(_) => handled = true,
+                                        Err(err) => {
+                                            println!("sync_tx_image=error {err}");
+                                            handled = true;
+                                        }
                                     }
                                 }
-                                Err(err) => println!("sync_tx_image=prepare_error {err}"),
+                                Err(err) => {
+                                    println!("sync_tx_image=prepare_error {err}");
+                                    handled = true;
+                                }
                             }
-                        } else if !paths.is_empty() {
-                            println!("clipboard_files={paths:?} (no image decoded)");
+                        }
+                        if !handled {
+                            if let Some(path) = m590_clipboard::first_regular_file(&paths) {
+                                match m590_clipboard::read_file_for_offer(&path, MAX_FILE_BYTES) {
+                                    Ok((name, data)) => {
+                                        content_seq += 1;
+                                        let tid = format!(
+                                            "clip-file-{}-{content_seq}",
+                                            process::id()
+                                        );
+                                        let bytes = data.len();
+                                        match session.offer_file(tid, name.clone(), data) {
+                                            Ok(QueueFileResult::Queued) => {
+                                                let out = session.take_outbox();
+                                                conn.send_all(out.iter())
+                                                    .map_err(|e| e.to_string())?;
+                                                println!(
+                                                    "sync_tx_file_offer name={name} bytes={bytes}"
+                                                );
+                                            }
+                                            Ok(other) => {
+                                                println!("sync_tx_file=skip {other:?}")
+                                            }
+                                            Err(err) => println!("sync_tx_file=error {err}"),
+                                        }
+                                    }
+                                    Err(err) => {
+                                        println!("clipboard_files={paths:?} skip={err}")
+                                    }
+                                }
+                            } else if !paths.is_empty() {
+                                println!("clipboard_files={paths:?} (no offerable file)");
+                            }
                         }
                     }
                 }

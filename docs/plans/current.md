@@ -14,6 +14,7 @@ Linux + Windows 剪贴板与小文件桥；V2 文件走元数据 + 按需传输 
 - [x] **task-021** hub 落盘 / send_file / status
 - [x] **task-022** UI 选文件发送、进度条、保存目录设置；`send_file_bytes`
 - [x] **task-023** 协议不兼容提示（type 11）+ Win 选文件按钮
+- [x] **task-024** file_list → 非图片原文件 offer
 
 ## 进行中
 
@@ -41,15 +42,15 @@ Linux + Windows 剪贴板与小文件桥；V2 文件走元数据 + 按需传输 
 | hub 自动落盘 + send_file(_bytes) | 有 |
 | UI 选文件发送 + 进度 + 保存目录 | **有** |
 | 文件夹 / >4MiB / OS 文件剪贴板 | 无 |
-| file_list 触发原文件 offer | 无 |
+| file_list 触发原文件 offer（非图片，≤4MiB） | **有** |
 
 ## 下一步（有序）
 
-1. （可选）file_list → 原文件 offer  
-2. mDNS  
-3. 安装包 / 自启  
+1. mDNS 发现  
+2. 安装包 / 开机自启  
+3. （可选）多文件 / >4MiB / 文件夹  
 
-> 「开始开发」→ 新建一个子 task（建议 file_list→offer 或安装/自启预研）。
+> 「开始开发」→ 新建一个子 task（建议 mDNS 或安装/自启预研）。
 
 ## 用户怎么用
 
