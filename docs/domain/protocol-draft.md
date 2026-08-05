@@ -1,7 +1,7 @@
 # 协议草案 · M590Bridge
 
-> 状态：draft（task-003 + task-014 图片）  
-> 范围：局域网 1 对 1；文本 + 小图剪贴板；文件分片仍后置
+> 状态：draft（至 task-018 图片 PNG）  
+> 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；文件分片仍后置（task-019+）
 
 ## 版本
 
@@ -67,7 +67,7 @@
 - 实现：`m590_net::TcpFrameStream`；daemon 命令：`listen` / `connect`
 - 配对：host listen 持有 pairing code；joiner connect 发送 Hello + PairRequest
 - 文本：Connected 后发送 `ClipboardText`；接收方可写 OS 剪贴板
-- 图片（task-014）：Connected 后发送 `ClipboardImage`；超限则日志 skip，不分片
+- 图片（task-014..018）：Connected 后发送 `ClipboardImage`（优先 PNG）；超限 `ImageTooLarge` / `last_error`；TCP send 前恢复 blocking
 
 ## 运行时硬化（task-007）
 
