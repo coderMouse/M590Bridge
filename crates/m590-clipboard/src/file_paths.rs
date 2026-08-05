@@ -1,13 +1,38 @@
-//! Helpers for turning clipboard file_list paths into offerable payloads.
+//! Helpers for turning clipboard file_list / path text into offerable payloads.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::image_file::{candidate_paths, is_likely_image_path, normalize_path_token};
 use crate::ClipboardError;
+
+fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    // arboard usually returns real paths; still accept file://-looking Path display.
+    path.to_str()
+        .and_then(normalize_path_token)
+        .filter(|p| p.is_file())
+}
 
 /// First existing regular file in `paths` (skips dirs / missing).
 pub fn first_regular_file(paths: &[PathBuf]) -> Option<PathBuf> {
-    paths.iter().find(|p| p.is_file()).cloned()
+    paths.iter().find_map(|p| resolve_existing_file(p))
+}
+
+/// If clipboard text is a local **non-image** file path/URI, return it.
+pub fn regular_file_from_text(text: &str) -> Option<PathBuf> {
+    for candidate in candidate_paths(text) {
+        if !candidate.is_file() {
+            continue;
+        }
+        if is_likely_image_path(&candidate) {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
 }
 
 /// Read a local file for file-channel offer if it fits `max_bytes`.
@@ -17,13 +42,10 @@ pub fn read_file_for_offer(
     path: &Path,
     max_bytes: usize,
 ) -> Result<(String, Vec<u8>), ClipboardError> {
-    if !path.is_file() {
-        return Err(ClipboardError::Backend(format!(
-            "not a file: {}",
-            path.display()
-        )));
-    }
-    let meta = fs::metadata(path).map_err(|e| {
+    let path = resolve_existing_file(path).ok_or_else(|| {
+        ClipboardError::Backend(format!("not a file: {}", path.display()))
+    })?;
+    let meta = fs::metadata(&path).map_err(|e| {
         ClipboardError::Backend(format!("stat {}: {e}", path.display()))
     })?;
     let len = meta.len() as usize;
@@ -42,7 +64,7 @@ pub fn read_file_for_offer(
     if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
         return Err(ClipboardError::Backend("invalid file name".into()));
     }
-    let data = fs::read(path).map_err(|e| {
+    let data = fs::read(&path).map_err(|e| {
         ClipboardError::Backend(format!("read {}: {e}", path.display()))
     })?;
     Ok((name, data))
@@ -85,5 +107,17 @@ mod tests {
         assert_eq!(name, "b.bin");
         assert_eq!(data, b"12345");
         let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn regular_file_from_text_skips_images() {
+        let p = temp_file("note.txt", b"hello");
+        let t = p.to_str().unwrap();
+        assert_eq!(regular_file_from_text(t).as_ref(), Some(&p));
+        let img = temp_file("x.png", b"not-really-png");
+        // extension says image → skip even if undecodable
+        assert!(regular_file_from_text(img.to_str().unwrap()).is_none());
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+        let _ = fs::remove_dir_all(img.parent().unwrap());
     }
 }

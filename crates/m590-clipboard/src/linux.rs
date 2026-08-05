@@ -118,6 +118,10 @@ impl ClipboardService for LinuxClipboard {
         self.last_image_fp = None;
         self.last_files.clear();
     }
+
+    fn adopt_text_baseline(&mut self) {
+        self.last_seen = read_text_raw(&mut self.clipboard).ok().flatten();
+    }
 }
 
 pub fn detect_backend() -> Result<ClipboardBackend, ClipboardError> {

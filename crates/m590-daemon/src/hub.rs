@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use m590_clipboard::{ClipboardService, PlatformClipboard};
 use m590_core::{
-    ConnectionState, DeviceId, InboundClipboardResult, InboundFileResult, QueueClipboardResult,
-    QueueFileResult, Session, SessionEvent, DEFAULT_HEARTBEAT_MISS_THRESHOLD, MAX_FILE_BYTES,
+    ConnectionState, DeviceId, InboundClipboardResult, InboundFileResult, Message,
+    QueueClipboardResult, QueueFileResult, Session, SessionEvent,
+    DEFAULT_HEARTBEAT_MISS_THRESHOLD, MAX_FILE_BYTES,
 };
 use m590_net::{accept_framed, connect_framed, listen_on, TcpFrameStream};
 
@@ -858,8 +859,10 @@ fn run_session_loop(
                         .handle(SessionEvent::Message(msg))
                         .map_err(|e| e.to_string())?;
                     last_peer_rx = Instant::now();
-                    conn.send_all(session.take_outbox().iter())
+                    let outbox = session.take_outbox();
+                    conn.send_all(outbox.iter())
                         .map_err(|e| e.to_string())?;
+                    note_outbound_file_completes(&shared, &outbox);
                     match session.take_inbound_clipboard() {
                         Some(InboundClipboardResult::Applied { content_id, text }) => {
                             with_status(&shared, |s| {
@@ -1011,6 +1014,7 @@ fn run_session_loop(
                                                 file_name,
                                                 bytes,
                                             );
+                                            clip.adopt_text_baseline();
                                         }
                                         Err(err) => {
                                             with_status(&shared, |s| {
@@ -1033,10 +1037,10 @@ fn run_session_loop(
                     }
                 }
                 if let Ok(Some(text)) = clip.poll_text_change() {
-                    content_seq += 1;
                     // File-manager "copy image file" often only places a path/URI as text.
                     // Prefer decoding local image files into ClipboardImage.
                     if let Ok(Some(image)) = m590_clipboard::image_from_clipboard_text(&text) {
+                        content_seq += 1;
                         let cid = format!("ui-clip-imgfile-{}-{content_seq}", std::process::id());
                         match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
                             Ok((encoding, data)) => {
@@ -1082,7 +1086,46 @@ fn run_session_loop(
                                 });
                             }
                         }
+                    } else if let Some(path) = m590_clipboard::regular_file_from_text(&text) {
+                        // Linux often exposes a copied file as plain path text only.
+                        match m590_clipboard::read_file_for_offer(&path, MAX_FILE_BYTES) {
+                            Ok((name, data)) => {
+                                match offer_file_bytes(
+                                    session,
+                                    &mut content_seq,
+                                    name,
+                                    data,
+                                ) {
+                                    Ok((summary, transfer_id, file_name, bytes)) => {
+                                        conn.send_all(session.take_outbox().iter())
+                                            .map_err(|e| e.to_string())?;
+                                        mark_file_sending(
+                                            &shared,
+                                            summary,
+                                            transfer_id,
+                                            file_name,
+                                            bytes,
+                                        );
+                                        clip.adopt_text_baseline();
+                                    }
+                                    Err(err) => {
+                                        with_status(&shared, |s| {
+                                            s.file_transfer_phase = Some("failed".into());
+                                            s.last_error =
+                                                Some(format!("path text offer: {err}"));
+                                        });
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                with_status(&shared, |s| {
+                                    s.last_error =
+                                        Some(format!("path text skip: {err}"));
+                                });
+                            }
+                        }
                     } else {
+                        content_seq += 1;
                         let cid = format!("ui-clip-{}-{content_seq}", std::process::id());
                         if let Ok(QueueClipboardResult::Queued) =
                             session.queue_clipboard_text(cid, text.clone())
@@ -1177,6 +1220,38 @@ fn mark_file_sending(
         s.last_sync_text = Some(summary);
         s.last_error = None;
     });
+}
+
+/// Sender side: after FileRequest is answered, outbox contains FileComplete but status
+/// used to stay on `sending` / 0%. Mirror complete into hub status for UI progress.
+fn note_outbound_file_completes(shared: &SharedStatus, outbox: &[Message]) {
+    for msg in outbox {
+        let Message::FileComplete(payload) = msg else {
+            continue;
+        };
+        with_status(shared, |s| {
+            let matches_current = s
+                .last_file_transfer_id
+                .as_deref()
+                .is_some_and(|id| id == payload.transfer_id);
+            let sending = s.file_transfer_phase.as_deref() == Some("sending");
+            if !(matches_current || sending) {
+                return;
+            }
+            s.last_file_transfer_id = Some(payload.transfer_id.clone());
+            if payload.ok {
+                s.file_transfer_phase = Some("done".into());
+                if let Some(total) = s.file_bytes_total.or(s.last_file_bytes) {
+                    s.file_bytes_received = Some(total);
+                    s.file_bytes_total = Some(total);
+                }
+                s.last_error = None;
+            } else {
+                s.file_transfer_phase = Some("failed".into());
+                s.last_error = Some(payload.message.clone());
+            }
+        });
+    }
 }
 
 fn offer_local_file(

@@ -531,6 +531,7 @@ fn run_bridge(
                                                 let out = session.take_outbox();
                                                 conn.send_all(out.iter())
                                                     .map_err(|e| e.to_string())?;
+                                                clip.adopt_text_baseline();
                                                 println!(
                                                     "sync_tx_file_offer name={name} bytes={bytes}"
                                                 );
@@ -558,8 +559,8 @@ fn run_bridge(
             match clip.poll_text_change() {
                 Ok(Some(text)) => {
                     if session.state() == ConnectionState::Connected {
-                        content_seq += 1;
                         if let Ok(Some(image)) = m590_clipboard::image_from_clipboard_text(&text) {
+                            content_seq += 1;
                             let cid = format!("clip-imgfile-{}-{content_seq}", process::id());
                             let w = image.width;
                             let h = image.height;
@@ -594,7 +595,37 @@ fn run_bridge(
                                 }
                                 Err(err) => println!("sync_tx_image=prepare_error {err}"),
                             }
+                        } else if let Some(path) = m590_clipboard::regular_file_from_text(&text) {
+                            match m590_clipboard::read_file_for_offer(
+                                &path,
+                                m590_core::MAX_FILE_BYTES,
+                            ) {
+                                Ok((name, data)) => {
+                                    content_seq += 1;
+                                    let tid =
+                                        format!("clip-file-{}-{content_seq}", process::id());
+                                    match session.offer_file(tid, name.clone(), data) {
+                                        Ok(QueueFileResult::Queued) => {
+                                            let out = session.take_outbox();
+                                            conn.send_all(out.iter())
+                                                .map_err(|e| e.to_string())?;
+                                            clip.adopt_text_baseline();
+                                            println!("sync_tx_file_from_path name={name}");
+                                        }
+                                        Ok(other) => {
+                                            println!("sync_tx_file_from_path=skip {other:?}")
+                                        }
+                                        Err(err) => {
+                                            println!("sync_tx_file_from_path=error {err}")
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    println!("sync_tx_file_from_path=skip {err}")
+                                }
+                            }
                         } else {
+                            content_seq += 1;
                             let cid = format!("clip-{}-{content_seq}", process::id());
                             match session.queue_clipboard_text(cid, text.clone()) {
                                 Ok(QueueClipboardResult::Queued) => {

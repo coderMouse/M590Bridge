@@ -27,7 +27,7 @@ mod windows;
 
 pub use error::ClipboardError;
 pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
-pub use file_paths::{first_regular_file, read_file_for_offer};
+pub use file_paths::{first_regular_file, read_file_for_offer, regular_file_from_text};
 
 /// Which OS/display backend is selected or available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +224,14 @@ pub trait ClipboardService {
     fn prime_poll_to_emit_current(&mut self) {
         let _ = self;
     }
+
+    /// Set text poll baseline to whatever is currently on the clipboard (no emit).
+    ///
+    /// Used after a file_list / path-text file offer so the path string is not
+    /// also pushed as ClipboardText.
+    fn adopt_text_baseline(&mut self) {
+        let _ = self;
+    }
 }
 
 /// No-op clipboard used in tests and headless demos.
@@ -306,6 +314,10 @@ impl ClipboardService for NullClipboard {
         self.last_seen = None;
         self.last_image_fp = None;
         self.last_files.clear();
+    }
+
+    fn adopt_text_baseline(&mut self) {
+        self.last_seen = self.text.clone();
     }
 }
 
@@ -466,6 +478,13 @@ impl ClipboardService for PlatformClipboard {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             self.inner.prime_poll_to_emit_current();
+        }
+    }
+
+    fn adopt_text_baseline(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.adopt_text_baseline();
         }
     }
 }

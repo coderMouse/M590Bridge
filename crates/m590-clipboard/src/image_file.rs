@@ -51,7 +51,7 @@ pub fn load_image_file(path: &Path) -> Result<ImageClipboard, ClipboardError> {
     ImageClipboard::from_rgba(width, height, rgba.into_raw())
 }
 
-fn candidate_paths(text: &str) -> Vec<PathBuf> {
+pub(crate) fn candidate_paths(text: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -82,7 +82,7 @@ fn candidate_paths(text: &str) -> Vec<PathBuf> {
     out
 }
 
-fn normalize_path_token(token: &str) -> Option<PathBuf> {
+pub(crate) fn normalize_path_token(token: &str) -> Option<PathBuf> {
     let token = token.trim().trim_matches('"').trim_matches('\'');
     if token.is_empty() {
         return None;
@@ -109,7 +109,7 @@ fn normalize_path_token(token: &str) -> Option<PathBuf> {
     }
 }
 
-fn is_likely_image_path(path: &Path) -> bool {
+pub(crate) fn is_likely_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)))

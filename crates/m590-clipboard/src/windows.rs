@@ -132,6 +132,16 @@ impl ClipboardService for WindowsClipboard {
         }
     }
 
+    fn adopt_text_baseline(&mut self) {
+        let current = read_text_raw(&mut self.clipboard).or_else(|_| {
+            self.refresh_clipboard()?;
+            read_text_raw(&mut self.clipboard)
+        });
+        if let Ok(v) = current {
+            self.last_seen = v;
+        }
+    }
+
     fn prime_poll_to_emit_current(&mut self) {
         self.last_seen = None;
         self.last_image_fp = None;
