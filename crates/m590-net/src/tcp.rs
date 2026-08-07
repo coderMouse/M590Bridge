@@ -8,6 +8,9 @@ use m590_core::Message;
 
 use crate::frame::{encode_frame, try_decode_frame, FrameError, FRAME_HEADER_LEN, MAX_PAYLOAD_LEN};
 
+const SOCKET_READ_CHUNK_LEN: usize = 64 * 1024;
+const MAX_BUFFERED_LEN: usize = FRAME_HEADER_LEN + MAX_PAYLOAD_LEN + SOCKET_READ_CHUNK_LEN;
+
 /// Errors from TCP framed I/O.
 #[derive(Debug)]
 pub enum TcpError {
@@ -46,6 +49,7 @@ impl From<FrameError> for TcpError {
 pub struct TcpFrameStream {
     stream: TcpStream,
     buffer: Vec<u8>,
+    read_chunk: Box<[u8]>,
 }
 
 impl TcpFrameStream {
@@ -53,7 +57,8 @@ impl TcpFrameStream {
         stream.set_nodelay(true)?;
         Ok(Self {
             stream,
-            buffer: Vec::with_capacity(4096),
+            buffer: Vec::with_capacity(SOCKET_READ_CHUNK_LEN),
+            read_chunk: vec![0u8; SOCKET_READ_CHUNK_LEN].into_boxed_slice(),
         })
     }
 
@@ -135,15 +140,19 @@ impl TcpFrameStream {
 
     /// Non-blocking style: return `Ok(None)` if no complete frame is ready yet.
     pub fn try_recv(&mut self) -> Result<Option<Message>, TcpError> {
-        // Fill from socket without blocking forever.
         self.set_nonblocking(true)?;
-        match self.read_more_nonblocking() {
-            Ok(()) => {}
-            Err(TcpError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {}
-            Err(TcpError::Io(err)) if err.kind() == io::ErrorKind::TimedOut => {}
-            Err(err) => return Err(err),
+        if let Some(msg) = self.try_decode_buffered()? {
+            return Ok(Some(msg));
         }
-        self.try_decode_buffered()
+
+        loop {
+            if !self.read_more_nonblocking_once()? {
+                return Ok(None);
+            }
+            if let Some(msg) = self.try_decode_buffered()? {
+                return Ok(Some(msg));
+            }
+        }
     }
 
     fn try_decode_buffered(&mut self) -> Result<Option<Message>, TcpError> {
@@ -157,34 +166,34 @@ impl TcpFrameStream {
     }
 
     fn read_more_blocking(&mut self) -> Result<(), TcpError> {
-        let mut chunk = [0u8; 4096];
-        let n = self.stream.read(&mut chunk)?;
+        let n = self.stream.read(&mut self.read_chunk)?;
         if n == 0 {
             return Err(TcpError::Disconnected);
         }
-        self.buffer.extend_from_slice(&chunk[..n]);
-        if self.buffer.len() > FRAME_HEADER_LEN + MAX_PAYLOAD_LEN {
-            return Err(TcpError::Frame(FrameError::PayloadTooLarge(self.buffer.len())));
+        self.buffer.extend_from_slice(&self.read_chunk[..n]);
+        if self.buffer.len() > MAX_BUFFERED_LEN {
+            return Err(TcpError::Frame(FrameError::PayloadTooLarge(
+                self.buffer.len(),
+            )));
         }
         Ok(())
     }
 
-    fn read_more_nonblocking(&mut self) -> Result<(), TcpError> {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match self.stream.read(&mut chunk) {
-                Ok(0) => return Err(TcpError::Disconnected),
-                Ok(n) => {
-                    self.buffer.extend_from_slice(&chunk[..n]);
-                    if self.buffer.len() > FRAME_HEADER_LEN + MAX_PAYLOAD_LEN {
-                        return Err(TcpError::Frame(FrameError::PayloadTooLarge(self.buffer.len())));
-                    }
-                    // Keep reading while the kernel buffer drains; exit on WouldBlock.
+    fn read_more_nonblocking_once(&mut self) -> Result<bool, TcpError> {
+        match self.stream.read(&mut self.read_chunk) {
+            Ok(0) => Err(TcpError::Disconnected),
+            Ok(n) => {
+                self.buffer.extend_from_slice(&self.read_chunk[..n]);
+                if self.buffer.len() > MAX_BUFFERED_LEN {
+                    return Err(TcpError::Frame(FrameError::PayloadTooLarge(
+                        self.buffer.len(),
+                    )));
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(err) if err.kind() == io::ErrorKind::TimedOut => return Ok(()),
-                Err(err) => return Err(TcpError::Io(err)),
+                Ok(true)
             }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => Ok(false),
+            Err(err) => Err(TcpError::Io(err)),
         }
     }
 }
@@ -221,7 +230,8 @@ pub fn parse_socket_addr(input: &str) -> Result<std::net::SocketAddr, TcpError> 
 mod tests {
     use super::*;
     use m590_core::{
-        ClipboardTextPayload, ConnectionState, DeviceId, Message, Session, SessionEvent,
+        ClipboardTextPayload, ConnectionState, DeviceId, FileChunkPayload, Message, Session,
+        SessionEvent,
     };
     use std::thread;
     use std::time::{Duration, Instant};
@@ -364,5 +374,47 @@ mod tests {
             .expect("large image send must not fail with WouldBlock after try_recv");
         let got = server.join().unwrap();
         assert_eq!(got, msg);
+    }
+
+    #[test]
+    fn tcp_nonblocking_decodes_many_frames_exceeding_single_frame_limit() {
+        const CHUNK_LEN: usize = 256 * 1024;
+        const FRAME_COUNT: usize = MAX_PAYLOAD_LEN / CHUNK_LEN + 8;
+
+        let listener = listen_on("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut conn = accept_framed(&listener).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut received = 0usize;
+            while received < FRAME_COUNT {
+                assert!(Instant::now() < deadline, "bulk frame receive timeout");
+                match conn.try_recv() {
+                    Ok(Some(Message::FileChunk(payload))) => {
+                        assert_eq!(payload.offset, (received * CHUNK_LEN) as u64);
+                        assert_eq!(payload.data.len(), CHUNK_LEN);
+                        received += 1;
+                    }
+                    Ok(Some(other)) => panic!("unexpected message: {}", other.name()),
+                    Ok(None) => thread::yield_now(),
+                    Err(err) => panic!("bulk frame receive failed: {err}"),
+                }
+            }
+            received
+        });
+
+        let mut client = connect_framed(addr).unwrap();
+        for index in 0..FRAME_COUNT {
+            let payload = FileChunkPayload::new(
+                DeviceId::new("bulk-sender"),
+                "bulk-transfer",
+                (index * CHUNK_LEN) as u64,
+                vec![index as u8; CHUNK_LEN],
+            )
+            .unwrap();
+            client.send(&Message::file_chunk(payload)).unwrap();
+        }
+
+        assert_eq!(server.join().unwrap(), FRAME_COUNT);
     }
 }

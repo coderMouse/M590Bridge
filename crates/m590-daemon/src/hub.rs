@@ -33,6 +33,24 @@ const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_JSON_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HTTP_FILE_BODY_BYTES: usize = MAX_HTTP_FILE_BYTES.div_ceil(3) * 4 + 64 * 1024;
+const IDLE_SESSION_LOOP_DELAY: Duration = Duration::from_millis(50);
+const STALLED_FILE_LOOP_DELAY: Duration = Duration::from_millis(1);
+
+#[derive(Debug, PartialEq, Eq)]
+enum SessionLoopPause {
+    Yield,
+    Sleep(Duration),
+}
+
+fn session_loop_pause(file_active: bool, file_progressed: bool) -> SessionLoopPause {
+    if file_progressed {
+        SessionLoopPause::Yield
+    } else if file_active {
+        SessionLoopPause::Sleep(STALLED_FILE_LOOP_DELAY)
+    } else {
+        SessionLoopPause::Sleep(IDLE_SESSION_LOOP_DELAY)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct HttpRequest {
@@ -1127,6 +1145,8 @@ fn run_session_loop(
     }
 
     loop {
+        let mut file_progressed = false;
+
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             let _ = session.handle(SessionEvent::Disconnect);
             with_status(&shared, |s| {
@@ -1222,6 +1242,7 @@ fn run_session_loop(
             session
                 .pump_outbound_file()
                 .map_err(|e| e.to_string())?;
+            file_progressed = true;
             let outbox = session.take_outbox();
             conn.send_all(outbox.iter())
                 .map_err(|e| e.to_string())?;
@@ -1242,6 +1263,8 @@ fn run_session_loop(
         loop {
             match conn.try_recv() {
                 Ok(Some(msg)) => {
+                    file_progressed |=
+                        matches!(msg, Message::FileChunk(_) | Message::FileComplete(_));
                     session
                         .handle(SessionEvent::Message(msg))
                         .map_err(|e| e.to_string())?;
@@ -1557,7 +1580,10 @@ fn run_session_loop(
             }
         }
 
-        thread::sleep(Duration::from_millis(50));
+        match session_loop_pause(session.has_active_file_transfer(), file_progressed) {
+            SessionLoopPause::Yield => thread::yield_now(),
+            SessionLoopPause::Sleep(delay) => thread::sleep(delay),
+        }
     }
 }
 
@@ -1826,6 +1852,20 @@ mod tests {
         let token = generate_hub_token().unwrap();
         assert_eq!(token.len(), 64);
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn session_loop_pause_is_work_aware() {
+        assert_eq!(
+            session_loop_pause(false, false),
+            SessionLoopPause::Sleep(Duration::from_millis(50))
+        );
+        assert_eq!(
+            session_loop_pause(true, false),
+            SessionLoopPause::Sleep(Duration::from_millis(1))
+        );
+        assert_eq!(session_loop_pause(true, true), SessionLoopPause::Yield);
+        assert_eq!(session_loop_pause(false, true), SessionLoopPause::Yield);
     }
 
     #[test]

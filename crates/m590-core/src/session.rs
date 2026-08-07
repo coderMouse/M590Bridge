@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -358,6 +358,11 @@ impl Session {
     /// True when more outbound file chunks still need pumping.
     pub fn has_pending_outbound_file(&self) -> bool {
         self.active_outbound.is_some()
+    }
+
+    /// True while file bytes are actively being sent or received.
+    pub fn has_active_file_transfer(&self) -> bool {
+        self.active_outbound.is_some() || !self.incoming_files.is_empty()
     }
 
     pub fn handle(&mut self, event: SessionEvent) -> Result<(), SessionError> {
@@ -1078,13 +1083,14 @@ impl Session {
                 }
                 OutboundBody::Path(_) => {
                     let file = active.file.as_mut().ok_or({
-                        SessionError::Protocol(ProtocolError::InvalidFile("missing send file handle"))
-                    })?;
-                    file.seek(SeekFrom::Start(offset)).map_err(|_| {
-                        SessionError::Protocol(ProtocolError::InvalidFile("seek failed while sending"))
+                        SessionError::Protocol(ProtocolError::InvalidFile(
+                            "missing send file handle",
+                        ))
                     })?;
                     file.read_exact(&mut buf).map_err(|_| {
-                        SessionError::Protocol(ProtocolError::InvalidFile("read failed while sending"))
+                        SessionError::Protocol(ProtocolError::InvalidFile(
+                            "read failed while sending",
+                        ))
                     })?;
                 }
             }
@@ -1858,6 +1864,8 @@ mod tests {
     #[test]
     fn file_path_offer_streams_without_loading_all() {
         let (mut host, mut joiner) = pair_host_joiner();
+        assert!(!host.has_active_file_transfer());
+        assert!(!joiner.has_active_file_transfer());
         let dir = std::env::temp_dir().join(format!(
             "m590-stream-{}",
             std::time::SystemTime::now()
@@ -1893,7 +1901,18 @@ mod tests {
         let req = host.take_outbox().pop().unwrap();
         joiner.handle(SessionEvent::Message(req)).unwrap();
         assert!(joiner.has_pending_outbound_file());
+        assert!(joiner.has_active_file_transfer());
+        let first_batch = joiner.take_outbox();
+        assert!(first_batch
+            .iter()
+            .all(|message| matches!(message, Message::FileChunk(_))));
+        for message in first_batch {
+            host.handle(SessionEvent::Message(message)).unwrap();
+        }
+        assert!(host.has_active_file_transfer());
         drain_file_send(&mut joiner, &mut host);
+        assert!(!joiner.has_active_file_transfer());
+        assert!(!host.has_active_file_transfer());
         let Some(InboundFileResult::Applied {
             path,
             size,
