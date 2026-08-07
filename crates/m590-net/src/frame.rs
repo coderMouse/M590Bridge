@@ -178,6 +178,7 @@ fn encode_payload(message: &Message) -> Result<(u8, Vec<u8>), FrameError> {
             write_string(&mut payload, &body.transfer_id)?;
             write_string(&mut payload, &body.file_name)?;
             payload.extend_from_slice(&body.size.to_be_bytes());
+            write_string(&mut payload, &body.sha256_hex)?;
             TYPE_FILE_OFFER
         }
         Message::FileRequest(body) => {
@@ -197,6 +198,7 @@ fn encode_payload(message: &Message) -> Result<(u8, Vec<u8>), FrameError> {
             write_string(&mut payload, &body.transfer_id)?;
             payload.push(u8::from(body.ok));
             write_string(&mut payload, &body.message)?;
+            write_string(&mut payload, &body.sha256_hex)?;
             TYPE_FILE_COMPLETE
         }
         Message::Goodbye { device_id, reason } => {
@@ -303,15 +305,23 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
             let transfer_id = read_string(&mut payload)?;
             let file_name = read_string(&mut payload)?;
             let size = read_u64(&mut payload)?;
+            let sha256_hex = read_string(&mut payload)?;
             ensure_empty(payload)?;
-            let body = FileOfferPayload::new(device_id, transfer_id, file_name, size).map_err(
-                |e| FrameError::InvalidField(match e {
+            let body = FileOfferPayload::with_sha256(
+                device_id,
+                transfer_id,
+                file_name,
+                size,
+                sha256_hex,
+            )
+            .map_err(|e| {
+                FrameError::InvalidField(match e {
                     m590_core::ProtocolError::EmptyDeviceId => "device_id",
                     m590_core::ProtocolError::EmptyTransferId => "transfer_id",
-                    m590_core::ProtocolError::InvalidFile(reason) => reason,
+                    m590_core::ProtocolError::InvalidFile(_) => "file_offer",
                     _ => "file_offer",
-                }),
-            )?;
+                })
+            })?;
             Ok(Message::FileOffer(body))
         }
         TYPE_FILE_REQUEST => {
@@ -352,14 +362,23 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
             let ok = payload[0] != 0;
             payload = &payload[1..];
             let message = read_string(&mut payload)?;
+            let sha256_hex = read_string(&mut payload)?;
             ensure_empty(payload)?;
-            let body = FileCompletePayload::new(device_id, transfer_id, ok, message).map_err(
-                |e| FrameError::InvalidField(match e {
+            let body = FileCompletePayload::with_sha256(
+                device_id,
+                transfer_id,
+                ok,
+                message,
+                sha256_hex,
+            )
+            .map_err(|e| {
+                FrameError::InvalidField(match e {
                     m590_core::ProtocolError::EmptyDeviceId => "device_id",
                     m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                    m590_core::ProtocolError::InvalidFile(_) => "file_complete",
                     _ => "file_complete",
-                }),
-            )?;
+                })
+            })?;
             Ok(Message::FileComplete(body))
         }
         TYPE_GOODBYE => {

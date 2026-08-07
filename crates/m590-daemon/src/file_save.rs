@@ -37,6 +37,20 @@ pub fn save_received_file(dir: &Path, file_name: &str, data: &[u8]) -> Result<Pa
     Ok(path)
 }
 
+/// Move a completed `.part` (or temp) file into `dir` under a unique basename.
+pub fn finalize_part_file(dir: &Path, file_name: &str, part_path: &Path) -> Result<PathBuf, String> {
+    let dest = unique_save_path(dir, file_name)?;
+    match fs::rename(part_path, &dest) {
+        Ok(()) => Ok(dest),
+        Err(_) => {
+            // Cross-device rename fallback.
+            fs::copy(part_path, &dest).map_err(|e| format!("copy part file: {e}"))?;
+            let _ = fs::remove_file(part_path);
+            Ok(dest)
+        }
+    }
+}
+
 fn validate_basename(file_name: &str) -> Result<String, String> {
     let name = file_name.trim();
     if name.is_empty() {
@@ -96,12 +110,26 @@ mod tests {
     }
 
     #[test]
+    fn finalize_moves_part() {
+        let dir = temp_dir();
+        let part = dir.join("x.part");
+        fs::write(&part, b"part-bytes").unwrap();
+        let saved = finalize_part_file(&dir, "final.bin", &part).unwrap();
+        assert_eq!(saved.file_name().unwrap(), "final.bin");
+        assert_eq!(fs::read(&saved).unwrap(), b"part-bytes");
+        assert!(!part.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_transfer_then_save_like_hub() {
         use m590_core::{
             DeviceId, InboundFileResult, QueueFileResult, Session, SessionEvent,
         };
 
         let mut host = Session::new(DeviceId::new("host")).unwrap();
+        let recv = temp_dir();
+        host.set_file_receive_dir(recv.join("parts"));
         host.handle(SessionEvent::StartPairing {
             expected_code: "999111".into(),
         })
@@ -143,21 +171,29 @@ mod tests {
         assert_eq!(host.request_file("t-save").unwrap(), QueueFileResult::Queued);
         let req = host.take_outbox().pop().unwrap();
         joiner.handle(SessionEvent::Message(req)).unwrap();
-        for msg in joiner.take_outbox() {
-            host.handle(SessionEvent::Message(msg)).unwrap();
+        loop {
+            let out = joiner.take_outbox();
+            for msg in out {
+                host.handle(SessionEvent::Message(msg)).unwrap();
+            }
+            if !joiner.has_pending_outbound_file() {
+                break;
+            }
+            joiner.pump_outbound_file().unwrap();
         }
         let Some(InboundFileResult::Applied {
             file_name,
-            data: got,
+            path,
+            size,
             ..
         }) = host.take_inbound_file()
         else {
             panic!("expected applied file");
         };
-        assert_eq!(got, data);
-        let dir = temp_dir();
-        let saved = save_received_file(&dir, &file_name, &got).unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(fs::read(&path).unwrap(), data);
+        let saved = finalize_part_file(&recv, &file_name, &path).unwrap();
         assert_eq!(fs::read(saved).unwrap(), data);
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&recv);
     }
 }

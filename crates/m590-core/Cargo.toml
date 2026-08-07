@@ -6,3 +6,4 @@ license.workspace = true
 description = "Shared types, config placeholders, and version for M590Bridge"
 
 [dependencies]
+sha2 = "0.10"

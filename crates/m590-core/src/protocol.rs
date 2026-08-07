@@ -153,6 +153,28 @@ fn validate_file_name(file_name: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Validate lowercase/uppercase hex SHA-256 (empty allowed = not provided).
+pub fn validate_sha256_hex(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ProtocolError::InvalidFile("sha256 must be 64 hex chars or empty"));
+    }
+    Ok(())
+}
+
+/// Lowercase hex encode.
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
 /// Peer announces a file is available for on-demand pull.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileOfferPayload {
@@ -160,6 +182,8 @@ pub struct FileOfferPayload {
     pub transfer_id: String,
     pub file_name: String,
     pub size: u64,
+    /// Lowercase hex SHA-256 of full file; empty if not precomputed.
+    pub sha256_hex: String,
 }
 
 impl FileOfferPayload {
@@ -168,6 +192,16 @@ impl FileOfferPayload {
         transfer_id: impl Into<String>,
         file_name: impl Into<String>,
         size: u64,
+    ) -> Result<Self, ProtocolError> {
+        Self::with_sha256(device_id, transfer_id, file_name, size, "")
+    }
+
+    pub fn with_sha256(
+        device_id: DeviceId,
+        transfer_id: impl Into<String>,
+        file_name: impl Into<String>,
+        size: u64,
+        sha256_hex: impl Into<String>,
     ) -> Result<Self, ProtocolError> {
         if device_id.as_str().is_empty() {
             return Err(ProtocolError::EmptyDeviceId);
@@ -178,11 +212,14 @@ impl FileOfferPayload {
         }
         let file_name = file_name.into();
         validate_file_name(&file_name)?;
+        let sha256_hex = sha256_hex.into().to_ascii_lowercase();
+        validate_sha256_hex(&sha256_hex)?;
         Ok(Self {
             device_id,
             transfer_id,
             file_name,
             size,
+            sha256_hex,
         })
     }
 }
@@ -252,6 +289,8 @@ pub struct FileCompletePayload {
     pub transfer_id: String,
     pub ok: bool,
     pub message: String,
+    /// Lowercase hex SHA-256 of transferred bytes when ok; empty otherwise.
+    pub sha256_hex: String,
 }
 
 impl FileCompletePayload {
@@ -261,6 +300,16 @@ impl FileCompletePayload {
         ok: bool,
         message: impl Into<String>,
     ) -> Result<Self, ProtocolError> {
+        Self::with_sha256(device_id, transfer_id, ok, message, "")
+    }
+
+    pub fn with_sha256(
+        device_id: DeviceId,
+        transfer_id: impl Into<String>,
+        ok: bool,
+        message: impl Into<String>,
+        sha256_hex: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
         if device_id.as_str().is_empty() {
             return Err(ProtocolError::EmptyDeviceId);
         }
@@ -268,11 +317,14 @@ impl FileCompletePayload {
         if transfer_id.is_empty() {
             return Err(ProtocolError::EmptyTransferId);
         }
+        let sha256_hex = sha256_hex.into().to_ascii_lowercase();
+        validate_sha256_hex(&sha256_hex)?;
         Ok(Self {
             device_id,
             transfer_id,
             ok,
             message: message.into(),
+            sha256_hex,
         })
     }
 }

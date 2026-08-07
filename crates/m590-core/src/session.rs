@@ -1,18 +1,30 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::{
-    ConnectionState, DeviceId, FileChunkPayload, FileCompletePayload, FileOfferPayload,
-    FileRequestPayload, Message, ProtocolError, SessionError, SyncState, PROTOCOL_VERSION,
+    bytes_to_hex, ConnectionState, DeviceId, FileChunkPayload, FileCompletePayload,
+    FileOfferPayload, FileRequestPayload, Message, ProtocolError, SessionError, SyncState,
+    PROTOCOL_VERSION,
 };
 
 /// Max remembered clipboard content IDs for dedup (send + receive).
 const SEEN_CONTENT_ID_CAP: usize = 64;
 
-/// Outbound file chunk size for staged transfers (first file-channel slice).
-pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
+/// Outbound file chunk size (streamed disk/network buffer).
+pub const FILE_CHUNK_SIZE: usize = 256 * 1024;
 
-/// Max staged / received file bytes kept in session memory for this slice.
-pub const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// How many chunks to emit per [`Session::pump_outbound_file`] call (back-pressure).
+pub const OUTBOUND_CHUNKS_PER_PUMP: usize = 4;
+
+/// Soft cap for any single file transfer (path or memory). Not an in-memory ceiling.
+pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Max bytes accepted by the in-memory [`Session::offer_file`] / base64 path.
+pub const MAX_MEMORY_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default missed heartbeat-ack ticks before the peer is considered suspect.
 pub const DEFAULT_HEARTBEAT_MISS_THRESHOLD: u32 = 3;
@@ -69,8 +81,8 @@ pub enum QueueFileResult {
     Queued,
     /// Same `transfer_id` already staged locally.
     DuplicateTransferId,
-    /// File exceeds in-memory staging budget for this slice.
-    FileTooLarge { byte_len: usize, limit: usize },
+    /// File exceeds transfer soft cap.
+    FileTooLarge { byte_len: u64, limit: u64 },
     /// No matching inbound offer to request.
     UnknownTransferId,
 }
@@ -84,11 +96,13 @@ pub enum InboundFileResult {
         file_name: String,
         size: u64,
     },
-    /// Transfer finished successfully with bytes reassembled in memory.
+    /// Transfer finished; bytes live on disk at `path` (caller should move/rename).
     Applied {
         transfer_id: String,
         file_name: String,
-        data: Vec<u8>,
+        path: PathBuf,
+        size: u64,
+        sha256_hex: String,
     },
     /// Transfer failed or was aborted by peer.
     Failed {
@@ -97,29 +111,66 @@ pub enum InboundFileResult {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+enum OutboundBody {
+    Memory(Vec<u8>),
+    Path(PathBuf),
+}
+
+#[derive(Debug)]
 struct StagedOutboundFile {
+    file_name: String,
+    size: u64,
+    body: OutboundBody,
+    /// Precomputed digest for memory offers; path offers hash while sending.
+    sha256_hex: Option<String>,
+}
+
+#[derive(Debug)]
+struct ActiveOutboundSend {
+    transfer_id: String,
     #[allow(dead_code)]
     file_name: String,
-    data: Vec<u8>,
+    size: u64,
+    body: OutboundBody,
+    next_offset: u64,
+    /// Live hasher when digest was not precomputed.
+    hasher: Option<Sha256>,
+    sha256_hex: Option<String>,
+    file: Option<File>,
 }
 
 #[derive(Debug, Clone)]
 struct InboundOffer {
     file_name: String,
     size: u64,
+    sha256_hex: String,
     #[allow(dead_code)]
     from: DeviceId,
 }
 
-#[derive(Debug, Clone)]
 struct IncomingFile {
     file_name: String,
     expected_size: u64,
+    expected_sha256: String,
     #[allow(dead_code)]
     from: DeviceId,
-    buf: Vec<u8>,
+    part_path: PathBuf,
+    writer: File,
     next_offset: u64,
+    hasher: Sha256,
+}
+
+impl std::fmt::Debug for IncomingFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncomingFile")
+            .field("file_name", &self.file_name)
+            .field("expected_size", &self.expected_size)
+            .field("expected_sha256", &self.expected_sha256)
+            .field("part_path", &self.part_path)
+            .field("next_offset", &self.next_offset)
+            .finish()
+    }
 }
 
 /// Read-only view of session fields useful for daemon logging / UI later.
@@ -137,13 +188,13 @@ pub struct SessionSnapshot {
     pub last_clipboard_image_bytes: Option<usize>,
     pub last_file_transfer_id: Option<String>,
     pub last_file_name: Option<String>,
-    pub last_file_bytes: Option<usize>,
+    pub last_file_bytes: Option<u64>,
     pub missed_heartbeat_acks: u32,
     pub outstanding_heartbeat_seq: Option<u64>,
 }
 
 /// In-memory 1-on-1 session. Types keep `DeviceId` for future multi-device use.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Session {
     local_device: DeviceId,
     peer_device: Option<DeviceId>,
@@ -163,18 +214,22 @@ pub struct Session {
     seen_content_ids: VecDeque<String>,
     /// Filled when an inbound clipboard payload is newly applied (daemon should consume).
     last_inbound_clipboard: Option<InboundClipboardResult>,
-    /// Local files staged after `offer_file` (bytes kept until sent or disconnect).
+    /// Local files staged after offer (path or small memory body).
     staged_outbound_files: HashMap<String, StagedOutboundFile>,
+    /// Single in-flight outbound stream (chunks produced via [`Self::pump_outbound_file`]).
+    active_outbound: Option<ActiveOutboundSend>,
     /// Offers announced by the peer, keyed by transfer_id.
     inbound_offers: HashMap<String, InboundOffer>,
-    /// In-progress reassembly of peer file bytes.
+    /// In-progress receive writing to `.part` files.
     incoming_files: HashMap<String, IncomingFile>,
+    /// Directory for inbound `.part` / temp files (defaults to system temp).
+    file_receive_dir: Option<PathBuf>,
     /// Filled when an inbound file event is newly observed (daemon/UI should consume).
     last_inbound_file: Option<InboundFileResult>,
     last_file_transfer_id: Option<String>,
     last_file_name: Option<String>,
-    last_file_bytes: Option<usize>,
-    /// Outbound messages produced by the last `handle` / queue call.
+    last_file_bytes: Option<u64>,
+    /// Outbound messages produced by the last `handle` / queue / pump call.
     pending_outbox: Vec<Message>,
 }
 
@@ -200,14 +255,21 @@ impl Session {
             seen_content_ids: VecDeque::new(),
             last_inbound_clipboard: None,
             staged_outbound_files: HashMap::new(),
+            active_outbound: None,
             inbound_offers: HashMap::new(),
             incoming_files: HashMap::new(),
+            file_receive_dir: None,
             last_inbound_file: None,
             last_file_transfer_id: None,
             last_file_name: None,
             last_file_bytes: None,
             pending_outbox: Vec::new(),
         })
+    }
+
+    /// Directory used for inbound `.part` files (created on demand).
+    pub fn set_file_receive_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.file_receive_dir = Some(dir.into());
     }
 
     pub fn state(&self) -> ConnectionState {
@@ -284,6 +346,18 @@ impl Session {
             }
         }
         None
+    }
+
+    /// Best-effort send progress for the active outbound stream.
+    pub fn outbound_file_progress(&self) -> Option<(String, u64, u64)> {
+        self.active_outbound
+            .as_ref()
+            .map(|a| (a.transfer_id.clone(), a.next_offset, a.size))
+    }
+
+    /// True when more outbound file chunks still need pumping.
+    pub fn has_pending_outbound_file(&self) -> bool {
+        self.active_outbound.is_some()
     }
 
     pub fn handle(&mut self, event: SessionEvent) -> Result<(), SessionError> {
@@ -413,7 +487,8 @@ impl Session {
 
     /// Stage file bytes in memory and announce a [`Message::FileOffer`] to the peer.
     ///
-    /// The peer must call [`Self::request_file`] before chunks are sent (on-demand pull).
+    /// Prefer [`Self::offer_file_path`] for large files. This path precomputes SHA-256 and
+    /// keeps bytes in RAM up to [`MAX_MEMORY_FILE_BYTES`].
     pub fn offer_file(
         &mut self,
         transfer_id: impl Into<String>,
@@ -436,30 +511,109 @@ impl Session {
         if self.staged_outbound_files.contains_key(&transfer_id) {
             return Ok(QueueFileResult::DuplicateTransferId);
         }
-        if data.len() > MAX_FILE_BYTES {
+        let byte_len = data.len() as u64;
+        if byte_len > MAX_FILE_BYTES {
             return Ok(QueueFileResult::FileTooLarge {
-                byte_len: data.len(),
+                byte_len,
                 limit: MAX_FILE_BYTES,
             });
         }
+        if data.len() > MAX_MEMORY_FILE_BYTES {
+            return Ok(QueueFileResult::FileTooLarge {
+                byte_len,
+                limit: MAX_MEMORY_FILE_BYTES as u64,
+            });
+        }
         let file_name = file_name.into();
-        let offer = FileOfferPayload::new(
+        let digest = Sha256::digest(&data);
+        let sha256_hex = bytes_to_hex(&digest);
+        let offer = FileOfferPayload::with_sha256(
             self.local_device.clone(),
             transfer_id.clone(),
             file_name.clone(),
-            data.len() as u64,
+            byte_len,
+            sha256_hex.clone(),
         )?;
         self.staged_outbound_files.insert(
             transfer_id.clone(),
             StagedOutboundFile {
                 file_name: file_name.clone(),
-                data,
+                size: byte_len,
+                body: OutboundBody::Memory(data),
+                sha256_hex: Some(sha256_hex),
             },
         );
         self.sync_state = SyncState::Syncing;
         self.last_file_transfer_id = Some(transfer_id);
         self.last_file_name = Some(file_name);
-        self.last_file_bytes = Some(offer.size as usize);
+        self.last_file_bytes = Some(offer.size);
+        self.pending_outbox.push(Message::file_offer(offer));
+        self.sync_state = SyncState::Idle;
+        Ok(QueueFileResult::Queued)
+    }
+
+    /// Stage a local file by path (streamed on request; does not load whole file).
+    pub fn offer_file_path(
+        &mut self,
+        transfer_id: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> Result<QueueFileResult, SessionError> {
+        self.pending_outbox.clear();
+        self.last_inbound_clipboard = None;
+        self.last_inbound_file = None;
+        if self.state != ConnectionState::Connected {
+            return Err(SessionError::InvalidTransition {
+                from: self.state,
+                event: "offer_file_path",
+            });
+        }
+        let transfer_id = transfer_id.into();
+        if transfer_id.is_empty() {
+            return Err(ProtocolError::EmptyTransferId.into());
+        }
+        if self.staged_outbound_files.contains_key(&transfer_id) {
+            return Ok(QueueFileResult::DuplicateTransferId);
+        }
+        let path = path.as_ref();
+        let meta = fs::metadata(path).map_err(|_| {
+            SessionError::Protocol(ProtocolError::InvalidFile("failed to stat file"))
+        })?;
+        if !meta.is_file() {
+            return Err(ProtocolError::InvalidFile("path is not a regular file").into());
+        }
+        let size = meta.len();
+        if size > MAX_FILE_BYTES {
+            return Ok(QueueFileResult::FileTooLarge {
+                byte_len: size,
+                limit: MAX_FILE_BYTES,
+            });
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .ok_or(ProtocolError::InvalidFile("file name missing"))?
+            .to_string();
+        // Offer without pre-hash (hash while streaming) to avoid double full-file read.
+        let offer = FileOfferPayload::new(
+            self.local_device.clone(),
+            transfer_id.clone(),
+            file_name.clone(),
+            size,
+        )?;
+        self.staged_outbound_files.insert(
+            transfer_id.clone(),
+            StagedOutboundFile {
+                file_name: file_name.clone(),
+                size,
+                body: OutboundBody::Path(path.to_path_buf()),
+                sha256_hex: None,
+            },
+        );
+        self.sync_state = SyncState::Syncing;
+        self.last_file_transfer_id = Some(transfer_id);
+        self.last_file_name = Some(file_name);
+        self.last_file_bytes = Some(size);
         self.pending_outbox.push(Message::file_offer(offer));
         self.sync_state = SyncState::Idle;
         Ok(QueueFileResult::Queued)
@@ -491,6 +645,23 @@ impl Session {
         self.pending_outbox.push(Message::file_request(req));
         self.sync_state = SyncState::Idle;
         Ok(QueueFileResult::Queued)
+    }
+
+    /// Emit up to [`OUTBOUND_CHUNKS_PER_PUMP`] file chunks (or a Complete) for the active send.
+    ///
+    /// Returns `true` if more pumping is still required. Appends to the outbox without clearing it.
+    pub fn pump_outbound_file(&mut self) -> Result<bool, SessionError> {
+        if self.active_outbound.is_none() {
+            return Ok(false);
+        }
+        if self.state != ConnectionState::Connected {
+            self.abort_active_outbound();
+            return Ok(false);
+        }
+        self.sync_state = SyncState::Syncing;
+        self.pump_outbound_file_inner()?;
+        self.sync_state = SyncState::Idle;
+        Ok(self.active_outbound.is_some())
     }
 
     fn on_start_pairing(&mut self, expected_code: String) -> Result<(), SessionError> {
@@ -810,7 +981,7 @@ impl Session {
 
     fn on_file_offer(&mut self, payload: FileOfferPayload) -> Result<(), SessionError> {
         self.ensure_connected_file_peer(&payload.device_id, "file_offer")?;
-        if payload.size > MAX_FILE_BYTES as u64 {
+        if payload.size > MAX_FILE_BYTES {
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: format!(
@@ -825,6 +996,7 @@ impl Session {
             InboundOffer {
                 file_name: payload.file_name.clone(),
                 size: payload.size,
+                sha256_hex: payload.sha256_hex,
                 from: payload.device_id,
             },
         );
@@ -838,71 +1010,157 @@ impl Session {
 
     fn on_file_request(&mut self, payload: FileRequestPayload) -> Result<(), SessionError> {
         self.ensure_connected_file_peer(&payload.device_id, "file_request")?;
-        let Some(staged) = self.staged_outbound_files.get(&payload.transfer_id).cloned() else {
+        if self.active_outbound.is_some() {
+            let complete = FileCompletePayload::new(
+                self.local_device.clone(),
+                payload.transfer_id,
+                false,
+                "sender busy with another transfer",
+            )?;
+            self.pending_outbox.push(Message::file_complete(complete));
+            return Ok(());
+        }
+        let Some(staged) = self.staged_outbound_files.remove(&payload.transfer_id) else {
             let complete = FileCompletePayload::new(
                 self.local_device.clone(),
                 payload.transfer_id,
                 false,
                 "unknown transfer id",
             )?;
-            self.pending_outbox
-                .push(Message::file_complete(complete));
+            self.pending_outbox.push(Message::file_complete(complete));
             return Ok(());
         };
 
+        let hasher = if staged.sha256_hex.is_some() {
+            None
+        } else {
+            Some(Sha256::new())
+        };
+        let file = match &staged.body {
+            OutboundBody::Path(path) => Some(File::open(path).map_err(|_| {
+                SessionError::Protocol(ProtocolError::InvalidFile("failed to open file for send"))
+            })?),
+            OutboundBody::Memory(_) => None,
+        };
+
+        self.active_outbound = Some(ActiveOutboundSend {
+            transfer_id: payload.transfer_id,
+            file_name: staged.file_name,
+            size: staged.size,
+            body: staged.body,
+            next_offset: 0,
+            hasher,
+            sha256_hex: staged.sha256_hex,
+            file,
+        });
         self.sync_state = SyncState::Syncing;
-        let mut offset: u64 = 0;
-        while (offset as usize) < staged.data.len() {
-            let start = offset as usize;
-            let end = (start + FILE_CHUNK_SIZE).min(staged.data.len());
+        self.pump_outbound_file_inner()?;
+        self.sync_state = SyncState::Idle;
+        Ok(())
+    }
+
+    fn pump_outbound_file_inner(&mut self) -> Result<(), SessionError> {
+        for _ in 0..OUTBOUND_CHUNKS_PER_PUMP {
+            let Some(active) = self.active_outbound.as_mut() else {
+                return Ok(());
+            };
+            if active.next_offset >= active.size {
+                break;
+            }
+            let remaining = (active.size - active.next_offset) as usize;
+            let take = remaining.min(FILE_CHUNK_SIZE);
+            let offset = active.next_offset;
+            let mut buf = vec![0u8; take];
+            match &mut active.body {
+                OutboundBody::Memory(data) => {
+                    let start = offset as usize;
+                    buf.copy_from_slice(&data[start..start + take]);
+                }
+                OutboundBody::Path(_) => {
+                    let file = active.file.as_mut().ok_or_else(|| {
+                        SessionError::Protocol(ProtocolError::InvalidFile("missing send file handle"))
+                    })?;
+                    file.seek(SeekFrom::Start(offset)).map_err(|_| {
+                        SessionError::Protocol(ProtocolError::InvalidFile("seek failed while sending"))
+                    })?;
+                    file.read_exact(&mut buf).map_err(|_| {
+                        SessionError::Protocol(ProtocolError::InvalidFile("read failed while sending"))
+                    })?;
+                }
+            }
+            if let Some(hasher) = active.hasher.as_mut() {
+                hasher.update(&buf);
+            }
             let chunk = FileChunkPayload::new(
                 self.local_device.clone(),
-                payload.transfer_id.clone(),
+                active.transfer_id.clone(),
                 offset,
-                staged.data[start..end].to_vec(),
+                buf,
             )?;
+            active.next_offset = offset + take as u64;
             self.pending_outbox.push(Message::file_chunk(chunk));
-            offset = end as u64;
         }
-        let complete = FileCompletePayload::new(
+
+        let finished = self
+            .active_outbound
+            .as_ref()
+            .is_some_and(|a| a.next_offset >= a.size);
+        if !finished {
+            return Ok(());
+        }
+
+        let active = self.active_outbound.take().expect("active outbound");
+        let sha256_hex = if let Some(hex) = active.sha256_hex {
+            hex
+        } else if let Some(hasher) = active.hasher {
+            bytes_to_hex(&hasher.finalize())
+        } else {
+            String::new()
+        };
+        let complete = FileCompletePayload::with_sha256(
             self.local_device.clone(),
-            payload.transfer_id.clone(),
+            active.transfer_id,
             true,
             "",
+            sha256_hex,
         )?;
-        self.pending_outbox
-            .push(Message::file_complete(complete));
+        self.pending_outbox.push(Message::file_complete(complete));
         self.sync_state = SyncState::Idle;
         Ok(())
     }
 
     fn on_file_chunk(&mut self, payload: FileChunkPayload) -> Result<(), SessionError> {
         self.ensure_connected_file_peer(&payload.device_id, "file_chunk")?;
-
-        if let Some(incoming) = self.incoming_files.get_mut(&payload.transfer_id) {
-            if payload.offset != incoming.next_offset {
-                self.incoming_files.remove(&payload.transfer_id);
-                self.last_inbound_file = Some(InboundFileResult::Failed {
-                    transfer_id: payload.transfer_id,
-                    message: "chunk offset mismatch".into(),
-                });
-                return Ok(());
+        if self.incoming_files.contains_key(&payload.transfer_id) {
+            let fail_msg = {
+                let incoming = self.incoming_files.get_mut(&payload.transfer_id).unwrap();
+                if payload.offset != incoming.next_offset {
+                    Some(format!(
+                        "offset mismatch: got {} expected {}",
+                        payload.offset, incoming.next_offset
+                    ))
+                } else {
+                    let new_len = incoming
+                        .next_offset
+                        .saturating_add(payload.data.len() as u64);
+                    if new_len > incoming.expected_size || new_len > MAX_FILE_BYTES {
+                        Some("chunk exceeds expected size".into())
+                    } else if incoming.writer.write_all(&payload.data).is_err() {
+                        Some("failed to write part file".into())
+                    } else {
+                        incoming.hasher.update(&payload.data);
+                        incoming.next_offset = new_len;
+                        None
+                    }
+                }
+            };
+            if let Some(msg) = fail_msg {
+                self.fail_incoming(&payload.transfer_id, msg);
             }
-            let new_len = incoming.buf.len().saturating_add(payload.data.len());
-            if new_len > MAX_FILE_BYTES || new_len as u64 > incoming.expected_size {
-                self.incoming_files.remove(&payload.transfer_id);
-                self.last_inbound_file = Some(InboundFileResult::Failed {
-                    transfer_id: payload.transfer_id,
-                    message: "incoming file exceeds expected size".into(),
-                });
-                return Ok(());
-            }
-            incoming.buf.extend_from_slice(&payload.data);
-            incoming.next_offset = payload.offset + payload.data.len() as u64;
             return Ok(());
         }
 
-        let Some(offer) = self.inbound_offers.get(&payload.transfer_id).cloned() else {
+        let Some(offer) = self.inbound_offers.remove(&payload.transfer_id) else {
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: "chunk for unknown transfer".into(),
@@ -916,36 +1174,43 @@ impl Session {
             });
             return Ok(());
         }
-        if payload.data.len() > MAX_FILE_BYTES || payload.data.len() as u64 > offer.size {
+        if payload.data.len() as u64 > offer.size || offer.size > MAX_FILE_BYTES {
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
-                message: "incoming file exceeds expected size".into(),
+                message: "chunk exceeds offer size".into(),
             });
             return Ok(());
         }
-        let mut buf = Vec::with_capacity(offer.size as usize);
-        buf.extend_from_slice(&payload.data);
-        let next_offset = payload.data.len() as u64;
-        self.incoming_files.insert(
-            payload.transfer_id,
-            IncomingFile {
-                file_name: offer.file_name,
-                expected_size: offer.size,
-                from: payload.device_id,
-                buf,
-                next_offset,
-            },
-        );
+        match self.open_incoming(&payload.transfer_id, &offer, &payload.device_id) {
+            Ok(mut incoming) => {
+                if let Err(_) = incoming.writer.write_all(&payload.data) {
+                    let _ = fs::remove_file(&incoming.part_path);
+                    self.last_inbound_file = Some(InboundFileResult::Failed {
+                        transfer_id: payload.transfer_id,
+                        message: "failed to write part file".into(),
+                    });
+                    return Ok(());
+                }
+                incoming.hasher.update(&payload.data);
+                incoming.next_offset = payload.data.len() as u64;
+                self.incoming_files
+                    .insert(payload.transfer_id, incoming);
+            }
+            Err(msg) => {
+                self.last_inbound_file = Some(InboundFileResult::Failed {
+                    transfer_id: payload.transfer_id,
+                    message: msg,
+                });
+            }
+        }
         Ok(())
     }
 
     fn on_file_complete(&mut self, payload: FileCompletePayload) -> Result<(), SessionError> {
         self.ensure_connected_file_peer(&payload.device_id, "file_complete")?;
-
-        let offer = self.inbound_offers.remove(&payload.transfer_id);
-        let incoming = self.incoming_files.remove(&payload.transfer_id);
-
         if !payload.ok {
+            self.cleanup_incoming(&payload.transfer_id);
+            self.inbound_offers.remove(&payload.transfer_id);
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: if payload.message.is_empty() {
@@ -954,58 +1219,154 @@ impl Session {
                     payload.message
                 },
             });
-            self.sync_state = SyncState::Idle;
             return Ok(());
         }
 
-        let (file_name, expected_size, data) = match (offer, incoming) {
-            (_, Some(incoming)) => (
-                incoming.file_name,
-                incoming.expected_size,
-                incoming.buf,
-            ),
-            (Some(offer), None) if offer.size == 0 => (offer.file_name, 0, Vec::new()),
-            (Some(offer), None) => {
-                self.last_inbound_file = Some(InboundFileResult::Failed {
-                    transfer_id: payload.transfer_id,
-                    message: format!(
-                        "complete missing chunks for {} byte file",
-                        offer.size
-                    ),
-                });
-                return Ok(());
+        // Empty file: complete may arrive with no chunks.
+        if !self.incoming_files.contains_key(&payload.transfer_id) {
+            if let Some(offer) = self.inbound_offers.remove(&payload.transfer_id) {
+                if offer.size == 0 {
+                    match self.open_incoming(&payload.transfer_id, &offer, &payload.device_id) {
+                        Ok(incoming) => {
+                            self.incoming_files
+                                .insert(payload.transfer_id.clone(), incoming);
+                        }
+                        Err(msg) => {
+                            self.last_inbound_file = Some(InboundFileResult::Failed {
+                                transfer_id: payload.transfer_id,
+                                message: msg,
+                            });
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    self.last_inbound_file = Some(InboundFileResult::Failed {
+                        transfer_id: payload.transfer_id,
+                        message: "complete without data".into(),
+                    });
+                    return Ok(());
+                }
             }
-            (None, None) => {
-                self.last_inbound_file = Some(InboundFileResult::Failed {
-                    transfer_id: payload.transfer_id,
-                    message: "complete for unknown transfer".into(),
-                });
-                return Ok(());
-            }
-        };
+        }
 
-        if data.len() as u64 != expected_size {
+        let Some(mut incoming) = self.incoming_files.remove(&payload.transfer_id) else {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: "complete for unknown transfer".into(),
+            });
+            return Ok(());
+        };
+        self.inbound_offers.remove(&payload.transfer_id);
+
+        let _ = incoming.writer.flush();
+        drop(incoming.writer);
+
+        if incoming.next_offset != incoming.expected_size {
+            let _ = fs::remove_file(&incoming.part_path);
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: format!(
                     "size mismatch: got {} expected {}",
-                    data.len(),
-                    expected_size
+                    incoming.next_offset, incoming.expected_size
+                ),
+            });
+            return Ok(());
+        }
+
+        let digest = bytes_to_hex(&incoming.hasher.finalize());
+        if !payload.sha256_hex.is_empty() && payload.sha256_hex != digest {
+            let _ = fs::remove_file(&incoming.part_path);
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: format!(
+                    "sha256 mismatch: got {digest} expected {}",
+                    payload.sha256_hex
+                ),
+            });
+            return Ok(());
+        }
+        if !incoming.expected_sha256.is_empty() && incoming.expected_sha256 != digest {
+            let _ = fs::remove_file(&incoming.part_path);
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: format!(
+                    "sha256 mismatch vs offer: got {digest} expected {}",
+                    incoming.expected_sha256
                 ),
             });
             return Ok(());
         }
 
         self.last_file_transfer_id = Some(payload.transfer_id.clone());
-        self.last_file_name = Some(file_name.clone());
-        self.last_file_bytes = Some(data.len());
+        self.last_file_name = Some(incoming.file_name.clone());
+        self.last_file_bytes = Some(incoming.expected_size);
         self.last_inbound_file = Some(InboundFileResult::Applied {
             transfer_id: payload.transfer_id,
-            file_name,
-            data,
+            file_name: incoming.file_name,
+            path: incoming.part_path,
+            size: incoming.expected_size,
+            sha256_hex: digest,
         });
         self.sync_state = SyncState::Idle;
         Ok(())
+    }
+
+    fn open_incoming(
+        &self,
+        transfer_id: &str,
+        offer: &InboundOffer,
+        from: &DeviceId,
+    ) -> Result<IncomingFile, String> {
+        let dir = self.receive_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("create receive dir: {e}"))?;
+        let part_path = dir.join(format!("{transfer_id}.part"));
+        if part_path.exists() {
+            let _ = fs::remove_file(&part_path);
+        }
+        let writer = File::create(&part_path).map_err(|e| format!("create part file: {e}"))?;
+        Ok(IncomingFile {
+            file_name: offer.file_name.clone(),
+            expected_size: offer.size,
+            expected_sha256: offer.sha256_hex.clone(),
+            from: from.clone(),
+            part_path,
+            writer,
+            next_offset: 0,
+            hasher: Sha256::new(),
+        })
+    }
+
+    fn receive_dir(&self) -> PathBuf {
+        self.file_receive_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("m590-incoming"))
+    }
+
+    fn fail_incoming(&mut self, transfer_id: &str, message: String) {
+        self.cleanup_incoming(transfer_id);
+        self.inbound_offers.remove(transfer_id);
+        self.last_inbound_file = Some(InboundFileResult::Failed {
+            transfer_id: transfer_id.to_string(),
+            message,
+        });
+    }
+
+    fn cleanup_incoming(&mut self, transfer_id: &str) {
+        if let Some(incoming) = self.incoming_files.remove(transfer_id) {
+            drop(incoming.writer);
+            let _ = fs::remove_file(&incoming.part_path);
+        }
+    }
+
+    fn abort_active_outbound(&mut self) {
+        self.active_outbound = None;
+    }
+
+    fn cleanup_all_incoming_parts(&mut self) {
+        let ids: Vec<String> = self.incoming_files.keys().cloned().collect();
+        for id in ids {
+            self.cleanup_incoming(&id);
+        }
     }
 
     fn remember_peer(&mut self, device_id: DeviceId) -> Result<(), SessionError> {
@@ -1057,8 +1418,9 @@ impl Session {
         self.seen_content_ids.clear();
         self.last_inbound_clipboard = None;
         self.staged_outbound_files.clear();
+        self.abort_active_outbound();
         self.inbound_offers.clear();
-        self.incoming_files.clear();
+        self.cleanup_all_incoming_parts();
         self.last_inbound_file = None;
         self.last_file_transfer_id = None;
         self.last_file_name = None;
@@ -1331,6 +1693,23 @@ mod tests {
         );
     }
 
+    fn drain_file_send(sender: &mut Session, receiver: &mut Session) {
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 100_000, "file send did not finish");
+            let out = sender.take_outbox();
+            for msg in out {
+                receiver.handle(SessionEvent::Message(msg)).unwrap();
+            }
+            if sender.has_pending_outbound_file() {
+                sender.pump_outbound_file().unwrap();
+                continue;
+            }
+            break;
+        }
+    }
+
     #[test]
     fn file_offer_request_chunk_complete_small_file() {
         let (mut host, mut joiner) = pair_host_joiner();
@@ -1339,6 +1718,10 @@ mod tests {
         for (i, b) in data.iter_mut().enumerate() {
             *b = (i % 251) as u8;
         }
+        let expect_sha = crate::bytes_to_hex(&{
+            use sha2::Digest;
+            sha2::Sha256::digest(&data)
+        });
 
         assert_eq!(
             joiner
@@ -1363,22 +1746,25 @@ mod tests {
         );
         let req_msg = host.take_outbox().pop().unwrap();
         joiner.handle(SessionEvent::Message(req_msg)).unwrap();
-        let out = joiner.take_outbox();
-        // 2 chunks + complete
-        assert!(out.len() >= 3, "out len {}", out.len());
+        drain_file_send(&mut joiner, &mut host);
 
-        for msg in out {
-            host.handle(SessionEvent::Message(msg)).unwrap();
-        }
-        assert_eq!(
-            host.take_inbound_file(),
-            Some(InboundFileResult::Applied {
-                transfer_id: "xfer-1".into(),
-                file_name: "note.bin".into(),
-                data,
-            })
-        );
+        let Some(InboundFileResult::Applied {
+            transfer_id,
+            file_name,
+            path,
+            size,
+            sha256_hex,
+        }) = host.take_inbound_file()
+        else {
+            panic!("expected applied file");
+        };
+        assert_eq!(transfer_id, "xfer-1");
+        assert_eq!(file_name, "note.bin");
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(sha256_hex, expect_sha);
+        assert_eq!(fs::read(&path).unwrap(), data);
         assert_eq!(host.snapshot().last_file_name.as_deref(), Some("note.bin"));
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -1402,13 +1788,160 @@ mod tests {
         for msg in out {
             host.handle(SessionEvent::Message(msg)).unwrap();
         }
+        let Some(InboundFileResult::Applied {
+            transfer_id,
+            file_name,
+            path,
+            size,
+            sha256_hex,
+        }) = host.take_inbound_file()
+        else {
+            panic!("expected applied empty file");
+        };
+        assert_eq!(transfer_id, "empty-1");
+        assert_eq!(file_name, "empty.txt");
+        assert_eq!(size, 0);
+        assert_eq!(fs::read(&path).unwrap(), b"");
         assert_eq!(
-            host.take_inbound_file(),
-            Some(InboundFileResult::Applied {
-                transfer_id: "empty-1".into(),
-                file_name: "empty.txt".into(),
-                data: Vec::new(),
-            })
+            sha256_hex,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+        let _ = fs::remove_file(&path);
     }
+
+    #[test]
+    fn file_path_offer_streams_without_loading_all() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        let dir = std::env::temp_dir().join(format!(
+            "m590-stream-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        host.set_file_receive_dir(dir.join("recv"));
+        let src = dir.join("big.bin");
+        let n = OUTBOUND_CHUNKS_PER_PUMP * FILE_CHUNK_SIZE + 1234;
+        let mut data = vec![0u8; n];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 199) as u8;
+        }
+        fs::write(&src, &data).unwrap();
+
+        assert_eq!(
+            joiner.offer_file_path("path-1", &src).unwrap(),
+            QueueFileResult::Queued
+        );
+        let offer_msg = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer_msg)).unwrap();
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Offered {
+                ref transfer_id,
+                size,
+                ..
+            }) if transfer_id == "path-1" && size == n as u64
+        ));
+        host.request_file("path-1").unwrap();
+        let req = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(req)).unwrap();
+        assert!(joiner.has_pending_outbound_file());
+        drain_file_send(&mut joiner, &mut host);
+        let Some(InboundFileResult::Applied {
+            path,
+            size,
+            sha256_hex,
+            ..
+        }) = host.take_inbound_file()
+        else {
+            panic!("expected applied path file");
+        };
+        assert_eq!(size, n as u64);
+        assert_eq!(fs::read(&path).unwrap(), data);
+        let expect_sha = crate::bytes_to_hex(&{
+            use sha2::Digest;
+            sha2::Sha256::digest(&data)
+        });
+        assert_eq!(sha256_hex, expect_sha);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_path_streams_100mib_with_sha256() {
+        use std::time::Instant;
+        let (mut host, mut joiner) = pair_host_joiner();
+        let dir = std::env::temp_dir().join(format!(
+            "m590-100m-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        host.set_file_receive_dir(dir.join("recv"));
+        let src = dir.join("big-100m.bin");
+        let n = 100 * 1024 * 1024;
+        // Stream-write patterned file without holding two full copies longer than needed.
+        {
+            let mut f = File::create(&src).unwrap();
+            let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+            let mut left = n;
+            let mut seq = 0u8;
+            while left > 0 {
+                let take = left.min(buf.len());
+                for b in &mut buf[..take] {
+                    *b = seq;
+                    seq = seq.wrapping_add(1);
+                }
+                f.write_all(&buf[..take]).unwrap();
+                left -= take;
+            }
+        }
+        let t0 = Instant::now();
+        assert_eq!(
+            joiner.offer_file_path("big-100", &src).unwrap(),
+            QueueFileResult::Queued
+        );
+        let offer = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer)).unwrap();
+        let _ = host.take_inbound_file();
+        host.request_file("big-100").unwrap();
+        let req = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(req)).unwrap();
+        drain_file_send(&mut joiner, &mut host);
+        let elapsed = t0.elapsed();
+        let Some(InboundFileResult::Applied {
+            path,
+            size,
+            sha256_hex,
+            ..
+        }) = host.take_inbound_file()
+        else {
+            panic!("expected 100MiB applied");
+        };
+        assert_eq!(size, n as u64);
+        assert_eq!(fs::metadata(&path).unwrap().len(), n as u64);
+        // Re-hash source for expected digest.
+        let mut hasher = sha2::Sha256::new();
+        let mut f = File::open(&src).unwrap();
+        let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+        loop {
+            let read = f.read(&mut buf).unwrap();
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+        }
+        let expect = crate::bytes_to_hex(&hasher.finalize());
+        assert_eq!(sha256_hex, expect);
+        let mib = (n as f64) / (1024.0 * 1024.0);
+        let secs = elapsed.as_secs_f64().max(1e-6);
+        eprintln!(
+            "100MiB stream: {mib:.1} MiB in {secs:.3}s => {:.1} MiB/s sha256={sha256_hex}",
+            mib / secs
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
 }

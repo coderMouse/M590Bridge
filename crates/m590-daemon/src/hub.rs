@@ -13,7 +13,7 @@ use m590_clipboard::{ClipboardService, PlatformClipboard};
 use m590_core::{
     ConnectionState, DeviceId, InboundClipboardResult, InboundFileResult, Message,
     QueueClipboardResult, QueueFileResult, Session, SessionEvent,
-    DEFAULT_HEARTBEAT_MISS_THRESHOLD, MAX_FILE_BYTES,
+    DEFAULT_HEARTBEAT_MISS_THRESHOLD, MAX_FILE_BYTES, MAX_MEMORY_FILE_BYTES,
 };
 use m590_net::{accept_framed, connect_framed, listen_on, TcpFrameStream};
 
@@ -710,7 +710,7 @@ fn push_file(shared: &SharedStatus, path: String) -> Result<(), String> {
         return Err(format!("not a file: {path}"));
     }
     let meta = fs::metadata(&p).map_err(|e| format!("stat file: {e}"))?;
-    if meta.len() as usize > MAX_FILE_BYTES {
+    if meta.len() > MAX_FILE_BYTES {
         return Err(format!(
             "file too large: {}B > limit {MAX_FILE_BYTES}B",
             meta.len()
@@ -743,9 +743,9 @@ fn push_file_bytes(shared: &SharedStatus, name: String, data_b64: String) -> Res
     let data = base64::engine::general_purpose::STANDARD
         .decode(data_b64.trim())
         .map_err(|e| format!("base64 decode: {e}"))?;
-    if data.len() > MAX_FILE_BYTES {
+    if data.len() > MAX_MEMORY_FILE_BYTES {
         return Err(format!(
-            "file too large: {}B > limit {MAX_FILE_BYTES}B",
+            "file too large for bytes API: {}B > limit {MAX_MEMORY_FILE_BYTES}B (use /api/send_file path)",
             data.len()
         ));
     }
@@ -889,6 +889,12 @@ fn run_session_loop(
         clip.prime_poll_to_emit_current();
     }
 
+    // Inbound .part files land under save_dir/.partial then finalize into save_dir.
+    {
+        let save_dir = with_status(&shared, |s| PathBuf::from(s.file_save_dir.clone()));
+        session.set_file_receive_dir(save_dir.join(".partial"));
+    }
+
     loop {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             let _ = session.handle(SessionEvent::Disconnect);
@@ -961,6 +967,28 @@ fn run_session_loop(
                         s.last_error = Some(err);
                     });
                 }
+            }
+        }
+
+        // Stream more file chunks without starving the rest of the loop forever.
+        if session.has_pending_outbound_file() {
+            session
+                .pump_outbound_file()
+                .map_err(|e| e.to_string())?;
+            let outbox = session.take_outbox();
+            conn.send_all(outbox.iter())
+                .map_err(|e| e.to_string())?;
+            note_outbound_file_completes(&shared, &outbox);
+            if let Some((tid, sent, total)) = session.outbound_file_progress() {
+                with_status(&shared, |s| {
+                    if s.last_file_transfer_id.as_deref() == Some(tid.as_str())
+                        || s.file_transfer_phase.as_deref() == Some("sending")
+                    {
+                        s.file_transfer_phase = Some("sending".into());
+                        s.file_bytes_received = Some(sent);
+                        s.file_bytes_total = Some(total);
+                    }
+                });
             }
         }
 
@@ -1105,43 +1133,29 @@ fn run_session_loop(
                             }
                         }
                     }
-                    // Non-image regular files: V2 file offer (first path only, ≤ MAX_FILE_BYTES).
+                    // Non-image regular files: V2 file offer (first path only, streamed ≤ MAX_FILE_BYTES).
                     if !handled {
                         if let Some(path) = m590_clipboard::first_regular_file(&paths) {
-                            match m590_clipboard::read_file_for_offer(&path, MAX_FILE_BYTES) {
-                                Ok((name, data)) => {
-                                    match offer_file_bytes(
-                                        session,
-                                        &mut content_seq,
-                                        name,
-                                        data,
-                                    ) {
-                                        Ok((summary, transfer_id, file_name, bytes)) => {
-                                            conn.send_all(session.take_outbox().iter())
-                                                .map_err(|e| e.to_string())?;
-                                            mark_file_sending(
-                                                &shared,
-                                                summary,
-                                                transfer_id,
-                                                file_name,
-                                                bytes,
-                                            );
-                                            clip.adopt_text_baseline();
-                                        }
-                                        Err(err) => {
-                                            with_status(&shared, |s| {
-                                                s.file_transfer_phase = Some("failed".into());
-                                                s.last_error = Some(format!(
-                                                    "file_list offer: {err}"
-                                                ));
-                                            });
-                                        }
-                                    }
+                            match offer_local_file(
+                                session,
+                                &mut content_seq,
+                                &path.to_string_lossy(),
+                            ) {
+                                Ok((summary, transfer_id, file_name, bytes)) => {
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|e| e.to_string())?;
+                                    mark_file_sending(
+                                        &shared,
+                                        summary,
+                                        transfer_id,
+                                        file_name,
+                                        bytes,
+                                    );
+                                    clip.adopt_text_baseline();
                                 }
                                 Err(err) => {
                                     with_status(&shared, |s| {
-                                        s.last_error =
-                                            Some(format!("file_list skip: {err}"));
+                                        s.last_error = Some(format!("file_list skip: {err}"));
                                     });
                                 }
                             }
@@ -1200,39 +1214,26 @@ fn run_session_loop(
                         }
                     } else if let Some(path) = m590_clipboard::regular_file_from_text(&text) {
                         // Linux often exposes a copied file as plain path text only.
-                        match m590_clipboard::read_file_for_offer(&path, MAX_FILE_BYTES) {
-                            Ok((name, data)) => {
-                                match offer_file_bytes(
-                                    session,
-                                    &mut content_seq,
-                                    name,
-                                    data,
-                                ) {
-                                    Ok((summary, transfer_id, file_name, bytes)) => {
-                                        conn.send_all(session.take_outbox().iter())
-                                            .map_err(|e| e.to_string())?;
-                                        mark_file_sending(
-                                            &shared,
-                                            summary,
-                                            transfer_id,
-                                            file_name,
-                                            bytes,
-                                        );
-                                        clip.adopt_text_baseline();
-                                    }
-                                    Err(err) => {
-                                        with_status(&shared, |s| {
-                                            s.file_transfer_phase = Some("failed".into());
-                                            s.last_error =
-                                                Some(format!("path text offer: {err}"));
-                                        });
-                                    }
-                                }
+                        match offer_local_file(
+                            session,
+                            &mut content_seq,
+                            &path.to_string_lossy(),
+                        ) {
+                            Ok((summary, transfer_id, file_name, bytes)) => {
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|e| e.to_string())?;
+                                mark_file_sending(
+                                    &shared,
+                                    summary,
+                                    transfer_id,
+                                    file_name,
+                                    bytes,
+                                );
+                                clip.adopt_text_baseline();
                             }
                             Err(err) => {
                                 with_status(&shared, |s| {
-                                    s.last_error =
-                                        Some(format!("path text skip: {err}"));
+                                    s.last_error = Some(format!("path text skip: {err}"));
                                 });
                             }
                         }
@@ -1372,14 +1373,39 @@ fn offer_local_file(
     path: &str,
 ) -> Result<(String, String, String, u64), String> {
     let p = PathBuf::from(path);
-    let data = fs::read(&p).map_err(|e| format!("read file: {e}"))?;
+    let meta = fs::metadata(&p).map_err(|e| format!("stat file: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "file too large: {}B > limit {MAX_FILE_BYTES}B",
+            meta.len()
+        ));
+    }
     let file_name = p
         .file_name()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "file name missing".to_string())?
         .to_string();
-    offer_file_bytes(session, content_seq, file_name, data)
+    *content_seq += 1;
+    let transfer_id = format!("ui-file-{}-{content_seq}", std::process::id());
+    let bytes = meta.len();
+    match session.offer_file_path(transfer_id.clone(), &p) {
+        Ok(QueueFileResult::Queued) => Ok((
+            format!("[file offer {file_name} {bytes}B id={transfer_id}]"),
+            transfer_id,
+            file_name,
+            bytes,
+        )),
+        Ok(QueueFileResult::DuplicateTransferId) => Err("duplicate transfer id".into()),
+        Ok(QueueFileResult::FileTooLarge { byte_len, limit }) => {
+            Err(format!("file too large: {byte_len}B > {limit}B"))
+        }
+        Ok(QueueFileResult::UnknownTransferId) => Err("unexpected unknown transfer".into()),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 fn offer_file_bytes(
@@ -1388,9 +1414,9 @@ fn offer_file_bytes(
     file_name: String,
     data: Vec<u8>,
 ) -> Result<(String, String, String, u64), String> {
-    if data.len() > MAX_FILE_BYTES {
+    if data.len() > MAX_MEMORY_FILE_BYTES {
         return Err(format!(
-            "file too large: {}B > limit {MAX_FILE_BYTES}B",
+            "file too large for memory offer: {}B > limit {MAX_MEMORY_FILE_BYTES}B (use path send)",
             data.len()
         ));
     }
@@ -1462,27 +1488,31 @@ fn handle_inbound_file(
         InboundFileResult::Applied {
             transfer_id,
             file_name,
-            data,
+            path,
+            size,
+            sha256_hex,
         } => {
             let dir = with_status(shared, |s| PathBuf::from(s.file_save_dir.clone()));
-            match file_save::save_received_file(&dir, &file_name, &data) {
+            match file_save::finalize_part_file(&dir, &file_name, &path) {
                 Ok(saved) => {
                     let saved_s = saved.display().to_string();
                     with_status(shared, |s| {
                         s.file_transfer_phase = Some("done".into());
                         s.last_file_transfer_id = Some(transfer_id);
                         s.last_file_name = Some(file_name.clone());
-                        s.last_file_bytes = Some(data.len() as u64);
+                        s.last_file_bytes = Some(size);
                         s.last_file_saved_path = Some(saved_s.clone());
-                        s.file_bytes_received = Some(data.len() as u64);
-                        s.file_bytes_total = Some(data.len() as u64);
-                        s.last_sync_text =
-                            Some(format!("[file saved {file_name} {}B]", data.len()));
+                        s.file_bytes_received = Some(size);
+                        s.file_bytes_total = Some(size);
+                        s.last_sync_text = Some(format!(
+                            "[file saved {file_name} {size}B sha256={sha256_hex}]"
+                        ));
                         s.last_error = None;
                     });
-                    println!("file_saved={saved_s}");
+                    println!("file_saved={saved_s} sha256={sha256_hex}");
                 }
                 Err(err) => {
+                    let _ = fs::remove_file(&path);
                     with_status(shared, |s| {
                         s.file_transfer_phase = Some("failed".into());
                         s.last_file_transfer_id = Some(transfer_id);

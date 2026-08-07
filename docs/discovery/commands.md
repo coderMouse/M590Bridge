@@ -63,7 +63,7 @@ cargo run -p m590-clipboard --example probe_clipboard
 - 图片位图：Linux ↔ Windows 双向（线载优先 PNG；Word 等可粘贴）  
 - 复制图片**文件**：可提升为图片同步（非传原文件字节流）  
 - 发大图：TCP 写满帧，避免 EAGAIN 误判断线  
-- 文件：`FileOffer/Request/Chunk/Complete` + hub 落盘 + UI 发送/进度（≤4MiB）  
+- 文件：`FileOffer/Request/Chunk/Complete` + 路径流式 + SHA-256 + hub 落盘 + UI 发送/进度（软上限 8GiB；`send_file_bytes` 仍限内存）  
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
 
@@ -105,7 +105,7 @@ UI 加入页「局域网设备」旁有刷新图标。
 
 ## 未做
 
-- 文件夹 / >4MiB  
+- 文件夹 / OS 文件剪贴板 / 断点续传 / 独立数据连接  
 - Windows 安装包 / Linux 与 Windows 开机自启
 - 设置页「发现方式」开关  
 - （已取消）019A  

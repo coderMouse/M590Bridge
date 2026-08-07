@@ -250,7 +250,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
     setError(null)
     setPickedFileLabel(`${file.name} (${file.size}B)`)
     if (file.size > MAX_SEND_FILE_BYTES) {
-      setError(`文件过大：${file.size}B > 上限 ${MAX_SEND_FILE_BYTES}B`)
+      setError('浏览器模式单文件上限 4MiB；请使用桌面版原生选择或拖放发送大文件')
       return
     }
     // Basename only for wire protocol safety.
@@ -692,7 +692,8 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                   </span>
                 </div>
                 <div className="mb-2 text-[11px] leading-4 text-[#6B7589]">
-                  单文件上限 4MiB；对端自动接收并写入其保存目录。
+                  桌面版原生选择/拖放支持路径流式发送，单文件软上限 8GiB；浏览器模式上限 4MiB。
+                  对端自动接收并写入其保存目录。
                   <br />
                   可「选择并发送」（原生对话框，默认桌面）或把文件拖到窗口。GNOME 下文件管理器 Ctrl+C 常不可用。
                   <br />
@@ -884,7 +885,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                   />
                 </label>
                 <p className="text-[11px] leading-4 text-[#6B7589]">
-                  对端发来的文件会写入此目录（自动创建）。单文件上限 4MiB。
+                  对端发来的文件会写入此目录（自动创建）。路径流式单文件软上限 8GiB。
                 </p>
                 {status?.last_file_saved_path ? (
                   <div className="break-all text-[11px] text-[#1A2030]">

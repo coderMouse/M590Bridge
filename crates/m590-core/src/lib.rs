@@ -6,13 +6,14 @@ mod session;
 
 pub use error::{ProtocolError, SessionError};
 pub use protocol::{
-    ClipboardImagePayload, ClipboardTextPayload, FileChunkPayload, FileCompletePayload,
-    FileOfferPayload, FileRequestPayload, ImageEncoding, Message, PROTOCOL_VERSION,
+    bytes_to_hex, validate_sha256_hex, ClipboardImagePayload, ClipboardTextPayload,
+    FileChunkPayload, FileCompletePayload, FileOfferPayload, FileRequestPayload, ImageEncoding,
+    Message, PROTOCOL_VERSION,
 };
 pub use session::{
     InboundClipboardResult, InboundFileResult, QueueClipboardResult, QueueFileResult, Session,
     SessionEvent, SessionSnapshot, DEFAULT_HEARTBEAT_MISS_THRESHOLD, FILE_CHUNK_SIZE,
-    MAX_FILE_BYTES,
+    MAX_FILE_BYTES, MAX_MEMORY_FILE_BYTES, OUTBOUND_CHUNKS_PER_PUMP,
 };
 
 /// Crate / product version string used by the daemon binary.

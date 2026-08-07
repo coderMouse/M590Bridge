@@ -59,7 +59,7 @@ export type DiscoverResponse = {
 }
 
 const DEFAULT_API = 'http://127.0.0.1:5910'
-/** Keep in sync with Session::MAX_FILE_BYTES */
+/** Browser File/base64 fallback cap; native desktop path sends use the 8 GiB core soft cap. */
 export const MAX_SEND_FILE_BYTES = 4 * 1024 * 1024
 
 export function getApiBase(): string {

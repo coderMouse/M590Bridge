@@ -211,14 +211,33 @@ mod tests {
         );
         flush_outbox(&mut host, &mut pipe, false).unwrap();
         deliver(&mut pipe, &mut joiner, &mut host).unwrap();
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 10_000);
+            flush_outbox(&mut joiner, &mut pipe, true).unwrap();
+            deliver(&mut pipe, &mut joiner, &mut host).unwrap();
+            if joiner.has_pending_outbound_file() {
+                joiner.pump_outbound_file().unwrap();
+                continue;
+            }
+            break;
+        }
 
-        assert_eq!(
-            host.take_inbound_file(),
-            Some(InboundFileResult::Applied {
-                transfer_id: "pipe-xfer".into(),
-                file_name: "doc.bin".into(),
-                data,
-            })
-        );
+        let Some(InboundFileResult::Applied {
+            transfer_id,
+            file_name,
+            path,
+            size,
+            ..
+        }) = host.take_inbound_file()
+        else {
+            panic!("expected applied");
+        };
+        assert_eq!(transfer_id, "pipe-xfer");
+        assert_eq!(file_name, "doc.bin");
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        let _ = std::fs::remove_file(&path);
     }
 }

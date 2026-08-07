@@ -13,7 +13,7 @@ use m590_clipboard::{
 use m590_core::{
     ConnectionState, DeviceId, InboundClipboardResult, Message, QueueClipboardResult,
     QueueFileResult, Session, SessionEvent, APP_NAME, DEFAULT_HEARTBEAT_MISS_THRESHOLD,
-    MAX_FILE_BYTES, PROTOCOL_VERSION, VERSION,
+    PROTOCOL_VERSION, VERSION,
 };
 use m590_net::{
     accept_framed, connect_framed, deliver, listen_on, MemoryPipe, NullTransport, TcpFrameStream,
@@ -387,6 +387,14 @@ fn run_bridge(
             last_heartbeat = Instant::now();
         }
 
+        if session.has_pending_outbound_file() {
+            session.pump_outbound_file().map_err(|e| e.to_string())?;
+            let out = session.take_outbox();
+            if !out.is_empty() {
+                conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+            }
+        }
+
         // Drain available inbound frames.
         loop {
             match conn.try_recv() {
@@ -518,33 +526,24 @@ fn run_bridge(
                         }
                         if !handled {
                             if let Some(path) = m590_clipboard::first_regular_file(&paths) {
-                                match m590_clipboard::read_file_for_offer(&path, MAX_FILE_BYTES) {
-                                    Ok((name, data)) => {
-                                        content_seq += 1;
-                                        let tid = format!(
-                                            "clip-file-{}-{content_seq}",
-                                            process::id()
-                                        );
-                                        let bytes = data.len();
-                                        match session.offer_file(tid, name.clone(), data) {
-                                            Ok(QueueFileResult::Queued) => {
-                                                let out = session.take_outbox();
-                                                conn.send_all(out.iter())
-                                                    .map_err(|e| e.to_string())?;
-                                                clip.adopt_text_baseline();
-                                                println!(
-                                                    "sync_tx_file_offer name={name} bytes={bytes}"
-                                                );
-                                            }
-                                            Ok(other) => {
-                                                println!("sync_tx_file=skip {other:?}")
-                                            }
-                                            Err(err) => println!("sync_tx_file=error {err}"),
-                                        }
+                                content_seq += 1;
+                                let tid =
+                                    format!("clip-file-{}-{content_seq}", process::id());
+                                let name = path
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("file")
+                                    .to_string();
+                                match session.offer_file_path(tid, &path) {
+                                    Ok(QueueFileResult::Queued) => {
+                                        let out = session.take_outbox();
+                                        conn.send_all(out.iter())
+                                            .map_err(|e| e.to_string())?;
+                                        clip.adopt_text_baseline();
+                                        println!("sync_tx_file_offer name={name}");
                                     }
-                                    Err(err) => {
-                                        println!("clipboard_files={paths:?} skip={err}")
-                                    }
+                                    Ok(other) => println!("sync_tx_file=skip {other:?}"),
+                                    Err(err) => println!("sync_tx_file=error {err}"),
                                 }
                             } else if !paths.is_empty() {
                                 println!("clipboard_files={paths:?} (no offerable file)");
@@ -596,33 +595,24 @@ fn run_bridge(
                                 Err(err) => println!("sync_tx_image=prepare_error {err}"),
                             }
                         } else if let Some(path) = m590_clipboard::regular_file_from_text(&text) {
-                            match m590_clipboard::read_file_for_offer(
-                                &path,
-                                m590_core::MAX_FILE_BYTES,
-                            ) {
-                                Ok((name, data)) => {
-                                    content_seq += 1;
-                                    let tid =
-                                        format!("clip-file-{}-{content_seq}", process::id());
-                                    match session.offer_file(tid, name.clone(), data) {
-                                        Ok(QueueFileResult::Queued) => {
-                                            let out = session.take_outbox();
-                                            conn.send_all(out.iter())
-                                                .map_err(|e| e.to_string())?;
-                                            clip.adopt_text_baseline();
-                                            println!("sync_tx_file_from_path name={name}");
-                                        }
-                                        Ok(other) => {
-                                            println!("sync_tx_file_from_path=skip {other:?}")
-                                        }
-                                        Err(err) => {
-                                            println!("sync_tx_file_from_path=error {err}")
-                                        }
-                                    }
+                            content_seq += 1;
+                            let tid = format!("clip-file-{}-{content_seq}", process::id());
+                            let name = path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("file")
+                                .to_string();
+                            match session.offer_file_path(tid, &path) {
+                                Ok(QueueFileResult::Queued) => {
+                                    let out = session.take_outbox();
+                                    conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+                                    clip.adopt_text_baseline();
+                                    println!("sync_tx_file_from_path name={name}");
                                 }
-                                Err(err) => {
-                                    println!("sync_tx_file_from_path=skip {err}")
+                                Ok(other) => {
+                                    println!("sync_tx_file_from_path=skip {other:?}")
                                 }
+                                Err(err) => println!("sync_tx_file_from_path=error {err}"),
                             }
                         } else {
                             content_seq += 1;
