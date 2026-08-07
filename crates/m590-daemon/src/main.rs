@@ -98,6 +98,9 @@ Options:
   --no-clipboard        Do not read/write OS clipboard (protocol-only)
   --api ADDR            hub only: control API bind (default 127.0.0.1:5910)
   --help                Show this help
+
+Environment:
+  M590_HUB_TOKEN        hub auth token (at least 32 characters); generated and printed if unset
 "
     );
 }
@@ -876,6 +879,6 @@ mod tests {
     #[test]
     fn daemon_crate_loads() {
         assert!(!m590_core::VERSION.is_empty());
-        assert_eq!(m590_core::PROTOCOL_VERSION, 1);
+        assert_eq!(m590_core::PROTOCOL_VERSION, 2);
     }
 }

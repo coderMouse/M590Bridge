@@ -62,22 +62,68 @@ const DEFAULT_API = 'http://127.0.0.1:5910'
 /** Browser File/base64 fallback cap; native desktop path sends use the 8 GiB core soft cap. */
 export const MAX_SEND_FILE_BYTES = 4 * 1024 * 1024
 
+type TauriInvoke = (cmd: string, args?: object) => Promise<unknown>
+
+function getTauriInvoke(): TauriInvoke | null {
+  const w = window as unknown as {
+    __TAURI_INTERNALS__?: { invoke: TauriInvoke }
+    __TAURI__?: { core?: { invoke: TauriInvoke } }
+  }
+  return w.__TAURI_INTERNALS__?.invoke ?? w.__TAURI__?.core?.invoke ?? null
+}
+
+function loopbackApi(value: string | undefined): string | null {
+  if (!value) return null
+  try {
+    const url = new URL(value)
+    if (!['http:', 'https:'].includes(url.protocol)) return null
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) return null
+    return url.origin
+  } catch {
+    return null
+  }
+}
+
 export function getApiBase(): string {
   const fromEnv = (import.meta as ImportMeta & { env?: Record<string, string> }).env?.VITE_M590_API
-  if (fromEnv && fromEnv.length > 0) return fromEnv.replace(/\/$/, '')
+  const envApi = loopbackApi(fromEnv)
+  if (envApi) return envApi
   if (typeof window !== 'undefined') {
     const q = new URLSearchParams(window.location.search).get('api')
-    if (q) return q.replace(/\/$/, '')
+    const queryApi = loopbackApi(q ?? undefined)
+    if (queryApi) return queryApi
   }
   return DEFAULT_API
 }
 
+let hubTokenPromise: Promise<string | null> | null = null
+
+async function getHubAuthToken(): Promise<string | null> {
+  if (hubTokenPromise) return hubTokenPromise
+  hubTokenPromise = (async () => {
+    const invoke = getTauriInvoke()
+    if (invoke) {
+      const token = await invoke('hub_auth_token')
+      return typeof token === 'string' && token.length >= 32 ? token : null
+    }
+    const env = (import.meta as ImportMeta & {
+      env?: { DEV?: boolean; VITE_M590_HUB_TOKEN?: string }
+    }).env
+    const envToken = env?.DEV ? env.VITE_M590_HUB_TOKEN?.trim() : null
+    return envToken && envToken.length >= 32 ? envToken : null
+  })().catch(() => null)
+  return hubTokenPromise
+}
+
 async function request<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const base = getApiBase()
+  const authToken = await getHubAuthToken()
+  if (!authToken) throw new Error('Hub authentication token unavailable')
   const res = await fetch(`${base}${path}`, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
+      'X-M590-Token': authToken,
       ...(init?.headers ?? {}),
     },
   })
@@ -249,13 +295,7 @@ export function fileProgressPercent(status: HubStatus | null): number {
 
 /** Tauri native file dialog → absolute path. null if cancelled / not in Tauri. */
 export async function pickSendFileNative(): Promise<string | null> {
-  const w = window as unknown as {
-    __TAURI_INTERNALS__?: { invoke: (cmd: string, args?: object) => Promise<unknown> }
-    __TAURI__?: { core?: { invoke: (cmd: string, args?: object) => Promise<unknown> } }
-  }
-  const invoke =
-    w.__TAURI_INTERNALS__?.invoke ??
-    w.__TAURI__?.core?.invoke
+  const invoke = getTauriInvoke()
   if (!invoke) return null
   const path = (await invoke('pick_send_file')) as string | null
   return path ?? null

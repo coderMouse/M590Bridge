@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
-> 更新：2026-08-07  
-> 阶段：文本+图片+V2 文件流式 + mDNS + Linux .deb + 自适应桌面 UI；**下一刀：Linux 登录自启**
+> 更新：2026-08-07
+> 阶段：文本+图片+V2 文件流式 + mDNS + Linux .deb + 自适应桌面 UI；**发布硬化已完成**
 
 ## 目标（近期）
 
@@ -25,10 +25,11 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-032** Linux `.deb` 安装包基线
 - [x] **task-033** 大文件流式传输（路径发送 / `.part` / SHA-256）
 - [x] **task-034** 桌面 UI 自适应原生窗口（满窗口外壳 / 响应式导航 / 宽屏双列）
+- [x] **task-035** Hub 与文件通道发布硬化（localhost API 鉴权 / 协议版本 / 上传与落盘正确性）
 
 ## 进行中 / 下一 task
 
-- （无 in_progress）建议下一刀：**Linux 登录自启**（需新建 task-035）
+- [ ] Linux 用户级登录自启（下一 task，尚未创建）
 
 ## 产品分期对照
 
@@ -63,17 +64,18 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 托盘菜单文案保活 | **有**（task-027） |
 | mDNS 发现（`_m590bridge._tcp`） | **有**（task-029；仍需配对码） |
 | Linux `.deb` 安装包 | **有**（task-032；amd64、未签名） |
+| localhost Hub API 鉴权 | **有**（task-035；进程临时令牌 + 限定 CORS） |
 | 设置「发现方式」开关 | 无（默认开启 browse） |
 
 ## 下一步（有序）
 
-1. **Linux 登录自启**（用户级、可显式启停）
+1. Linux 登录自启（用户级、可显式启停）
 2. Windows 安装包 / 开机自启
 3. （可选）独立文件数据连接 / 更高吞吐调优
 4. （可选）设置页发现开关 / 本机显示名
 5. （可选）多文件并行 / 文件夹 / OS 文件剪贴板
 
-> 「开始开发」→ 新建并执行下一 pending task（建议 Linux 自启），或用户指定。
+> task-035 已完成；下次“开始开发”时先创建 Linux 自启 task，一次仍只做一个 task。
 
 ## 用户怎么用
 
@@ -95,8 +97,10 @@ sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
 - 主面板「文件传输」：原生选文件/拖放；设置里改接收目录  
 
 ```bash
-curl -s http://127.0.0.1:5910/api/discover
+export M590_HUB_TOKEN='[REDACTED]' # 独立 Hub 的实际临时令牌；Tauri 内嵌模式无需手工设置
+curl -s -H "X-M590-Token: $M590_HUB_TOKEN" http://127.0.0.1:5910/api/discover
 curl -s -X POST http://127.0.0.1:5910/api/send_file_bytes \
+  -H "X-M590-Token: $M590_HUB_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"name":"a.txt","data_base64":"aGVsbG8="}'
 ```

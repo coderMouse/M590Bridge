@@ -2162,10 +2162,12 @@ name = "m590-daemon"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "m590-clipboard",
  "m590-core",
  "m590-net",
  "mdns-sd",
+ "serde_json",
 ]
 
 [[package]]

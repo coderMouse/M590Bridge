@@ -1077,7 +1077,7 @@ impl Session {
                     buf.copy_from_slice(&data[start..start + take]);
                 }
                 OutboundBody::Path(_) => {
-                    let file = active.file.as_mut().ok_or_else(|| {
+                    let file = active.file.as_mut().ok_or({
                         SessionError::Protocol(ProtocolError::InvalidFile("missing send file handle"))
                     })?;
                     file.seek(SeekFrom::Start(offset)).map_err(|_| {
@@ -1183,7 +1183,7 @@ impl Session {
         }
         match self.open_incoming(&payload.transfer_id, &offer, &payload.device_id) {
             Ok(mut incoming) => {
-                if let Err(_) = incoming.writer.write_all(&payload.data) {
+                if incoming.writer.write_all(&payload.data).is_err() {
                     let _ = fs::remove_file(&incoming.part_path);
                     self.last_inbound_file = Some(InboundFileResult::Failed {
                         transfer_id: payload.transfer_id,
@@ -1258,7 +1258,15 @@ impl Session {
         };
         self.inbound_offers.remove(&payload.transfer_id);
 
-        let _ = incoming.writer.flush();
+        if let Err(err) = incoming.writer.flush() {
+            drop(incoming.writer);
+            let _ = fs::remove_file(&incoming.part_path);
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: format!("flush part file: {err}"),
+            });
+            return Ok(());
+        }
         drop(incoming.writer);
 
         if incoming.next_offset != incoming.expected_size {
@@ -1649,6 +1657,44 @@ mod tests {
         assert_eq!(session.state(), ConnectionState::Disconnected);
         assert!(session.peer_device().is_none());
         assert_eq!(session.missed_heartbeat_acks(), 0);
+    }
+
+    #[test]
+    fn disconnect_removes_incoming_part_file() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        let dir = std::env::temp_dir().join(format!(
+            "m590-disconnect-part-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        host.set_file_receive_dir(&dir);
+        let data = vec![7u8; FILE_CHUNK_SIZE * (OUTBOUND_CHUNKS_PER_PUMP + 1)];
+        assert_eq!(
+            joiner
+                .offer_file("cleanup-part", "partial.bin", data)
+                .unwrap(),
+            QueueFileResult::Queued
+        );
+        let offer = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer)).unwrap();
+        let _ = host.take_inbound_file();
+        host.request_file("cleanup-part").unwrap();
+        let request = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(request)).unwrap();
+        let first_chunk = joiner
+            .take_outbox()
+            .into_iter()
+            .find(|message| matches!(message, Message::FileChunk(_)))
+            .unwrap();
+        host.handle(SessionEvent::Message(first_chunk)).unwrap();
+
+        let part = dir.join("cleanup-part.part");
+        assert!(part.exists());
+        host.handle(SessionEvent::Disconnect).unwrap();
+        assert!(!part.exists());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

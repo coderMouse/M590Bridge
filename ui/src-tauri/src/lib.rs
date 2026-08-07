@@ -8,6 +8,8 @@ use tauri::{
 
 const HUB_API: &str = "127.0.0.1:5910";
 
+struct HubAuthToken(String);
+
 struct TrayState {
     /// Keep tray + menu items alive for the process lifetime (Linux AppIndicator).
     _tray: TrayIcon<Wry>,
@@ -54,29 +56,35 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-fn post_hub_send_file(path: &Path) -> Result<(), String> {
+fn post_hub_send_file(path: &Path, auth_token: &str) -> Result<(), String> {
     let path_s = path.to_string_lossy();
-    // Minimal JSON escape for path strings.
-    let escaped = path_s
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r");
-    let body = format!(r#"{{"path":"{escaped}"}}"#);
-    let mut stream = std::net::TcpStream::connect(HUB_API)
-        .map_err(|e| format!("hub connect failed: {e}"))?;
-    use std::io::Write;
+    let body = serde_json::json!({ "path": path_s.as_ref() }).to_string();
+    let mut stream =
+        std::net::TcpStream::connect(HUB_API).map_err(|e| format!("hub connect failed: {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("hub read timeout: {e}"))?;
+    use std::io::{Read, Write};
     let req = format!(
-        "POST /api/send_file HTTP/1.1\r\nHost: {HUB_API}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /api/send_file HTTP/1.1\r\nHost: {HUB_API}\r\nContent-Type: application/json\r\nX-M590-Token: {auth_token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("hub write failed: {e}"))?;
-    // Best-effort read so the hub finishes the request.
-    let mut _buf = [0u8; 512];
-    let _ = std::io::Read::read(&mut stream, &mut _buf);
-    Ok(())
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("hub response failed: {e}"))?;
+    if response.starts_with("HTTP/1.1 200 ") {
+        Ok(())
+    } else {
+        let detail = response
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("request failed");
+        Err(format!("hub rejected file: {detail}"))
+    }
 }
 
 /// Native file dialog (starts at Desktop/桌面). Returns absolute path.
@@ -89,15 +97,24 @@ fn pick_send_file() -> Result<Option<String>, String> {
     Ok(dialog.pick_file().map(|p| p.to_string_lossy().into_owned()))
 }
 
+#[tauri::command]
+fn hub_auth_token(token: tauri::State<'_, HubAuthToken>) -> String {
+    token.0.clone()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let hub_token = m590_daemon::hub::generate_hub_token().expect("generate hub auth token");
+    let hub_token_for_setup = hub_token.clone();
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![pick_send_file])
-        .setup(|app| {
+        .manage(HubAuthToken(hub_token))
+        .invoke_handler(tauri::generate_handler![pick_send_file, hub_auth_token])
+        .setup(move |app| {
+            let hub_token = hub_token_for_setup.clone();
             std::thread::Builder::new()
                 .name("m590-hub".into())
-                .spawn(|| {
-                    if let Err(err) = m590_daemon::hub::run_hub(HUB_API) {
+                .spawn(move || {
+                    if let Err(err) = m590_daemon::hub::run_hub_with_token(HUB_API, hub_token) {
                         eprintln!("hub_error={err}");
                     }
                 })
@@ -167,7 +184,8 @@ pub fn run() {
             }
             WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
                 if let Some(path) = paths.into_iter().find(|p| p.is_file()) {
-                    if let Err(err) = post_hub_send_file(&path) {
+                    let token = window.state::<HubAuthToken>();
+                    if let Err(err) = post_hub_send_file(&path, &token.0) {
                         eprintln!("drop_send_file_error={err}");
                     } else {
                         eprintln!("drop_send_file_ok={}", path.display());

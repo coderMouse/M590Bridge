@@ -1,19 +1,21 @@
 # 项目结构图 · M590Bridge
 
-> 更新日期：2026-08-05  
-> 状态：文本+图片+文件+ mDNS 发现（task-020..029）
+> 更新日期：2026-08-07
+> 状态：文本+图片+流式文件+mDNS+桌面壳发布硬化（task-020..035）
 
 ```text
 crates/
-  m590-core/       # Message File*、Session offer/request/chunk
+  m590-core/       # 协议 v2、Message File*、Session 流式收发/SHA-256
   m590-clipboard/  # 文本/图片/file_list
-  m590-net/        # 帧 1..14、TCP
-  m590-daemon/     # hub：send_file、落盘、status、discovery(mDNS)
+  m590-net/        # 帧 1..14、版本拒绝、TCP
+  m590-daemon/     # hub：临时令牌/CORS、send_file、无覆盖落盘、status、mDNS
 ui/
-  src/             # React：OperableApp 配对/发现/文件发送
-  src-tauri/       # Tauri 2 m590-ui
+  src/             # React：OperableApp 配对/发现/文件发送；bridgeApi 自动鉴权
+  src-tauri/       # Tauri 2 m590-ui；capabilities/permissions 限制原生 commands
+    permissions/
+      hub-auth-token.toml  # 主窗口读取进程临时 Hub 令牌
 docs/
   plans/current.md
-  tasks/           # ..029
+  tasks/           # ..035
   domain/          # 协议草案
 ```

@@ -1,6 +1,7 @@
 //! Safe on-disk helpers for the V2 file channel (hub inbox).
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Resolve a unique path under `dir` for basename `file_name`.
@@ -32,22 +33,81 @@ pub fn unique_save_path(dir: &Path, file_name: &str) -> Result<PathBuf, String> 
 
 /// Write `data` under `dir` using a safe unique basename.
 pub fn save_received_file(dir: &Path, file_name: &str, data: &[u8]) -> Result<PathBuf, String> {
-    let path = unique_save_path(dir, file_name)?;
-    fs::write(&path, data).map_err(|e| format!("write file: {e}"))?;
+    let (path, mut file) = create_unique_file(dir, file_name)?;
+    if let Err(err) = file.write_all(data).and_then(|()| file.flush()) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(format!("write file: {err}"));
+    }
     Ok(path)
 }
 
 /// Move a completed `.part` (or temp) file into `dir` under a unique basename.
 pub fn finalize_part_file(dir: &Path, file_name: &str, part_path: &Path) -> Result<PathBuf, String> {
-    let dest = unique_save_path(dir, file_name)?;
-    match fs::rename(part_path, &dest) {
-        Ok(()) => Ok(dest),
-        Err(_) => {
-            // Cross-device rename fallback.
-            fs::copy(part_path, &dest).map_err(|e| format!("copy part file: {e}"))?;
-            let _ = fs::remove_file(part_path);
-            Ok(dest)
+    let base = validate_basename(file_name)?;
+    fs::create_dir_all(dir).map_err(|e| format!("create save dir: {e}"))?;
+
+    for i in 0..10_000 {
+        let dest = candidate_path(dir, &base, i);
+        match fs::hard_link(part_path, &dest) {
+            Ok(()) => {
+                if let Err(err) = fs::remove_file(part_path) {
+                    let _ = fs::remove_file(&dest);
+                    return Err(format!("remove part after link: {err}"));
+                }
+                return Ok(dest);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => match copy_to_new_file(part_path, &dest) {
+                Ok(()) => {
+                    if let Err(err) = fs::remove_file(part_path) {
+                        let _ = fs::remove_file(&dest);
+                        return Err(format!("remove part after copy: {err}"));
+                    }
+                    return Ok(dest);
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(format!("copy part file: {err}")),
+            },
         }
+    }
+    Err("too many name collisions in save dir".into())
+}
+
+fn create_unique_file(dir: &Path, file_name: &str) -> Result<(PathBuf, File), String> {
+    let base = validate_basename(file_name)?;
+    fs::create_dir_all(dir).map_err(|e| format!("create save dir: {e}"))?;
+    for i in 0..10_000 {
+        let path = candidate_path(dir, &base, i);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("create save file: {err}")),
+        }
+    }
+    Err("too many name collisions in save dir".into())
+}
+
+fn copy_to_new_file(source: &Path, dest: &Path) -> io::Result<()> {
+    let mut source = File::open(source)?;
+    let mut dest_file = OpenOptions::new().write(true).create_new(true).open(dest)?;
+    if let Err(err) = io::copy(&mut source, &mut dest_file).and_then(|_| dest_file.flush()) {
+        drop(dest_file);
+        let _ = fs::remove_file(dest);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn candidate_path(dir: &Path, base: &str, index: usize) -> PathBuf {
+    if index == 0 {
+        return dir.join(base);
+    }
+    let (stem, ext) = split_name(base);
+    if ext.is_empty() {
+        dir.join(format!("{stem}-{index}"))
+    } else {
+        dir.join(format!("{stem}-{index}.{ext}"))
     }
 }
 
@@ -117,6 +177,23 @@ mod tests {
         let saved = finalize_part_file(&dir, "final.bin", &part).unwrap();
         assert_eq!(saved.file_name().unwrap(), "final.bin");
         assert_eq!(fs::read(&saved).unwrap(), b"part-bytes");
+        assert!(!part.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finalize_never_overwrites_existing_name() {
+        let dir = temp_dir();
+        let existing = dir.join("final.bin");
+        fs::write(&existing, b"keep-me").unwrap();
+        let part = dir.join("x.part");
+        fs::write(&part, b"new-bytes").unwrap();
+
+        let saved = finalize_part_file(&dir, "final.bin", &part).unwrap();
+
+        assert_eq!(saved.file_name().unwrap(), "final-1.bin");
+        assert_eq!(fs::read(existing).unwrap(), b"keep-me");
+        assert_eq!(fs::read(saved).unwrap(), b"new-bytes");
         assert!(!part.exists());
         let _ = fs::remove_dir_all(&dir);
     }

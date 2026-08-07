@@ -510,6 +510,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_previous_protocol_version_before_payload_decode() {
+        let mut bytes = encode_frame(&Message::heartbeat(1)).unwrap();
+        bytes[4] = PROTOCOL_VERSION - 1;
+        assert_eq!(
+            decode_frame(&bytes).unwrap_err(),
+            FrameError::UnsupportedVersion(PROTOCOL_VERSION - 1)
+        );
+    }
+
+    #[test]
     fn roundtrip_unicode_clipboard() {
         let msg = Message::clipboard_text(
             ClipboardTextPayload {

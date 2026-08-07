@@ -27,7 +27,46 @@ static BRIDGE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 type SharedDiscovery = Arc<Option<Arc<DiscoveryHandle>>>;
 
+const HUB_TOKEN_ENV: &str = "M590_HUB_TOKEN";
+const HUB_TOKEN_HEADER: &str = "x-m590-token";
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_JSON_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_HTTP_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HTTP_FILE_BODY_BYTES: usize = MAX_HTTP_FILE_BYTES.div_ceil(3) * 4 + 64 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: String,
+    origin: Option<String>,
+    auth_token: Option<String>,
+}
+
+pub fn generate_hub_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| format!("generate hub token: {e}"))?;
+    Ok(m590_core::bytes_to_hex(&bytes))
+}
+
 pub fn run_hub(api_addr: &str) -> Result<(), String> {
+    let auth_token = match std::env::var(HUB_TOKEN_ENV) {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            let generated = generate_hub_token()?;
+            println!("hub_auth_token={generated}");
+            generated
+        }
+    };
+    run_hub_with_token(api_addr, auth_token)
+}
+
+pub fn run_hub_with_token(api_addr: &str, auth_token: String) -> Result<(), String> {
+    if auth_token.trim().len() < 32 {
+        return Err("hub auth token must be at least 32 characters".into());
+    }
+    let auth_token: Arc<str> = Arc::from(auth_token);
+    clear_pending_commands();
     let shared = crate::status::new_shared_status();
     with_status(&shared, |s| {
         s.hub_api = Some(format!("http://{api_addr}"));
@@ -54,6 +93,7 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
 
     let listener = TcpListener::bind(api_addr).map_err(|e| format!("bind hub api failed: {e}"))?;
     println!("hub_api=http://{api_addr}");
+    println!("hub_auth=required header=X-M590-Token");
     println!("hub_status=ready (UI can open operable shell and point API to this address)");
     println!(
         "endpoints=GET /api/status /api/config /api/discover POST /api/discover/refresh /api/listen /api/connect /api/push /api/send_file /api/disconnect /api/config"
@@ -66,8 +106,9 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
             Ok(stream) => {
                 let shared = Arc::clone(&shared);
                 let discovery = Arc::clone(&discovery);
+                let auth_token = Arc::clone(&auth_token);
                 thread::spawn(move || {
-                    if let Err(err) = handle_http(stream, shared, discovery) {
+                    if let Err(err) = handle_http(stream, shared, discovery, auth_token) {
                         eprintln!("hub_http_error={err}");
                     }
                 });
@@ -82,25 +123,54 @@ fn handle_http(
     mut stream: TcpStream,
     shared: SharedStatus,
     discovery: SharedDiscovery,
+    auth_token: Arc<str>,
 ) -> Result<(), String> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let (method, path, body) = read_http_request(&mut stream)?;
+    let request = read_http_request(&mut stream)?;
+    let cors_origin = request
+        .origin
+        .as_deref()
+        .filter(|origin| origin_allowed(origin));
 
-    if method == "OPTIONS" {
-        return write_response(&mut stream, 204, "text/plain", "");
+    if request.origin.is_some() && cors_origin.is_none() {
+        return write_json_error(
+            &mut stream,
+            403,
+            "origin not allowed",
+            None,
+        );
     }
 
-    match (method.as_str(), path.as_str()) {
+    if request.method == "OPTIONS" {
+        return write_response(&mut stream, 204, "text/plain", "", cors_origin);
+    }
+
+    if !token_matches(&auth_token, request.auth_token.as_deref()) {
+        return write_json_error(
+            &mut stream,
+            401,
+            "hub authentication required",
+            cors_origin,
+        );
+    }
+
+    match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/api/health") => {
-            write_response(&mut stream, 200, "application/json", "{\"ok\":true}")
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                "{\"ok\":true}",
+                cors_origin,
+            )
         }
         ("GET", "/api/status") => {
             let json = with_status(&shared, |s| s.to_json());
-            write_response(&mut stream, 200, "application/json", &json)
+            write_response(&mut stream, 200, "application/json", &json, cors_origin)
         }
         ("GET", "/api/config") => {
             let json = with_status(&shared, |s| s.snapshot_config().to_json());
-            write_response(&mut stream, 200, "application/json", &json)
+            write_response(&mut stream, 200, "application/json", &json, cors_origin)
         }
         ("GET", "/api/discover") => {
             let json = match discovery.as_ref() {
@@ -109,7 +179,7 @@ fn handle_http(
                     "{\"service_type\":\"_m590bridge._tcp.local.\",\"advertising\":false,\"peers\":[],\"error\":\"mdns unavailable\"}".into()
                 }
             };
-            write_response(&mut stream, 200, "application/json", &json)
+            write_response(&mut stream, 200, "application/json", &json, cors_origin)
         }
         ("POST", "/api/discover/refresh") => match discovery.as_ref() {
             Some(d) => match d.refresh() {
@@ -118,83 +188,125 @@ fn handle_http(
                     200,
                     "application/json",
                     &d.to_json(),
+                    cors_origin,
                 ),
-                Err(err) => write_json_err(&mut stream, &err),
+                Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
             },
-            None => write_json_err(&mut stream, "mdns unavailable"),
+            None => write_json_error(&mut stream, 400, "mdns unavailable", cors_origin),
         },
-        ("POST", "/api/config") => match apply_config_update(&shared, &body) {
-            Ok(json) => write_response(&mut stream, 200, "application/json", &json),
-            Err(err) => write_json_err(&mut stream, &err),
+        ("POST", "/api/config") => match apply_config_update(&shared, &request.body) {
+            Ok(json) => write_response(&mut stream, 200, "application/json", &json, cors_origin),
+            Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
         },
         ("POST", "/api/listen") => {
-            let code = resolve_pairing_code(&shared, &body);
-            let port = json_get(&body, "port")
+            let code = resolve_pairing_code(&shared, &request.body);
+            let port = json_get(&request.body, "port")
                 .and_then(|p| p.parse().ok())
                 .unwrap_or_else(|| with_status(&shared, |s| s.listen_port));
-            let device_id = json_get(&body, "device_id").filter(|s| !s.is_empty());
+            let device_id = json_get(&request.body, "device_id").filter(|s| !s.is_empty());
             match start_listen(shared, code, port, device_id, discovery) {
-                Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
-                Err(err) => write_json_err(&mut stream, &err),
+                Ok(()) => write_response(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    "{\"ok\":true}",
+                    cors_origin,
+                ),
+                Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
             }
         }
         ("POST", "/api/connect") => {
-            let code = resolve_pairing_code(&shared, &body);
-            let addr = json_get(&body, "addr")
+            let code = resolve_pairing_code(&shared, &request.body);
+            let addr = json_get(&request.body, "addr")
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| {
                     with_status(&shared, |s| s.connect_addr.clone().unwrap_or_default())
                 });
-            let device_id = json_get(&body, "device_id").filter(|s| !s.is_empty());
+            let device_id = json_get(&request.body, "device_id").filter(|s| !s.is_empty());
             match start_connect(shared, code, addr, device_id, discovery) {
-                Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
-                Err(err) => write_json_err(&mut stream, &err),
+                Ok(()) => write_response(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    "{\"ok\":true}",
+                    cors_origin,
+                ),
+                Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
             }
         }
         ("POST", "/api/push") => {
-            let text = json_get(&body, "text").unwrap_or_default();
+            let text = json_get(&request.body, "text").unwrap_or_default();
             match push_text(&shared, text) {
-                Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
-                Err(err) => write_json_err(&mut stream, &err),
+                Ok(()) => write_response(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    "{\"ok\":true}",
+                    cors_origin,
+                ),
+                Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
             }
         }
         ("POST", "/api/send_file") => {
-            let file_path = json_get(&body, "path").unwrap_or_default();
+            let file_path = json_get(&request.body, "path").unwrap_or_default();
             match push_file(&shared, file_path) {
-                Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
-                Err(err) => write_json_err(&mut stream, &err),
+                Ok(()) => write_response(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    "{\"ok\":true}",
+                    cors_origin,
+                ),
+                Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
             }
         }
         ("POST", "/api/send_file_bytes") => {
-            let name = json_get(&body, "name").unwrap_or_default();
-            let data_b64 = json_get(&body, "data_base64").unwrap_or_default();
+            let name = json_get(&request.body, "name").unwrap_or_default();
+            let data_b64 = json_get(&request.body, "data_base64").unwrap_or_default();
             match push_file_bytes(&shared, name, data_b64) {
-                Ok(()) => write_response(&mut stream, 200, "application/json", "{\"ok\":true}"),
-                Err(err) => write_json_err(&mut stream, &err),
+                Ok(()) => write_response(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    "{\"ok\":true}",
+                    cors_origin,
+                ),
+                Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
             }
         }
         ("POST", "/api/disconnect") => {
             STOP_BRIDGE.store(true, Ordering::SeqCst);
+            {
+                let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
+                with_status(&shared, |s| {
+                    s.phase = HubPhase::Idle;
+                    s.connection = Some(ConnectionState::Disconnected);
+                    s.peer_device = None;
+                    s.last_error = None;
+                    s.role = None;
+                    s.endpoint = None;
+                    // Keep pairing_code / connect_addr / listen_port for UI prefills.
+                    s.reconnect_attempt = 0;
+                });
+                pending.clear();
+            }
             if let Some(d) = discovery.as_ref() {
                 d.stop_advertise();
             }
-            with_status(&shared, |s| {
-                s.phase = HubPhase::Idle;
-                s.connection = Some(ConnectionState::Disconnected);
-                s.peer_device = None;
-                s.last_error = None;
-                s.role = None;
-                s.endpoint = None;
-                // Keep pairing_code / connect_addr / listen_port for UI prefills.
-                s.reconnect_attempt = 0;
-            });
-            write_response(&mut stream, 200, "application/json", "{\"ok\":true}")
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                "{\"ok\":true}",
+                cors_origin,
+            )
         }
         _ => write_response(
             &mut stream,
             404,
             "application/json",
             "{\"error\":\"not found\"}",
+            cors_origin,
         ),
     }
 }
@@ -213,7 +325,7 @@ fn apply_config_update(shared: &SharedStatus, body: &str) -> Result<String, Stri
 }
 
 
-fn read_http_request(stream: &mut TcpStream) -> Result<(String, String, String), String> {
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut data: Vec<u8> = Vec::with_capacity(4096);
     let mut buf = [0u8; 2048];
     loop {
@@ -225,7 +337,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(String, String, String),
             break;
         }
         data.extend_from_slice(&buf[..n]);
-        if data.len() > 64 * 1024 {
+        if data.len() > MAX_HTTP_HEADER_BYTES {
             return Err("http headers too large".into());
         }
     }
@@ -245,30 +357,115 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(String, String, String),
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
 
-    let mut content_length = 0usize;
+    let mut content_length = None;
+    let mut origin = None;
+    let mut auth_token = None;
     for line in lines {
-        let lower = line.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|_| "invalid content-length")?,
+                );
+            }
+            "origin" => origin = Some(value.trim().to_string()),
+            HUB_TOKEN_HEADER => auth_token = Some(value.trim().to_string()),
+            _ => {}
         }
     }
 
+    let content_length = content_length.unwrap_or(0);
+    let body_limit = http_body_limit(&path);
+    if content_length > body_limit {
+        return Err(format!(
+            "http body too large: {content_length}B > limit {body_limit}B"
+        ));
+    }
     let mut body = data[header_end + 4..].to_vec();
+    if body.len() > body_limit {
+        return Err(format!(
+            "http body too large: {}B > limit {body_limit}B",
+            body.len()
+        ));
+    }
     while body.len() < content_length {
         let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
         body.extend_from_slice(&buf[..n]);
-        if body.len() > 1024 * 1024 {
-            return Err("http body too large".into());
+        if body.len() > body_limit {
+            return Err(format!(
+                "http body too large: {}B > limit {body_limit}B",
+                body.len()
+            ));
         }
+    }
+    if body.len() < content_length {
+        return Err("incomplete http body".into());
     }
     if content_length > 0 {
         body.truncate(content_length);
     }
     let body = String::from_utf8_lossy(&body).trim_end_matches('\0').to_string();
-    Ok((method, path, body))
+    Ok(HttpRequest {
+        method,
+        path,
+        body,
+        origin,
+        auth_token,
+    })
+}
+
+fn http_body_limit(path: &str) -> usize {
+    if path == "/api/send_file_bytes" {
+        MAX_HTTP_FILE_BODY_BYTES
+    } else {
+        MAX_HTTP_JSON_BODY_BYTES
+    }
+}
+
+fn token_matches(expected: &str, provided: Option<&str>) -> bool {
+    let Some(provided) = provided else {
+        return false;
+    };
+    if expected.len() != provided.len() {
+        return false;
+    }
+    expected
+        .as_bytes()
+        .iter()
+        .zip(provided.as_bytes())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
+fn origin_allowed(origin: &str) -> bool {
+    if matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) {
+        return true;
+    }
+    cfg!(debug_assertions) && is_local_dev_origin(origin)
+}
+
+fn is_local_dev_origin(origin: &str) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]") && port.parse::<u16>().is_ok()
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
@@ -295,12 +492,17 @@ fn resolve_pairing_code(shared: &SharedStatus, body: &str) -> String {
     })
 }
 
-fn write_json_err(stream: &mut TcpStream, err: &str) -> Result<(), String> {
+fn write_json_error(
+    stream: &mut TcpStream,
+    status: u16,
+    err: &str,
+    cors_origin: Option<&str>,
+) -> Result<(), String> {
     let body = format!(
         "{{\"ok\":false,\"error\":\"{}\"}}",
         err.replace('\\', "\\\\").replace('"', "\\\"")
     );
-    write_response(stream, 400, "application/json", &body)
+    write_response(stream, status, "application/json", &body, cors_origin)
 }
 
 fn write_response(
@@ -308,25 +510,36 @@ fn write_response(
     status: u16,
     content_type: &str,
     body: &str,
+    cors_origin: Option<&str>,
 ) -> Result<(), String> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         _ => "Error",
     };
+    let cors_headers = cors_origin
+        .map(|origin| {
+            format!(
+                "Access-Control-Allow-Origin: {origin}\r\n\
+Vary: Origin\r\n\
+Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: Content-Type, X-M590-Token\r\n"
+            )
+        })
+        .unwrap_or_default();
     let resp = format!(
         "HTTP/1.1 {status} {reason}\r\n\
 Content-Type: {content_type}; charset=utf-8\r\n\
 Content-Length: {len}\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-Access-Control-Allow-Headers: Content-Type\r\n\
+{cors_headers}\
 Connection: close\r\n\
 \r\n\
 {body}",
-        len = body.as_bytes().len(),
+        len = body.len(),
     );
     stream
         .write_all(resp.as_bytes())
@@ -334,37 +547,12 @@ Connection: close\r\n\
     stream.flush().map_err(|e| e.to_string())
 }
 
-/// Very small JSON string field extractor: "key":"value" or "key": 123
 fn json_get(body: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let idx = body.find(&pat)?;
-    let after = &body[idx + pat.len()..];
-    let after = after.trim_start().trim_start_matches(':').trim_start();
-    if after.starts_with("null") {
-        return None;
-    }
-    if let Some(rest) = after.strip_prefix('"') {
-        let mut out = String::new();
-        let mut chars = rest.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '"' => break,
-                '\\' => {
-                    if let Some(n) = chars.next() {
-                        out.push(n);
-                    }
-                }
-                other => out.push(other),
-            }
-        }
-        Some(out)
-    } else {
-        let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if num.is_empty() {
-            None
-        } else {
-            Some(num)
-        }
+    let object: serde_json::Value = serde_json::from_str(body).ok()?;
+    match object.get(key)? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -502,11 +690,7 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
             };
             match &job {
                 BridgeJob::Listen { .. } => {
-                    s.phase = if attempt == 0 {
-                        HubPhase::WaitingPeer
-                    } else {
-                        HubPhase::WaitingPeer
-                    };
+                    s.phase = HubPhase::WaitingPeer;
                     s.role = Some("host".into());
                     s.connection = Some(ConnectionState::Disconnected);
                 }
@@ -530,6 +714,17 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
                 device_id,
             } => connect_worker(shared.clone(), code.clone(), addr.clone(), device_id.clone()),
         };
+        {
+            let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
+            with_status(&shared, |s| {
+                if s.phase == HubPhase::Connected {
+                    s.phase = HubPhase::Idle;
+                    s.connection = Some(ConnectionState::Disconnected);
+                    s.peer_device = None;
+                }
+            });
+            pending.clear();
+        }
 
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             with_status(&shared, |s| {
@@ -693,11 +888,15 @@ fn push_text(shared: &SharedStatus, text: String) -> Result<(), String> {
     if text.is_empty() {
         return Err("text required".into());
     }
-    PENDING_PUSH.lock().expect("push lock").replace(text);
+    let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
     let phase = with_status(shared, |s| s.phase);
     if phase != HubPhase::Connected {
         return Err("not connected".into());
     }
+    if pending.text.is_some() {
+        return Err("text push already pending".into());
+    }
+    pending.text = Some(text);
     Ok(())
 }
 
@@ -716,18 +915,49 @@ fn push_file(shared: &SharedStatus, path: String) -> Result<(), String> {
             meta.len()
         ));
     }
-    PENDING_FILE.lock().expect("file lock").replace(path);
+    let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
     let phase = with_status(shared, |s| s.phase);
     if phase != HubPhase::Connected {
         return Err("not connected".into());
     }
+    if pending.file_path.is_some() {
+        return Err("file send already pending".into());
+    }
+    pending.file_path = Some(path);
     Ok(())
 }
 
-static PENDING_PUSH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-static PENDING_FILE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-static PENDING_FILE_BYTES: std::sync::Mutex<Option<(String, Vec<u8>)>> =
-    std::sync::Mutex::new(None);
+struct PendingCommands {
+    text: Option<String>,
+    file_path: Option<String>,
+    file_bytes: Option<(String, Vec<u8>)>,
+}
+
+impl PendingCommands {
+    const fn new() -> Self {
+        Self {
+            text: None,
+            file_path: None,
+            file_bytes: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.text = None;
+        self.file_path = None;
+        self.file_bytes = None;
+    }
+}
+
+static PENDING_COMMANDS: std::sync::Mutex<PendingCommands> =
+    std::sync::Mutex::new(PendingCommands::new());
+
+fn clear_pending_commands() {
+    PENDING_COMMANDS
+        .lock()
+        .expect("pending commands lock")
+        .clear();
+}
 
 fn push_file_bytes(shared: &SharedStatus, name: String, data_b64: String) -> Result<(), String> {
     if name.is_empty() {
@@ -739,24 +969,25 @@ fn push_file_bytes(shared: &SharedStatus, name: String, data_b64: String) -> Res
     if data_b64.is_empty() {
         return Err("data_base64 required".into());
     }
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(data_b64.trim())
-        .map_err(|e| format!("base64 decode: {e}"))?;
-    if data.len() > MAX_MEMORY_FILE_BYTES {
-        return Err(format!(
-            "file too large for bytes API: {}B > limit {MAX_MEMORY_FILE_BYTES}B (use /api/send_file path)",
-            data.len()
-        ));
-    }
-    PENDING_FILE_BYTES
-        .lock()
-        .expect("file bytes lock")
-        .replace((name, data));
+    let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
     let phase = with_status(shared, |s| s.phase);
     if phase != HubPhase::Connected {
         return Err("not connected".into());
     }
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.trim())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if data.len() > MAX_HTTP_FILE_BYTES {
+        return Err(format!(
+            "file too large for bytes API: {}B > limit {MAX_HTTP_FILE_BYTES}B (use /api/send_file path)",
+            data.len()
+        ));
+    }
+    if pending.file_bytes.is_some() {
+        return Err("file bytes send already pending".into());
+    }
+    pending.file_bytes = Some((name, data));
     Ok(())
 }
 
@@ -922,10 +1153,16 @@ fn run_session_loop(
             last_heartbeat = Instant::now();
         }
 
-        if let Some(text) = PENDING_PUSH.lock().expect("push").take() {
+        let pending_text = PENDING_COMMANDS
+            .lock()
+            .expect("pending commands lock")
+            .text
+            .take();
+        if let Some(text) = pending_text {
             content_seq += 1;
             let cid = format!("ui-push-{}-{content_seq}", std::process::id());
-            if let Ok(QueueClipboardResult::Queued) = session.queue_clipboard_text(cid, text.clone())
+            if let Ok(QueueClipboardResult::Queued) =
+                session.queue_clipboard_text(cid, text.clone())
             {
                 conn.send_all(session.take_outbox().iter())
                     .map_err(|e| e.to_string())?;
@@ -938,7 +1175,12 @@ fn run_session_loop(
             }
         }
 
-        if let Some(path) = PENDING_FILE.lock().expect("file").take() {
+        let pending_file = PENDING_COMMANDS
+            .lock()
+            .expect("pending commands lock")
+            .file_path
+            .take();
+        if let Some(path) = pending_file {
             match offer_local_file(session, &mut content_seq, &path) {
                 Ok((summary, transfer_id, file_name, bytes)) => {
                     conn.send_all(session.take_outbox().iter())
@@ -954,7 +1196,12 @@ fn run_session_loop(
             }
         }
 
-        if let Some((name, data)) = PENDING_FILE_BYTES.lock().expect("file bytes").take() {
+        let pending_file_bytes = PENDING_COMMANDS
+            .lock()
+            .expect("pending commands lock")
+            .file_bytes
+            .take();
+        if let Some((name, data)) = pending_file_bytes {
             match offer_file_bytes(session, &mut content_seq, name, data) {
                 Ok((summary, transfer_id, file_name, bytes)) => {
                     conn.send_all(session.take_outbox().iter())
@@ -1534,5 +1781,154 @@ fn handle_inbound_file(
             });
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn http_exchange(request: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_http(
+                stream,
+                crate::status::new_shared_status(),
+                Arc::new(None),
+                Arc::from(TEST_TOKEN),
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    fn request(method: &str, path: &str, headers: &str, body: &str) -> String {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn generated_hub_token_has_256_bits_of_hex() {
+        let token = generate_hub_token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn json_get_decodes_escaped_file_path() {
+        assert_eq!(
+            json_get(r#"{"path":"/tmp/line\nquote\"slash\\.txt"}"#, "path"),
+            Some("/tmp/line\nquote\"slash\\.txt".into())
+        );
+    }
+
+    #[test]
+    fn oversized_content_length_is_rejected_before_body_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream).unwrap_err()
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        let header = format!(
+            "POST /api/send_file_bytes HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_HTTP_FILE_BODY_BYTES + 1
+        );
+        client.write_all(header.as_bytes()).unwrap();
+        let err = server.join().unwrap();
+        assert!(err.contains("http body too large"), "{err}");
+    }
+
+    #[test]
+    fn hub_rejects_missing_token_and_untrusted_origin() {
+        let no_token = http_exchange(request("GET", "/api/status", "", ""));
+        assert!(no_token.starts_with("HTTP/1.1 401 "), "{no_token}");
+
+        let evil = http_exchange(request(
+            "GET",
+            "/api/status",
+            &format!("Origin: https://example.invalid\r\nX-M590-Token: {TEST_TOKEN}\r\n"),
+            "",
+        ));
+        assert!(evil.starts_with("HTTP/1.1 403 "), "{evil}");
+        assert!(!evil.contains("Access-Control-Allow-Origin"), "{evil}");
+    }
+
+    #[test]
+    fn hub_accepts_authenticated_tauri_origin() {
+        let response = http_exchange(request(
+            "GET",
+            "/api/status",
+            &format!("Origin: tauri://localhost\r\nX-M590-Token: {TEST_TOKEN}\r\n"),
+            "",
+        ));
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(
+            response.contains("Access-Control-Allow-Origin: tauri://localhost"),
+            "{response}"
+        );
+        assert!(!response.contains("Access-Control-Allow-Origin: *"));
+    }
+
+    #[test]
+    fn file_bytes_http_body_accepts_more_than_one_mib() {
+        use base64::Engine;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(vec![5u8; 1024 * 1024]);
+        let body = format!("{{\"name\":\"one.bin\",\"data_base64\":\"{encoded}\"}}");
+        assert!(body.len() > MAX_HTTP_JSON_BODY_BYTES);
+        assert!(body.len() < MAX_HTTP_FILE_BODY_BYTES);
+        let response = http_exchange(request(
+            "POST",
+            "/api/send_file_bytes",
+            &format!("X-M590-Token: {TEST_TOKEN}\r\nContent-Type: application/json\r\n"),
+            &body,
+        ));
+        assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+        assert!(response.contains("not connected"), "{response}");
+        assert!(!response.contains("http body too large"), "{response}");
+    }
+
+    #[test]
+    fn pending_commands_reject_overwrite_and_disconnected_push() {
+        clear_pending_commands();
+        let shared = crate::status::new_shared_status();
+        with_status(&shared, |status| status.phase = HubPhase::Connected);
+        assert_eq!(push_text(&shared, "first".into()), Ok(()));
+        assert_eq!(
+            push_text(&shared, "second".into()),
+            Err("text push already pending".into())
+        );
+        assert_eq!(
+            PENDING_COMMANDS.lock().unwrap().text.as_deref(),
+            Some("first")
+        );
+        clear_pending_commands();
+        with_status(&shared, |status| status.phase = HubPhase::Idle);
+        assert_eq!(
+            push_text(&shared, "later".into()),
+            Err("not connected".into())
+        );
+        assert!(PENDING_COMMANDS.lock().unwrap().text.is_none());
+        assert_eq!(
+            push_file_bytes(&shared, "later.bin".into(), "YQ==".into()),
+            Err("not connected".into())
+        );
+        assert!(PENDING_COMMANDS.lock().unwrap().file_bytes.is_none());
     }
 }

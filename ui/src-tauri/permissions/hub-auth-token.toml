@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-hub-auth-token"
+description = "Allow the main desktop WebView to obtain its process-local Hub API token."
+commands.allow = ["hub_auth_token"]

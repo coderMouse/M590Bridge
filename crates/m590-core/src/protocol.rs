@@ -1,7 +1,7 @@
 use crate::{DeviceId, ProtocolError};
 
 /// Draft wire protocol version (frame header also carries this value).
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Text clipboard payload carried on the wire after pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]

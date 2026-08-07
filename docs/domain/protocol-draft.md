@@ -1,12 +1,14 @@
 # 协议草案 · M590Bridge
 
-> 状态：draft（至 **task-033** 大文件流式第一刀）  
+> 状态：draft（至 **task-035** 发布硬化）
 > 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；**文件 offer/request/chunk/complete（磁盘流 + SHA-256）**
 
 ## 版本
 
-- 应用协议版本：`PROTOCOL_VERSION = 1`
+- 应用协议版本：`PROTOCOL_VERSION = 2`
 - 帧魔数：ASCII `M590`
+
+版本 2 在 `FileOffer` / `FileComplete` 中包含 SHA-256 字段；版本 1 帧会在帧头解码阶段返回 `UnsupportedVersion(1)`，不进入 payload 解码。
 
 ## 帧布局
 
@@ -25,8 +27,8 @@
 
 最大 payload：`MAX_PAYLOAD_LEN = 16 MiB`。  
 内联图片软上限：`Session::INLINE_IMAGE_MAX_BYTES = 12 MiB`（超出则发送侧 skip）。  
-文件软上限：`Session::MAX_FILE_BYTES = 8 GiB`（**不是**整文件内存 cap）。  
-内存/base64 offer 上限：`MAX_MEMORY_FILE_BYTES = 64 MiB`。  
+文件软上限：`Session::MAX_FILE_BYTES = 8 GiB`（**不是**整文件内存 cap）。
+内存/base64 offer 上限：`MAX_MEMORY_FILE_BYTES = 64 MiB`。
 分片：`FILE_CHUNK_SIZE = 256 KiB`；每轮泵送最多 `OUTBOUND_CHUNKS_PER_PUMP = 4` 片。
 
 ## 消息类型（msg_type）
@@ -63,12 +65,20 @@
 5. 空文件：无 chunk，直接 Complete
 6. 失败：`FileComplete(ok=0)` 或 `InboundFileResult::Failed`；清理 `.part`
 
-**本刀取舍**：仍走**同一 TCP 控制/数据连接**串行帧（未开独立数据连接）；靠分批 pump 避免一次把整文件 chunk 堆进 outbox，心跳/剪贴板可在 pump 间隙处理。  
+**本刀取舍**：仍走**同一 TCP 控制/数据连接**串行帧（未开独立数据连接）；靠分批 pump 避免一次把整文件 chunk 堆进 outbox，心跳/剪贴板可在 pump 间隙处理。
 **仍未做**：文件夹、OS 文件剪贴板、断点续传、多文件并行、独立数据连接。
 
 **hub**：自动 request + `.partial` → 保存目录；`POST /api/send_file`（路径流式）；`send_file_bytes` 仍限内存 cap。
 
 所有业务消息在类型上携带或保留 `DeviceId`，便于以后扩展；**运行时 MVP 仅 1 peer**。
+
+## 本机 Hub 控制 API（task-035）
+
+- 默认地址：`http://127.0.0.1:5910`，桌面壳仅接受 loopback API 地址。
+- Hub 每个进程使用随机 256 位令牌；除允许来源的 `OPTIONS` 预检外，所有 API 请求都必须携带 `X-M590-Token`。
+- Tauri WebView 通过受限 command 获取内嵌 Hub 的进程临时令牌；独立 daemon 可用 `M590_HUB_TOKEN` 注入，未注入时只输出到当前终端。
+- CORS 仅回显 Tauri origin；debug 构建额外允许带有效端口的 localhost/loopback 开发 origin。无 `Origin` 的 CLI 请求仍必须鉴权。
+- `send_file_bytes` 的源文件上限为 4 MiB；HTTP reader 为 Base64 JSON 放大预留空间，并在读取 body 前校验 `Content-Length`。
 
 ## 会话状态
 
