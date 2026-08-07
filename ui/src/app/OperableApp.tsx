@@ -36,6 +36,12 @@ import type { ConnectionStatus } from '@/lib/tokens'
 
 type Tab = 'pair' | 'home' | 'settings'
 
+const TAB_ITEMS = [
+  { id: 'pair', label: '配对', icon: Link2 },
+  { id: 'home', label: '主面板', icon: Monitor },
+  { id: 'settings', label: '设置', icon: Settings },
+] as const
+
 function formatCodeDisplay(code: string) {
   const digits = code.replace(/\D/g, '').slice(0, 6)
   if (digits.length <= 3) return digits
@@ -373,8 +379,8 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   }
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-[420px] flex-col bg-[#F5F7FA] text-[#1A2030] shadow-xl">
-      <header className="flex items-center justify-between border-b border-black/6 bg-white px-4 py-3">
+    <div className="flex h-dvh min-h-0 w-full min-w-0 flex-col overflow-hidden bg-[#F5F7FA] text-[#1A2030]">
+      <header className="flex shrink-0 items-center justify-between border-b border-black/6 bg-white px-4 py-3">
         <div>
           <div className="text-[14px] font-bold">M590Bridge</div>
           <div className="text-[11px] text-[#6B7589]">
@@ -401,9 +407,32 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
         </div>
       ) : null}
 
-      <div className="flex-1 overflow-auto">
-        {tab === 'pair' ? (
-          <div className="flex flex-col px-5 pb-5 pt-6">
+      <div className="flex min-h-0 flex-1">
+        <aside className="hidden w-40 shrink-0 flex-col border-r border-black/6 bg-white sm:flex">
+          <nav className="space-y-1 p-2" aria-label="主导航">
+            {TAB_ITEMS.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                type="button"
+                className={cn(
+                  'flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-left text-[12px] font-semibold transition-colors',
+                  tab === id
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-[#6B7589] hover:bg-[#F5F7FA] hover:text-[#1A2030]',
+                )}
+                aria-current={tab === id ? 'page' : undefined}
+                onClick={() => setTab(id)}
+              >
+                <Icon size={15} />
+                <span>{label}</span>
+              </button>
+            ))}
+          </nav>
+        </aside>
+
+        <main className="min-w-0 flex-1 overflow-auto">
+          {tab === 'pair' ? (
+          <div className="mx-auto flex min-h-full w-full max-w-[720px] flex-col px-5 pb-5 pt-6 sm:px-8">
             <div className="mb-4 flex flex-col items-center text-center">
               <AppIcon size={40} />
               <h1 className="mt-3 mb-1 text-[18px] font-bold">连接另一台电脑</h1>
@@ -608,152 +637,158 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
 
         {tab === 'home' ? (
           <div className="flex h-full flex-col">
-            <div className="flex-1 space-y-4 overflow-auto px-4 py-4">
-              <div className="flex items-center gap-2">
-                <DeviceCard
-                  name={status?.device_id ?? '本机'}
-                  os={status?.role === 'host' ? 'Host' : 'Joiner'}
-                  kind="本机"
-                />
-                <Link2
-                  size={16}
-                  className={cn(
-                    'shrink-0',
-                    status?.phase === 'connected' ? 'text-primary' : 'text-[#9AA3B2]',
-                  )}
-                />
-                <DeviceCard
-                  name={status?.peer_device ?? '未连接'}
-                  os="对端"
-                  kind="对端"
-                />
-              </div>
-
-              <ClipboardPreview
-                type="文本"
-                preview={status?.last_sync_text ?? '尚无同步文本'}
-                meta={
-                  status?.last_sync_content_id
-                    ? `content_id ${status.last_sync_content_id}`
-                    : '等待同步'
-                }
-              />
-
-              <div className="rounded-[10px] border border-black/8 bg-white p-3">
-                <div className="mb-2 text-[12px] font-semibold text-[#6B7589]">手动推送文本</div>
-                <textarea
-                  className="mb-2 h-20 w-full rounded-md border border-black/10 p-2 text-[12px]"
-                  value={pushText}
-                  onChange={(e) => setPushText(e.target.value)}
-                  placeholder="输入后推送到对端剪贴板"
-                />
-                <PrimaryButton
-                  onClick={() => void onPush()}
-                  disabled={!hubOnline || status?.phase !== 'connected' || busy}
-                >
-                  推送到对端
-                </PrimaryButton>
-              </div>
-
-              <div
-                className={
-                  fileDragOver
-                    ? 'rounded-[10px] border border-primary bg-primary/5 p-3'
-                    : 'rounded-[10px] border border-black/8 bg-white p-3'
-                }
-                onDragEnter={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  if (!fileBusy) setFileDragOver(true)
-                }}
-                onDragOver={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  if (!fileBusy) setFileDragOver(true)
-                }}
-                onDragLeave={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  setFileDragOver(false)
-                }}
-                onDrop={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  setFileDragOver(false)
-                  if (!hubOnline || status?.phase !== 'connected' || fileBusy || busy) return
-                  const f = e.dataTransfer.files?.[0] ?? null
-                  void onPickAndSendFile(f)
-                }}
-              >
-                <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold text-[#6B7589]">
-                  <FileUp size={14} /> 文件传输
-                  <span className="ml-auto font-medium text-[#1A2030]">
-                    {filePhaseLabel(status?.file_transfer_phase)}
-                  </span>
-                </div>
-                <div className="mb-2 text-[11px] leading-4 text-[#6B7589]">
-                  桌面版原生选择/拖放支持路径流式发送，单文件软上限 8GiB；浏览器模式上限 4MiB。
-                  对端自动接收并写入其保存目录。
-                  <br />
-                  可「选择并发送」（原生对话框，默认桌面）或把文件拖到窗口。GNOME 下文件管理器 Ctrl+C 常不可用。
-                  <br />
-                  两端必须同一版本（含文件通道）。若对端报 unknown message type 11，请升级对端后重连。
-                </div>
-                {status?.file_clipboard_watch_likely === false ? (
-                  <div className="mb-2 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-4 text-amber-900">
-                    当前环境可能读不到「文件管理器复制」。请用下方按钮或拖入文件发送。
+            <div className="flex-1 overflow-auto">
+              <div className="mx-auto grid w-full max-w-[1200px] grid-cols-1 gap-4 px-4 py-4 lg:grid-cols-2 lg:items-start">
+                <div className="min-w-0 space-y-4">
+                  <div className="flex items-center gap-2">
+                    <DeviceCard
+                      name={status?.device_id ?? '本机'}
+                      os={status?.role === 'host' ? 'Host' : 'Joiner'}
+                      kind="本机"
+                    />
+                    <Link2
+                      size={16}
+                      className={cn(
+                        'shrink-0',
+                        status?.phase === 'connected' ? 'text-primary' : 'text-[#9AA3B2]',
+                      )}
+                    />
+                    <DeviceCard
+                      name={status?.peer_device ?? '未连接'}
+                      os="对端"
+                      kind="对端"
+                    />
                   </div>
-                ) : null}
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  className="hidden"
-                  disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
-                  onChange={(e) => {
-                    const f = e.target.files?.[0] ?? null
-                    void onPickAndSendFile(f)
-                    e.target.value = ''
-                  }}
-                />
-                <PrimaryButton
-                  className="mb-2"
-                  loading={fileBusy}
-                  disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
-                  onClick={() => void onNativePickAndSend()}
-                >
-                  <FileUp size={14} /> 选择并发送文件
-                </PrimaryButton>
-                {pickedFileLabel ? (
-                  <div className="mb-2 truncate text-[11px] text-[#6B7589]">已选：{pickedFileLabel}</div>
-                ) : null}
-                <div className="mb-1 flex items-center justify-between text-[11px] text-[#6B7589]">
-                  <span className="truncate pr-2">
-                    {status?.last_file_name || '尚无文件传输'}
-                  </span>
-                  <span className="shrink-0 tabular-nums">{fileProgressPercent(status)}%</span>
-                </div>
-                <div className="mb-2 h-2 overflow-hidden rounded-full bg-[#EEF2F8]">
-                  <div
-                    className="h-full rounded-full bg-primary transition-[width] duration-300"
-                    style={{ width: `${fileProgressPercent(status)}%` }}
+
+                  <ClipboardPreview
+                    type="文本"
+                    preview={status?.last_sync_text ?? '尚无同步文本'}
+                    meta={
+                      status?.last_sync_content_id
+                        ? `content_id ${status.last_sync_content_id}`
+                        : '等待同步'
+                    }
                   />
                 </div>
-                <div className="space-y-1 text-[11px] leading-4 text-[#6B7589]">
-                  <div>
-                    进度字节：{status?.file_bytes_received ?? 0} / {status?.file_bytes_total ?? 0}
+
+                <div className="min-w-0 space-y-4">
+                  <div className="rounded-[10px] border border-black/8 bg-white p-3">
+                    <div className="mb-2 text-[12px] font-semibold text-[#6B7589]">手动推送文本</div>
+                    <textarea
+                      className="mb-2 h-20 w-full rounded-md border border-black/10 p-2 text-[12px]"
+                      value={pushText}
+                      onChange={(e) => setPushText(e.target.value)}
+                      placeholder="输入后推送到对端剪贴板"
+                    />
+                    <PrimaryButton
+                      onClick={() => void onPush()}
+                      disabled={!hubOnline || status?.phase !== 'connected' || busy}
+                    >
+                      推送到对端
+                    </PrimaryButton>
                   </div>
-                  {status?.last_file_saved_path ? (
-                    <div className="break-all text-[#1A2030]">
-                      已保存：{status.last_file_saved_path}
+
+                  <div
+                    className={
+                      fileDragOver
+                        ? 'rounded-[10px] border border-primary bg-primary/5 p-3'
+                        : 'rounded-[10px] border border-black/8 bg-white p-3'
+                    }
+                    onDragEnter={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      if (!fileBusy) setFileDragOver(true)
+                    }}
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      if (!fileBusy) setFileDragOver(true)
+                    }}
+                    onDragLeave={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setFileDragOver(false)
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setFileDragOver(false)
+                      if (!hubOnline || status?.phase !== 'connected' || fileBusy || busy) return
+                      const f = e.dataTransfer.files?.[0] ?? null
+                      void onPickAndSendFile(f)
+                    }}
+                  >
+                    <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold text-[#6B7589]">
+                      <FileUp size={14} /> 文件传输
+                      <span className="ml-auto font-medium text-[#1A2030]">
+                        {filePhaseLabel(status?.file_transfer_phase)}
+                      </span>
                     </div>
-                  ) : null}
-                  {status?.file_save_dir ? (
-                    <div className="break-all">本机保存目录：{status.file_save_dir}</div>
-                  ) : null}
+                    <div className="mb-2 text-[11px] leading-4 text-[#6B7589]">
+                      桌面版原生选择/拖放支持路径流式发送，单文件软上限 8GiB；浏览器模式上限 4MiB。
+                      对端自动接收并写入其保存目录。
+                      <br />
+                      可「选择并发送」（原生对话框，默认桌面）或把文件拖到窗口。GNOME 下文件管理器 Ctrl+C 常不可用。
+                      <br />
+                      两端必须同一版本（含文件通道）。若对端报 unknown message type 11，请升级对端后重连。
+                    </div>
+                    {status?.file_clipboard_watch_likely === false ? (
+                      <div className="mb-2 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-4 text-amber-900">
+                        当前环境可能读不到「文件管理器复制」。请用下方按钮或拖入文件发送。
+                      </div>
+                    ) : null}
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      className="hidden"
+                      disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0] ?? null
+                        void onPickAndSendFile(f)
+                        e.target.value = ''
+                      }}
+                    />
+                    <PrimaryButton
+                      className="mb-2"
+                      loading={fileBusy}
+                      disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
+                      onClick={() => void onNativePickAndSend()}
+                    >
+                      <FileUp size={14} /> 选择并发送文件
+                    </PrimaryButton>
+                    {pickedFileLabel ? (
+                      <div className="mb-2 truncate text-[11px] text-[#6B7589]">已选：{pickedFileLabel}</div>
+                    ) : null}
+                    <div className="mb-1 flex items-center justify-between text-[11px] text-[#6B7589]">
+                      <span className="truncate pr-2">
+                        {status?.last_file_name || '尚无文件传输'}
+                      </span>
+                      <span className="shrink-0 tabular-nums">{fileProgressPercent(status)}%</span>
+                    </div>
+                    <div className="mb-2 h-2 overflow-hidden rounded-full bg-[#EEF2F8]">
+                      <div
+                        className="h-full rounded-full bg-primary transition-[width] duration-300"
+                        style={{ width: `${fileProgressPercent(status)}%` }}
+                      />
+                    </div>
+                    <div className="space-y-1 text-[11px] leading-4 text-[#6B7589]">
+                      <div>
+                        进度字节：{status?.file_bytes_received ?? 0} / {status?.file_bytes_total ?? 0}
+                      </div>
+                      {status?.last_file_saved_path ? (
+                        <div className="break-all text-[#1A2030]">
+                          已保存：{status.last_file_saved_path}
+                        </div>
+                      ) : null}
+                      {status?.file_save_dir ? (
+                        <div className="break-all">本机保存目录：{status.file_save_dir}</div>
+                      ) : null}
+                    </div>
+                    {fileBusy ? (
+                      <div className="mt-2 text-[11px] font-medium text-primary">正在发送报价…</div>
+                    ) : null}
+                  </div>
                 </div>
-                {fileBusy ? (
-                  <div className="mt-2 text-[11px] font-medium text-primary">正在发送报价…</div>
-                ) : null}
               </div>
             </div>
 
@@ -784,7 +819,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
         ) : null}
 
         {tab === 'settings' ? (
-          <div className="space-y-4 px-4 py-4 text-[13px]">
+          <div className="mx-auto grid w-full max-w-[1200px] grid-cols-1 gap-4 px-4 py-4 text-[13px] lg:grid-cols-2 lg:items-start">
             <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
               <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
                 设备
@@ -895,7 +930,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
               </div>
             </section>
 
-            <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
+            <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white lg:col-span-2">
               <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
                 运行状态
               </div>
@@ -945,44 +980,46 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
               </div>
             </section>
 
-            <PrimaryButton loading={busy} onClick={() => void onSaveSettings()} disabled={!hubOnline || busy}>
+            <PrimaryButton
+              className="lg:col-span-2"
+              loading={busy}
+              onClick={() => void onSaveSettings()}
+              disabled={!hubOnline || busy}
+            >
               保存配置
             </PrimaryButton>
             {settingsSaved ? (
-              <div className="text-center text-[12px] text-emerald-600">{settingsSaved}</div>
+              <div className="text-center text-[12px] text-emerald-600 lg:col-span-2">{settingsSaved}</div>
             ) : null}
 
-            <p className="text-center text-[11px] leading-4 text-[#6B7589]">
+            <p className="text-center text-[11px] leading-4 text-[#6B7589] lg:col-span-2">
               配置保存在本机。可用环境变量 <code>M590_CONFIG</code> 覆盖路径。
             </p>
 
             {onOpenGallery ? (
-              <PrimaryButton variant="ghost" onClick={() => onOpenGallery()}>
+              <PrimaryButton className="lg:col-span-2" variant="ghost" onClick={() => onOpenGallery()}>
                 打开设计画廊（对照 Figma）
               </PrimaryButton>
             ) : null}
           </div>
         ) : null}
+        </main>
       </div>
 
-      <nav className="flex border-t border-black/6 bg-white text-[12px] font-semibold">
-        {(
-          [
-            ['pair', '配对'],
-            ['home', '主面板'],
-            ['settings', '设置'],
-          ] as const
-        ).map(([id, label]) => (
+      <nav className="flex shrink-0 border-t border-black/6 bg-white text-[12px] font-semibold sm:hidden" aria-label="主导航">
+        {TAB_ITEMS.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
             type="button"
             className={cn(
-              'flex-1 py-3',
+              'flex min-h-12 flex-1 items-center justify-center gap-1.5 py-2.5',
               tab === id ? 'text-primary' : 'text-[#6B7589]',
             )}
+            aria-current={tab === id ? 'page' : undefined}
             onClick={() => setTab(id)}
           >
-            {label}
+            <Icon size={14} />
+            <span>{label}</span>
           </button>
         ))}
       </nav>
