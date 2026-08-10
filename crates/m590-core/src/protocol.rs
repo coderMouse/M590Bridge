@@ -3,6 +3,17 @@ use crate::{DeviceId, ProtocolError};
 /// Draft wire protocol version (frame header also carries this value).
 pub const PROTOCOL_VERSION: u8 = 2;
 
+/// Maximum decoded clipboard image area accepted by the application.
+pub const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+
+/// Maximum inline clipboard image bytes accepted by the protocol.
+pub const MAX_INLINE_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+
+/// Maximum file data carried by one `FileChunk` message.
+pub const MAX_FILE_CHUNK_BYTES: usize = 256 * 1024;
+
+const MAX_TRANSFER_ID_BYTES: usize = 128;
+
 /// Text clipboard payload carried on the wire after pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardTextPayload {
@@ -109,6 +120,17 @@ impl ClipboardImagePayload {
         if width == 0 || height == 0 {
             return Err(ProtocolError::InvalidImage("dimensions must be non-zero"));
         }
+        let pixels = (width as u64)
+            .checked_mul(height as u64)
+            .ok_or(ProtocolError::InvalidImage("dimensions overflow"))?;
+        if pixels > MAX_IMAGE_PIXELS {
+            return Err(ProtocolError::InvalidImage("dimensions exceed pixel limit"));
+        }
+        if data.len() > MAX_INLINE_IMAGE_BYTES {
+            return Err(ProtocolError::InvalidImage(
+                "image exceeds inline byte limit",
+            ));
+        }
         match encoding {
             ImageEncoding::RawRgba => {
                 let expected = (width as usize)
@@ -153,13 +175,38 @@ fn validate_file_name(file_name: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Validate the identifier used to name an in-progress file transfer.
+///
+/// The identifier is used as a single path component below the receive directory, so
+/// accepting arbitrary UTF-8 or path syntax here would make the temporary-file boundary
+/// depend on platform-specific path rules.
+pub fn validate_transfer_id(transfer_id: &str) -> Result<(), ProtocolError> {
+    if transfer_id.is_empty() {
+        return Err(ProtocolError::EmptyTransferId);
+    }
+    if transfer_id.len() > MAX_TRANSFER_ID_BYTES
+        || transfer_id == "."
+        || transfer_id == ".."
+        || !transfer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ProtocolError::InvalidFile(
+            "transfer id must be a safe single path component",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate lowercase/uppercase hex SHA-256 (empty allowed = not provided).
 pub fn validate_sha256_hex(value: &str) -> Result<(), ProtocolError> {
     if value.is_empty() {
         return Ok(());
     }
     if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(ProtocolError::InvalidFile("sha256 must be 64 hex chars or empty"));
+        return Err(ProtocolError::InvalidFile(
+            "sha256 must be 64 hex chars or empty",
+        ));
     }
     Ok(())
 }
@@ -207,9 +254,7 @@ impl FileOfferPayload {
             return Err(ProtocolError::EmptyDeviceId);
         }
         let transfer_id = transfer_id.into();
-        if transfer_id.is_empty() {
-            return Err(ProtocolError::EmptyTransferId);
-        }
+        validate_transfer_id(&transfer_id)?;
         let file_name = file_name.into();
         validate_file_name(&file_name)?;
         let sha256_hex = sha256_hex.into().to_ascii_lowercase();
@@ -237,9 +282,7 @@ impl FileRequestPayload {
             return Err(ProtocolError::EmptyDeviceId);
         }
         let transfer_id = transfer_id.into();
-        if transfer_id.is_empty() {
-            return Err(ProtocolError::EmptyTransferId);
-        }
+        validate_transfer_id(&transfer_id)?;
         Ok(Self {
             device_id,
             transfer_id,
@@ -267,11 +310,12 @@ impl FileChunkPayload {
             return Err(ProtocolError::EmptyDeviceId);
         }
         let transfer_id = transfer_id.into();
-        if transfer_id.is_empty() {
-            return Err(ProtocolError::EmptyTransferId);
-        }
+        validate_transfer_id(&transfer_id)?;
         if data.is_empty() {
             return Err(ProtocolError::InvalidFile("chunk data must not be empty"));
+        }
+        if data.len() > MAX_FILE_CHUNK_BYTES {
+            return Err(ProtocolError::InvalidFile("chunk exceeds maximum size"));
         }
         Ok(Self {
             device_id,
@@ -314,9 +358,7 @@ impl FileCompletePayload {
             return Err(ProtocolError::EmptyDeviceId);
         }
         let transfer_id = transfer_id.into();
-        if transfer_id.is_empty() {
-            return Err(ProtocolError::EmptyTransferId);
-        }
+        validate_transfer_id(&transfer_id)?;
         let sha256_hex = sha256_hex.into().to_ascii_lowercase();
         validate_sha256_hex(&sha256_hex)?;
         Ok(Self {
@@ -350,10 +392,7 @@ pub enum Message {
     /// Peer accepted pairing.
     PairAccept { device_id: DeviceId },
     /// Peer rejected pairing.
-    PairReject {
-        device_id: DeviceId,
-        reason: String,
-    },
+    PairReject { device_id: DeviceId, reason: String },
     /// Liveness probe.
     Heartbeat { seq: u64 },
     /// Liveness response.
@@ -371,14 +410,14 @@ pub enum Message {
     /// Transfer finished.
     FileComplete(FileCompletePayload),
     /// Graceful teardown.
-    Goodbye {
-        device_id: DeviceId,
-        reason: String,
-    },
+    Goodbye { device_id: DeviceId, reason: String },
 }
 
 impl Message {
-    pub fn hello(device_id: DeviceId, app_version: impl Into<String>) -> Result<Self, ProtocolError> {
+    pub fn hello(
+        device_id: DeviceId,
+        app_version: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
         validate_device(&device_id)?;
         Ok(Self::Hello {
             device_id,
@@ -514,27 +553,25 @@ mod tests {
 
     #[test]
     fn rejects_bad_image_rgba_len() {
-        let err = ClipboardImagePayload::new(DeviceId::new("a"), "c1", 1, 1, vec![0, 0, 0]).unwrap_err();
+        let err =
+            ClipboardImagePayload::new(DeviceId::new("a"), "c1", 1, 1, vec![0, 0, 0]).unwrap_err();
         assert_eq!(err, ProtocolError::InvalidImage("rgba length mismatch"));
     }
 
     #[test]
     fn accepts_tiny_image() {
-        let img = ClipboardImagePayload::new(
-            DeviceId::new("a"),
-            "c1",
-            1,
-            1,
-            vec![1, 2, 3, 255],
-        )
-        .unwrap();
+        let img =
+            ClipboardImagePayload::new(DeviceId::new("a"), "c1", 1, 1, vec![1, 2, 3, 255]).unwrap();
         assert_eq!(img.byte_len(), 4);
     }
 
     #[test]
     fn file_offer_rejects_path_separators() {
         let err = FileOfferPayload::new(DeviceId::new("a"), "t1", "a/b.txt", 1).unwrap_err();
-        assert_eq!(err, ProtocolError::InvalidFile("file name must be a basename"));
+        assert_eq!(
+            err,
+            ProtocolError::InvalidFile("file name must be a basename")
+        );
     }
 
     #[test]
@@ -542,5 +579,48 @@ mod tests {
         let offer = FileOfferPayload::new(DeviceId::new("a"), "t1", "note.txt", 12).unwrap();
         assert_eq!(offer.file_name, "note.txt");
         assert_eq!(offer.size, 12);
+    }
+
+    #[test]
+    fn file_payload_rejects_unsafe_transfer_id() {
+        let err =
+            FileOfferPayload::new(DeviceId::new("a"), "../escape", "note.txt", 1).unwrap_err();
+        assert_eq!(
+            err,
+            ProtocolError::InvalidFile("transfer id must be a safe single path component")
+        );
+        assert!(validate_transfer_id("safe-id_01.part").is_ok());
+    }
+
+    #[test]
+    fn image_payload_rejects_excessive_pixel_area() {
+        let err = ClipboardImagePayload::encoded(
+            DeviceId::new("a"),
+            "c1",
+            MAX_IMAGE_PIXELS as u32 + 1,
+            1,
+            ImageEncoding::Png,
+            vec![1],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ProtocolError::InvalidImage("dimensions exceed pixel limit")
+        );
+    }
+
+    #[test]
+    fn file_chunk_rejects_excessive_chunk_size() {
+        let err = FileChunkPayload::new(
+            DeviceId::new("a"),
+            "t1",
+            0,
+            vec![0; MAX_FILE_CHUNK_BYTES + 1],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ProtocolError::InvalidFile("chunk exceeds maximum size")
+        );
     }
 }

@@ -1,6 +1,6 @@
 # 协议草案 · M590Bridge
 
-> 状态：draft（至 **task-035** 发布硬化）
+> 状态：draft（至 **task-037** 文件通道安全边界）
 > 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；**文件 offer/request/chunk/complete（磁盘流 + SHA-256）**
 
 ## 版本
@@ -27,9 +27,11 @@
 
 最大 payload：`MAX_PAYLOAD_LEN = 16 MiB`。  
 内联图片软上限：`Session::INLINE_IMAGE_MAX_BYTES = 12 MiB`（超出则发送侧 skip）。  
+图片声明尺寸与 PNG 实际解码尺寸的像素上限：`MAX_IMAGE_PIXELS = 16 Mi`；PNG 解码还受分配上限保护，不能只按压缩字节数判断安全。
 文件软上限：`Session::MAX_FILE_BYTES = 8 GiB`（**不是**整文件内存 cap）。
 内存/base64 offer 上限：`MAX_MEMORY_FILE_BYTES = 64 MiB`。
-分片：`FILE_CHUNK_SIZE = 256 KiB`；每轮泵送最多 `OUTBOUND_CHUNKS_PER_PUMP = 4` 片。
+分片：`FILE_CHUNK_SIZE = 256 KiB`；每轮泵送最多 `OUTBOUND_CHUNKS_PER_PUMP = 4` 片；单个 `FileChunk` 不得超过 256 KiB。
+`transfer_id`：最多 128 字节，只允许 ASCII 字母、数字、`.`、`_`、`-`，且不能为 `.` / `..`；它只能作为接收临时目录下的单路径组件。
 
 ## 消息类型（msg_type）
 
@@ -64,6 +66,8 @@
 4. 接收方边收边写 **`.part`**，校验 size + SHA-256 后交给 hub `finalize_part_file` 原子落到保存目录
 5. 空文件：无 chunk，直接 Complete
 6. 失败：`FileComplete(ok=0)` 或 `InboundFileResult::Failed`；清理 `.part`
+
+安全边界（task-037）：接收端把待接收 offer 与进行中接收的总预留量限制在 `MAX_IN_FLIGHT_FILE_BYTES`（当前等于 8 GiB），创建 `.part` 前检查目标卷可用空间；同名临时文件使用不覆盖的创建方式。会话设置 `.partial` 目录时只清理直接子项中的残留 `.part` 文件。
 
 **本刀取舍**：仍走**同一 TCP 控制/数据连接**串行帧（未开独立数据连接）；靠分批 pump 避免一次把整文件 chunk 堆进 outbox，心跳/剪贴板可在 pump 间隙处理。
 **仍未做**：文件夹、OS 文件剪贴板、断点续传、多文件并行、独立数据连接。

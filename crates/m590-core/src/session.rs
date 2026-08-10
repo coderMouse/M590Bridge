@@ -1,27 +1,35 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use fs2::available_space;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    bytes_to_hex, ConnectionState, DeviceId, FileChunkPayload, FileCompletePayload,
-    FileOfferPayload, FileRequestPayload, Message, ProtocolError, SessionError, SyncState,
-    PROTOCOL_VERSION,
+    bytes_to_hex, validate_transfer_id, ConnectionState, DeviceId, FileChunkPayload,
+    FileCompletePayload, FileOfferPayload, FileRequestPayload, Message, ProtocolError,
+    SessionError, SyncState, MAX_FILE_CHUNK_BYTES, PROTOCOL_VERSION,
 };
 
 /// Max remembered clipboard content IDs for dedup (send + receive).
 const SEEN_CONTENT_ID_CAP: usize = 64;
 
 /// Outbound file chunk size (streamed disk/network buffer).
-pub const FILE_CHUNK_SIZE: usize = 256 * 1024;
+pub const FILE_CHUNK_SIZE: usize = MAX_FILE_CHUNK_BYTES;
 
 /// How many chunks to emit per [`Session::pump_outbound_file`] call (back-pressure).
 pub const OUTBOUND_CHUNKS_PER_PUMP: usize = 4;
 
 /// Soft cap for any single file transfer (path or memory). Not an in-memory ceiling.
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Aggregate byte budget reserved by inbound offers and active receives.
+///
+/// The current product model is one peer and one file sender, so keeping this equal to the
+/// single-file cap prevents several queued offers from reserving unbounded disk space while
+/// preserving the existing 8 GiB per-file boundary.
+pub const MAX_IN_FLIGHT_FILE_BYTES: u64 = MAX_FILE_BYTES;
 
 /// Max bytes accepted by the in-memory [`Session::offer_file`] / base64 path.
 pub const MAX_MEMORY_FILE_BYTES: usize = 64 * 1024 * 1024;
@@ -269,7 +277,9 @@ impl Session {
 
     /// Directory used for inbound `.part` files (created on demand).
     pub fn set_file_receive_dir(&mut self, dir: impl Into<PathBuf>) {
-        self.file_receive_dir = Some(dir.into());
+        let dir = dir.into();
+        let _ = cleanup_stale_part_files(&dir);
+        self.file_receive_dir = Some(dir);
     }
 
     pub fn state(&self) -> ConnectionState {
@@ -413,8 +423,7 @@ impl Session {
         self.remember_content_id(payload.content_id.clone());
         self.last_clipboard_content_id = Some(payload.content_id.clone());
         self.last_clipboard_text = Some(payload.text.clone());
-        self.pending_outbox
-            .push(Message::clipboard_text(payload));
+        self.pending_outbox.push(Message::clipboard_text(payload));
         self.sync_state = SyncState::Idle;
         Ok(QueueClipboardResult::Queued)
     }
@@ -484,8 +493,7 @@ impl Session {
         self.last_clipboard_image_content_id = Some(payload.content_id.clone());
         self.last_clipboard_image_fp = Some(fp);
         self.last_clipboard_image_bytes = Some(payload.data.len());
-        self.pending_outbox
-            .push(Message::clipboard_image(payload));
+        self.pending_outbox.push(Message::clipboard_image(payload));
         self.sync_state = SyncState::Idle;
         Ok(QueueClipboardResult::Queued)
     }
@@ -681,10 +689,8 @@ impl Session {
                 self.sync_state = SyncState::Idle;
                 self.outstanding_heartbeat_seq = None;
                 self.missed_heartbeat_acks = 0;
-                self.pending_outbox.push(Message::hello(
-                    self.local_device.clone(),
-                    crate::VERSION,
-                )?);
+                self.pending_outbox
+                    .push(Message::hello(self.local_device.clone(), crate::VERSION)?);
                 self.pending_outbox.push(Message::pair_request(
                     self.local_device.clone(),
                     expected_code,
@@ -986,12 +992,39 @@ impl Session {
 
     fn on_file_offer(&mut self, payload: FileOfferPayload) -> Result<(), SessionError> {
         self.ensure_connected_file_peer(&payload.device_id, "file_offer")?;
+        if let Err(err) = validate_transfer_id(&payload.transfer_id) {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: err.to_string(),
+            });
+            return Ok(());
+        }
         if payload.size > MAX_FILE_BYTES {
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: format!(
                     "offer too large: {} > limit {}",
                     payload.size, MAX_FILE_BYTES
+                ),
+            });
+            return Ok(());
+        }
+        if self.inbound_offers.contains_key(&payload.transfer_id)
+            || self.incoming_files.contains_key(&payload.transfer_id)
+        {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: "duplicate inbound transfer id".into(),
+            });
+            return Ok(());
+        }
+        let reserved = self.inbound_reserved_bytes();
+        if payload.size > MAX_IN_FLIGHT_FILE_BYTES.saturating_sub(reserved) {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: format!(
+                    "inbound reservation exceeds limit: {} + {} > {}",
+                    reserved, payload.size, MAX_IN_FLIGHT_FILE_BYTES
                 ),
             });
             return Ok(());
@@ -1015,6 +1048,7 @@ impl Session {
 
     fn on_file_request(&mut self, payload: FileRequestPayload) -> Result<(), SessionError> {
         self.ensure_connected_file_peer(&payload.device_id, "file_request")?;
+        validate_transfer_id(&payload.transfer_id)?;
         if self.active_outbound.is_some() {
             let complete = FileCompletePayload::new(
                 self.local_device.clone(),
@@ -1137,6 +1171,17 @@ impl Session {
 
     fn on_file_chunk(&mut self, payload: FileChunkPayload) -> Result<(), SessionError> {
         self.ensure_connected_file_peer(&payload.device_id, "file_chunk")?;
+        if let Err(err) = validate_transfer_id(&payload.transfer_id) {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: err.to_string(),
+            });
+            return Ok(());
+        }
+        if payload.data.len() > FILE_CHUNK_SIZE {
+            self.fail_incoming(&payload.transfer_id, "chunk exceeds maximum size".into());
+            return Ok(());
+        }
         if self.incoming_files.contains_key(&payload.transfer_id) {
             let fail_msg = {
                 let incoming = self.incoming_files.get_mut(&payload.transfer_id).unwrap();
@@ -1199,8 +1244,7 @@ impl Session {
                 }
                 incoming.hasher.update(&payload.data);
                 incoming.next_offset = payload.data.len() as u64;
-                self.incoming_files
-                    .insert(payload.transfer_id, incoming);
+                self.incoming_files.insert(payload.transfer_id, incoming);
             }
             Err(msg) => {
                 self.last_inbound_file = Some(InboundFileResult::Failed {
@@ -1214,6 +1258,13 @@ impl Session {
 
     fn on_file_complete(&mut self, payload: FileCompletePayload) -> Result<(), SessionError> {
         self.ensure_connected_file_peer(&payload.device_id, "file_complete")?;
+        if let Err(err) = validate_transfer_id(&payload.transfer_id) {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.transfer_id,
+                message: err.to_string(),
+            });
+            return Ok(());
+        }
         if !payload.ok {
             self.cleanup_incoming(&payload.transfer_id);
             self.inbound_offers.remove(&payload.transfer_id);
@@ -1331,13 +1382,38 @@ impl Session {
         offer: &InboundOffer,
         from: &DeviceId,
     ) -> Result<IncomingFile, String> {
+        validate_transfer_id(transfer_id).map_err(|err| err.to_string())?;
+        if offer.size > MAX_FILE_BYTES {
+            return Err(format!(
+                "offer exceeds file size limit: {} > {}",
+                offer.size, MAX_FILE_BYTES
+            ));
+        }
         let dir = self.receive_dir();
         fs::create_dir_all(&dir).map_err(|e| format!("create receive dir: {e}"))?;
-        let part_path = dir.join(format!("{transfer_id}.part"));
-        if part_path.exists() {
-            let _ = fs::remove_file(&part_path);
+        let reserved = self
+            .incoming_files
+            .values()
+            .map(|file| file.expected_size)
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(offer.size);
+        if reserved > MAX_IN_FLIGHT_FILE_BYTES {
+            return Err(format!(
+                "inbound reservation exceeds limit: {reserved} > {MAX_IN_FLIGHT_FILE_BYTES}"
+            ));
         }
-        let writer = File::create(&part_path).map_err(|e| format!("create part file: {e}"))?;
+        let available = available_space(&dir).map_err(|e| format!("check receive space: {e}"))?;
+        if available < reserved {
+            return Err(format!(
+                "insufficient receive space: {available}B available, {reserved}B required"
+            ));
+        }
+        let part_path = dir.join(format!("{transfer_id}.part"));
+        let writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+            .map_err(|e| format!("create part file: {e}"))?;
         Ok(IncomingFile {
             file_name: offer.file_name.clone(),
             expected_size: offer.size,
@@ -1354,6 +1430,14 @@ impl Session {
         self.file_receive_dir
             .clone()
             .unwrap_or_else(|| std::env::temp_dir().join("m590-incoming"))
+    }
+
+    fn inbound_reserved_bytes(&self) -> u64 {
+        self.inbound_offers
+            .values()
+            .map(|offer| offer.size)
+            .chain(self.incoming_files.values().map(|file| file.expected_size))
+            .fold(0u64, u64::saturating_add)
     }
 
     fn fail_incoming(&mut self, transfer_id: &str, message: String) {
@@ -1454,6 +1538,26 @@ fn image_fingerprint(width: u32, height: u32, encoding: u8, data: &[u8]) -> u64 
     encoding.hash(&mut hasher);
     data.hash(&mut hasher);
     hasher.finish()
+}
+
+fn cleanup_stale_part_files(dir: &Path) -> std::io::Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let is_part = path
+            .extension()
+            .is_some_and(|extension| extension == "part");
+        if is_part && entry.file_type()?.is_file() {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1574,9 +1678,7 @@ mod tests {
         let hb = session.take_outbox();
         assert!(matches!(hb.as_slice(), [Message::Heartbeat { seq: 1 }]));
 
-        let queued = session
-            .queue_clipboard_text("c1", "hello from a")
-            .unwrap();
+        let queued = session.queue_clipboard_text("c1", "hello from a").unwrap();
         assert_eq!(queued, QueueClipboardResult::Queued);
         let clip = session.take_outbox();
         assert!(matches!(
@@ -1633,7 +1735,10 @@ mod tests {
             host.take_inbound_clipboard(),
             Some(InboundClipboardResult::DuplicateContentId)
         );
-        assert_eq!(host.snapshot().last_clipboard_text.as_deref(), Some("hello"));
+        assert_eq!(
+            host.snapshot().last_clipboard_text.as_deref(),
+            Some("hello")
+        );
 
         // Outbound duplicate id
         assert_eq!(
@@ -1704,6 +1809,139 @@ mod tests {
     }
 
     #[test]
+    fn receive_dir_cleanup_removes_only_stale_part_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "m590-stale-part-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("old-transfer.part");
+        let keep = dir.join("keep.txt");
+        fs::write(&stale, b"stale").unwrap();
+        fs::write(&keep, b"keep").unwrap();
+
+        let mut session = Session::new(DeviceId::new("a")).unwrap();
+        session.set_file_receive_dir(&dir);
+
+        assert!(!stale.exists());
+        assert_eq!(fs::read(&keep).unwrap(), b"keep");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unsafe_remote_transfer_id_never_reaches_receive_path() {
+        let (mut host, _joiner) = pair_host_joiner();
+        let dir = std::env::temp_dir().join(format!(
+            "m590-transfer-id-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        host.set_file_receive_dir(&dir);
+
+        let outside = dir.parent().unwrap().join("escape.part");
+        let _ = fs::remove_file(&outside);
+        host.handle(SessionEvent::Message(Message::file_offer(
+            FileOfferPayload {
+                device_id: DeviceId::new("joiner"),
+                transfer_id: "../escape".into(),
+                file_name: "note.txt".into(),
+                size: 1,
+                sha256_hex: String::new(),
+            },
+        )))
+        .unwrap();
+
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Failed { message, .. })
+                if message.contains("safe single path component")
+        ));
+        assert!(!outside.exists());
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inbound_reservation_rejects_more_than_one_file_cap() {
+        let (mut host, _joiner) = pair_host_joiner();
+        assert!(matches!(
+            host.handle(SessionEvent::Message(Message::file_offer(
+                FileOfferPayload::new(
+                    DeviceId::new("joiner"),
+                    "max-transfer",
+                    "large.bin",
+                    MAX_FILE_BYTES,
+                )
+                .unwrap(),
+            ))),
+            Ok(())
+        ));
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Offered { .. })
+        ));
+
+        host.handle(SessionEvent::Message(Message::file_offer(
+            FileOfferPayload::new(DeviceId::new("joiner"), "over-cap", "tiny.bin", 1).unwrap(),
+        )))
+        .unwrap();
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Failed { message, .. })
+                if message.contains("inbound reservation exceeds limit")
+        ));
+    }
+
+    #[test]
+    fn existing_part_file_is_not_overwritten() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        let dir = std::env::temp_dir().join(format!(
+            "m590-existing-part-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("collision.part");
+        fs::write(&part, b"keep-existing").unwrap();
+        host.set_file_receive_dir(&dir);
+        // Recreate the collision after setter cleanup, simulating a file created by another process.
+        fs::write(&part, b"keep-existing").unwrap();
+
+        joiner
+            .offer_file("collision", "note.txt", b"new-data".to_vec())
+            .unwrap();
+        host.handle(SessionEvent::Message(joiner.take_outbox().pop().unwrap()))
+            .unwrap();
+        let _ = host.take_inbound_file();
+        host.request_file("collision").unwrap();
+        joiner
+            .handle(SessionEvent::Message(host.take_outbox().pop().unwrap()))
+            .unwrap();
+        let chunk = joiner
+            .take_outbox()
+            .into_iter()
+            .find(|message| matches!(message, Message::FileChunk(_)))
+            .unwrap();
+        host.handle(SessionEvent::Message(chunk)).unwrap();
+
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Failed { message, .. })
+                if message.contains("create part file")
+        ));
+        assert_eq!(fs::read(&part).unwrap(), b"keep-existing");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn snapshot_exposes_protocol_version() {
         let session = Session::new(DeviceId::new("a")).unwrap();
         assert_eq!(session.snapshot().protocol_version, PROTOCOL_VERSION);
@@ -1738,9 +1976,7 @@ mod tests {
             QueueClipboardResult::DuplicateContentId
         );
         assert_eq!(
-            joiner
-                .queue_clipboard_image("img-2", 1, 1, rgba)
-                .unwrap(),
+            joiner.queue_clipboard_image("img-2", 1, 1, rgba).unwrap(),
             QueueClipboardResult::UnchangedImage
         );
     }
@@ -1823,7 +2059,9 @@ mod tests {
     fn file_empty_completes_without_chunks() {
         let (mut host, mut joiner) = pair_host_joiner();
         assert_eq!(
-            joiner.offer_file("empty-1", "empty.txt", Vec::new()).unwrap(),
+            joiner
+                .offer_file("empty-1", "empty.txt", Vec::new())
+                .unwrap(),
             QueueFileResult::Queued
         );
         let offer_msg = joiner.take_outbox().pop().unwrap();
@@ -2008,5 +2246,4 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
     }
-
 }

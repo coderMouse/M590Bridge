@@ -10,7 +10,8 @@
 
 use m590_core::{
     ClipboardImagePayload, ClipboardTextPayload, DeviceId, FileChunkPayload, FileCompletePayload,
-    FileOfferPayload, FileRequestPayload, ImageEncoding, Message, PROTOCOL_VERSION,
+    FileOfferPayload, FileRequestPayload, ImageEncoding, Message, MAX_FILE_CHUNK_BYTES,
+    MAX_INLINE_IMAGE_BYTES, PROTOCOL_VERSION,
 };
 
 /// Wire magic bytes.
@@ -287,17 +288,19 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
                 })
             })?;
             payload = &payload[1..];
-            let data = read_bytes(&mut payload)?;
+            let data = read_bytes(&mut payload, MAX_INLINE_IMAGE_BYTES)?;
             ensure_empty(payload)?;
             let body = ClipboardImagePayload::encoded(
                 device_id, content_id, width, height, encoding, data,
             )
-            .map_err(|e| FrameError::InvalidField(match e {
-                m590_core::ProtocolError::EmptyDeviceId => "device_id",
-                m590_core::ProtocolError::EmptyContentId => "content_id",
-                m590_core::ProtocolError::InvalidImage(reason) => reason,
-                _ => "image",
-            }))?;
+            .map_err(|e| {
+                FrameError::InvalidField(match e {
+                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                    m590_core::ProtocolError::EmptyContentId => "content_id",
+                    m590_core::ProtocolError::InvalidImage(reason) => reason,
+                    _ => "image",
+                })
+            })?;
             Ok(Message::ClipboardImage(body))
         }
         TYPE_FILE_OFFER => {
@@ -307,21 +310,16 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
             let size = read_u64(&mut payload)?;
             let sha256_hex = read_string(&mut payload)?;
             ensure_empty(payload)?;
-            let body = FileOfferPayload::with_sha256(
-                device_id,
-                transfer_id,
-                file_name,
-                size,
-                sha256_hex,
-            )
-            .map_err(|e| {
-                FrameError::InvalidField(match e {
-                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
-                    m590_core::ProtocolError::EmptyTransferId => "transfer_id",
-                    m590_core::ProtocolError::InvalidFile(_) => "file_offer",
-                    _ => "file_offer",
-                })
-            })?;
+            let body =
+                FileOfferPayload::with_sha256(device_id, transfer_id, file_name, size, sha256_hex)
+                    .map_err(|e| {
+                        FrameError::InvalidField(match e {
+                            m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                            m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                            m590_core::ProtocolError::InvalidFile(_) => "file_offer",
+                            _ => "file_offer",
+                        })
+                    })?;
             Ok(Message::FileOffer(body))
         }
         TYPE_FILE_REQUEST => {
@@ -341,16 +339,17 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
             let device_id = DeviceId::new(read_string(&mut payload)?);
             let transfer_id = read_string(&mut payload)?;
             let offset = read_u64(&mut payload)?;
-            let data = read_bytes(&mut payload)?;
+            let data = read_bytes(&mut payload, MAX_FILE_CHUNK_BYTES)?;
             ensure_empty(payload)?;
-            let body = FileChunkPayload::new(device_id, transfer_id, offset, data).map_err(|e| {
-                FrameError::InvalidField(match e {
-                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
-                    m590_core::ProtocolError::EmptyTransferId => "transfer_id",
-                    m590_core::ProtocolError::InvalidFile(reason) => reason,
-                    _ => "file_chunk",
-                })
-            })?;
+            let body =
+                FileChunkPayload::new(device_id, transfer_id, offset, data).map_err(|e| {
+                    FrameError::InvalidField(match e {
+                        m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                        m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                        m590_core::ProtocolError::InvalidFile(reason) => reason,
+                        _ => "file_chunk",
+                    })
+                })?;
             Ok(Message::FileChunk(body))
         }
         TYPE_FILE_COMPLETE => {
@@ -364,21 +363,16 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
             let message = read_string(&mut payload)?;
             let sha256_hex = read_string(&mut payload)?;
             ensure_empty(payload)?;
-            let body = FileCompletePayload::with_sha256(
-                device_id,
-                transfer_id,
-                ok,
-                message,
-                sha256_hex,
-            )
-            .map_err(|e| {
-                FrameError::InvalidField(match e {
-                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
-                    m590_core::ProtocolError::EmptyTransferId => "transfer_id",
-                    m590_core::ProtocolError::InvalidFile(_) => "file_complete",
-                    _ => "file_complete",
-                })
-            })?;
+            let body =
+                FileCompletePayload::with_sha256(device_id, transfer_id, ok, message, sha256_hex)
+                    .map_err(|e| {
+                    FrameError::InvalidField(match e {
+                        m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                        m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                        m590_core::ProtocolError::InvalidFile(_) => "file_complete",
+                        _ => "file_complete",
+                    })
+                })?;
             Ok(Message::FileComplete(body))
         }
         TYPE_GOODBYE => {
@@ -436,12 +430,15 @@ fn write_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), FrameError> {
     Ok(())
 }
 
-fn read_bytes(input: &mut &[u8]) -> Result<Vec<u8>, FrameError> {
+fn read_bytes(input: &mut &[u8], max_len: usize) -> Result<Vec<u8>, FrameError> {
     if input.len() < 4 {
         return Err(FrameError::TruncatedPayload);
     }
     let len = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
     *input = &input[4..];
+    if len > max_len {
+        return Err(FrameError::PayloadTooLarge(len));
+    }
     if input.len() < len {
         return Err(FrameError::TruncatedPayload);
     }
@@ -460,7 +457,6 @@ fn read_u32(input: &mut &[u8]) -> Result<u32, FrameError> {
     Ok(u32::from_be_bytes(buf))
 }
 
-
 fn ensure_empty(input: &[u8]) -> Result<(), FrameError> {
     if input.is_empty() {
         Ok(())
@@ -468,7 +464,6 @@ fn ensure_empty(input: &[u8]) -> Result<(), FrameError> {
         Err(FrameError::InvalidField("trailing_payload_bytes"))
     }
 }
-
 
 /// Try to decode one complete frame from the front of `data`.
 ///
@@ -521,13 +516,11 @@ mod tests {
 
     #[test]
     fn roundtrip_unicode_clipboard() {
-        let msg = Message::clipboard_text(
-            ClipboardTextPayload {
-                device_id: DeviceId::new("dev"),
-                content_id: "c".into(),
-                text: "剪贴板 ✅".into(),
-            },
-        );
+        let msg = Message::clipboard_text(ClipboardTextPayload {
+            device_id: DeviceId::new("dev"),
+            content_id: "c".into(),
+            text: "剪贴板 ✅".into(),
+        });
         let decoded = decode_frame(&encode_frame(&msg).unwrap()).unwrap();
         assert_eq!(decoded, msg);
     }
@@ -552,7 +545,10 @@ mod tests {
     fn unknown_message_type_mentions_upgrade() {
         let msg = FrameError::UnknownMessageType(11).to_string();
         assert!(msg.contains("11"), "{msg}");
-        assert!(msg.contains("protocol mismatch") || msg.contains("upgrade"), "{msg}");
+        assert!(
+            msg.contains("protocol mismatch") || msg.contains("upgrade"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -576,5 +572,34 @@ mod tests {
             let decoded = decode_frame(&encode_frame(&msg).unwrap()).unwrap();
             assert_eq!(decoded, msg);
         }
+    }
+
+    #[test]
+    fn rejects_unsafe_transfer_id_during_decode() {
+        let msg = Message::file_offer(FileOfferPayload {
+            device_id: DeviceId::new("a"),
+            transfer_id: "../escape".into(),
+            file_name: "a.txt".into(),
+            size: 1,
+            sha256_hex: String::new(),
+        });
+        assert_eq!(
+            decode_frame(&encode_frame(&msg).unwrap()).unwrap_err(),
+            FrameError::InvalidField("file_offer")
+        );
+    }
+
+    #[test]
+    fn rejects_file_chunk_above_protocol_chunk_limit_before_copy() {
+        let msg = Message::file_chunk(FileChunkPayload {
+            device_id: DeviceId::new("a"),
+            transfer_id: "t1".into(),
+            offset: 0,
+            data: vec![0; MAX_FILE_CHUNK_BYTES + 1],
+        });
+        assert_eq!(
+            decode_frame(&encode_frame(&msg).unwrap()).unwrap_err(),
+            FrameError::PayloadTooLarge(MAX_FILE_CHUNK_BYTES + 1)
+        );
     }
 }

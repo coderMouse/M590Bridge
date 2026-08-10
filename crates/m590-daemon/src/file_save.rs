@@ -137,14 +137,18 @@ fn split_name(name: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("m590-inbox-{nanos}"));
+        let seq = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("m590-inbox-{nanos}-{seq}"));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

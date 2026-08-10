@@ -12,9 +12,13 @@
 //! - Backend label is always [`ClipboardBackend::Windows`]
 //! - Open failures surface as [`ClipboardError::Backend`] / [`ClipboardError::NoDisplay`]
 
+use std::io::Cursor;
+
+use image::ImageDecoder;
+
 mod error;
-mod image_file;
 mod file_paths;
+mod image_file;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod arboard_text;
@@ -26,8 +30,8 @@ mod linux;
 mod windows;
 
 pub use error::ClipboardError;
-pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
 pub use file_paths::{first_regular_file, read_file_for_offer, regular_file_from_text};
+pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
 
 /// Which OS/display backend is selected or available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +76,7 @@ impl ImageClipboard {
                 "image dimensions must be non-zero".into(),
             ));
         }
+        validate_image_dimensions(width, height)?;
         let expected = (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(4))
@@ -124,13 +129,27 @@ impl ImageClipboard {
         encoding: m590_core::ImageEncoding,
         data: Vec<u8>,
     ) -> Result<Self, ClipboardError> {
+        validate_image_dimensions(width, height)?;
         match encoding {
             m590_core::ImageEncoding::RawRgba => Self::from_rgba(width, height, data),
             m590_core::ImageEncoding::Png => {
-                let dyn_img = image::load_from_memory(&data)
+                // Read PNG metadata with the decoder limits before allocating the decoded image.
+                let metadata_decoder =
+                    image::codecs::png::PngDecoder::new(Cursor::new(data.as_slice()))
+                        .map_err(|e| ClipboardError::Backend(format!("png metadata: {e}")))?;
+                let (decoded_width, decoded_height) = metadata_decoder.dimensions();
+                validate_image_dimensions(decoded_width, decoded_height)?;
+
+                let mut reader = image::ImageReader::with_format(
+                    Cursor::new(data.as_slice()),
+                    image::ImageFormat::Png,
+                );
+                reader.limits(image_decode_limits());
+                let dyn_img = reader
+                    .decode()
                     .map_err(|e| ClipboardError::Backend(format!("png decode: {e}")))?;
                 let rgba = dyn_img.to_rgba8();
-                // Trust decoded dimensions; peer width/height are advisory.
+                validate_image_dimensions(rgba.width(), rgba.height())?;
                 Self::from_rgba(rgba.width(), rgba.height(), rgba.into_raw())
             }
         }
@@ -163,6 +182,25 @@ impl ImageClipboard {
             Err(e) => return Err(e),
         }
     }
+}
+
+fn validate_image_dimensions(width: u32, height: u32) -> Result<(), ClipboardError> {
+    let pixels = (width as u64)
+        .checked_mul(height as u64)
+        .ok_or_else(|| ClipboardError::Backend("image dimensions overflow".into()))?;
+    if pixels > m590_core::MAX_IMAGE_PIXELS {
+        return Err(ClipboardError::Backend(format!(
+            "image dimensions exceed pixel limit: {pixels} > {}",
+            m590_core::MAX_IMAGE_PIXELS
+        )));
+    }
+    Ok(())
+}
+
+fn image_decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(m590_core::MAX_IMAGE_PIXELS.saturating_mul(4));
+    limits
 }
 
 /// Trait boundary for clipboard backends.
@@ -210,9 +248,7 @@ pub trait ClipboardService {
     ///
     /// Returns `Ok(Some(paths))` when the list changed (including to empty).
     /// Callers typically care about non-empty image paths.
-    fn poll_file_list_change(
-        &mut self,
-    ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+    fn poll_file_list_change(&mut self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
         let _ = self;
         Ok(None)
     }
@@ -299,9 +335,7 @@ impl ClipboardService for NullClipboard {
         Ok(self.files.clone())
     }
 
-    fn poll_file_list_change(
-        &mut self,
-    ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+    fn poll_file_list_change(&mut self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
         if self.files != self.last_files {
             self.last_files = self.files.clone();
             Ok(Some(self.files.clone()))
@@ -461,9 +495,7 @@ impl ClipboardService for PlatformClipboard {
         }
     }
 
-    fn poll_file_list_change(
-        &mut self,
-    ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+    fn poll_file_list_change(&mut self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             self.inner.poll_file_list_change()
@@ -551,7 +583,10 @@ mod tests {
         assert_eq!(clip.read_text().unwrap().as_deref(), Some("hello"));
         assert_eq!(clip.poll_text_change().unwrap(), None);
         clip.text = Some("external".into());
-        assert_eq!(clip.poll_text_change().unwrap().as_deref(), Some("external"));
+        assert_eq!(
+            clip.poll_text_change().unwrap().as_deref(),
+            Some("external")
+        );
         assert_eq!(clip.poll_text_change().unwrap(), None);
 
         let img = ImageClipboard::from_rgba(1, 1, vec![1, 2, 3, 255]).unwrap();
@@ -598,6 +633,37 @@ mod tests {
         let back = ImageClipboard::from_wire(200, 100, enc, data).unwrap();
         assert_eq!((back.width, back.height), (200, 100));
         assert_eq!(back.rgba.len(), raw_len);
+    }
+
+    #[test]
+    fn rejects_png_with_excessive_decoded_dimensions() {
+        let image = ImageClipboard::from_rgba(1, 1, vec![1, 2, 3, 255]).unwrap();
+        let (_, mut png) = image.prepare_inline(12 * 1024 * 1024).unwrap();
+
+        // Change the IHDR dimensions while keeping the test fixture structurally valid.
+        let width = m590_core::MAX_IMAGE_PIXELS as u32 + 1;
+        png[16..20].copy_from_slice(&width.to_be_bytes());
+        png[20..24].copy_from_slice(&1u32.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+
+        let err = ImageClipboard::from_wire(1, 1, m590_core::ImageEncoding::Png, png).unwrap_err();
+        assert!(err.to_string().contains("pixel limit"), "{err}");
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb88320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
     }
 
     #[test]
