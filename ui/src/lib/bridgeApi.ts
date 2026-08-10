@@ -301,10 +301,27 @@ export async function pickSendFileNative(): Promise<string | null> {
   return path ?? null
 }
 
+export async function fetchAutostartEnabled(): Promise<boolean> {
+  const invoke = getTauriInvoke()
+  if (!invoke) return false
+  return (await invoke('autostart_enabled')) === true
+}
+
+export async function setAutostartEnabled(enabled: boolean): Promise<boolean> {
+  const invoke = getTauriInvoke()
+  if (!invoke) return false
+  return (await invoke('set_autostart', { enabled })) === true
+}
+
 export function isTauriShell(): boolean {
   const w = window as unknown as {
     __TAURI_INTERNALS__?: unknown
     __TAURI__?: unknown
   }
   return Boolean(w.__TAURI_INTERNALS__ || w.__TAURI__)
+}
+
+export function isLinuxTauriShell(): boolean {
+  if (!isTauriShell() || typeof navigator === 'undefined') return false
+  return /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent)
 }

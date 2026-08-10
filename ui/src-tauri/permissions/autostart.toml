@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-autostart"
+description = "Allow the main desktop WebView to read and update Linux user autostart."
+commands.allow = ["autostart_enabled", "set_autostart"]

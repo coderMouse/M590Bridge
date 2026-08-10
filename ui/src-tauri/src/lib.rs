@@ -1,5 +1,12 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
@@ -7,6 +14,12 @@ use tauri::{
 };
 
 const HUB_API: &str = "127.0.0.1:5910";
+
+#[cfg(target_os = "linux")]
+const AUTOSTART_DESKTOP_FILE: &str = "M590Bridge.desktop";
+
+#[cfg(target_os = "linux")]
+static AUTOSTART_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct HubAuthToken(String);
 
@@ -32,6 +45,114 @@ fn desktop_dir() -> Option<PathBuf> {
         return Some(home);
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn xdg_config_home() -> Result<PathBuf, String> {
+    if let Some(value) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+    }
+
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is unavailable; cannot resolve XDG config directory".to_string())?;
+    if !home.is_absolute() {
+        return Err("HOME must be an absolute path".into());
+    }
+    Ok(home.join(".config"))
+}
+
+#[cfg(target_os = "linux")]
+fn autostart_path_from_config_home(config_home: &Path) -> PathBuf {
+    config_home.join("autostart").join(AUTOSTART_DESKTOP_FILE)
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_exec_value(executable: &Path) -> Result<String, String> {
+    if !executable.is_absolute() {
+        return Err("autostart executable path must be absolute".into());
+    }
+    let raw = executable
+        .to_str()
+        .ok_or_else(|| "autostart executable path must be valid UTF-8".to_string())?;
+    if raw.chars().any(char::is_control) {
+        return Err("autostart executable path contains control characters".into());
+    }
+
+    let mut escaped = String::with_capacity(raw.len() + 2);
+    escaped.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '"' | '`' | '$' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            '%' => escaped.push_str("%%"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    Ok(escaped)
+}
+
+#[cfg(target_os = "linux")]
+fn autostart_entry(executable: &Path) -> Result<String, String> {
+    let exec = desktop_exec_value(executable)?;
+    Ok(format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=M590Bridge\nComment=Start M590Bridge after login\nExec={exec}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn autostart_enabled_at(config_home: &Path) -> bool {
+    autostart_path_from_config_home(config_home).is_file()
+}
+
+#[cfg(target_os = "linux")]
+fn set_autostart_at(config_home: &Path, executable: &Path, enabled: bool) -> Result<bool, String> {
+    let path = autostart_path_from_config_home(config_home);
+    if !enabled {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("remove {}: {err}", path.display())),
+        }
+        return Ok(false);
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "autostart path has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    let contents = autostart_entry(executable)?;
+    let sequence = AUTOSTART_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".{AUTOSTART_DESKTOP_FILE}.tmp-{}-{sequence}",
+        std::process::id()
+    ));
+    let write_result = (|| -> Result<(), String> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|err| format!("create {}: {err}", temp_path.display()))?;
+        temp.write_all(contents.as_bytes())
+            .map_err(|err| format!("write {}: {err}", temp_path.display()))?;
+        temp.sync_all()
+            .map_err(|err| format!("sync {}: {err}", temp_path.display()))?;
+        fs::rename(&temp_path, &path)
+            .map_err(|err| format!("replace {}: {err}", path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result?;
+    Ok(autostart_enabled_at(config_home))
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -102,13 +223,45 @@ fn hub_auth_token(token: tauri::State<'_, HubAuthToken>) -> String {
     token.0.clone()
 }
 
+#[tauri::command]
+fn autostart_enabled() -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(autostart_enabled_at(&xdg_config_home()?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let executable =
+            std::env::current_exe().map_err(|err| format!("resolve current executable: {err}"))?;
+        set_autostart_at(&xdg_config_home()?, &executable, enabled)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = enabled;
+        Ok(false)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let hub_token = m590_daemon::hub::generate_hub_token().expect("generate hub auth token");
     let hub_token_for_setup = hub_token.clone();
     tauri::Builder::default()
         .manage(HubAuthToken(hub_token))
-        .invoke_handler(tauri::generate_handler![pick_send_file, hub_auth_token])
+        .invoke_handler(tauri::generate_handler![
+            pick_send_file,
+            hub_auth_token,
+            autostart_enabled,
+            set_autostart
+        ])
         .setup(move |app| {
             let hub_token = hub_token_for_setup.clone();
             std::thread::Builder::new()
@@ -183,9 +336,9 @@ pub fn run() {
                 let _ = window.minimize();
             }
             WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
-                if let Some(path) = paths.into_iter().find(|p| p.is_file()) {
+                if let Some(path) = paths.iter().find(|p| p.is_file()) {
                     let token = window.state::<HubAuthToken>();
-                    if let Err(err) = post_hub_send_file(&path, &token.0) {
+                    if let Err(err) = post_hub_send_file(path, &token.0) {
                         eprintln!("drop_send_file_error={err}");
                     } else {
                         eprintln!("drop_send_file_ok={}", path.display());
@@ -196,4 +349,52 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod autostart_tests {
+    use super::*;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_config_home() -> PathBuf {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "m590-autostart-test-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn autostart_entry_roundtrips_in_xdg_directory() {
+        let config_home = temp_config_home();
+        let executable = Path::new("/opt/M590 Bridge/m590-ui");
+
+        assert!(!autostart_enabled_at(&config_home));
+        assert!(set_autostart_at(&config_home, executable, true).unwrap());
+
+        let path = autostart_path_from_config_home(&config_home);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("Type=Application\n"));
+        assert!(contents.contains("Exec=\"/opt/M590 Bridge/m590-ui\"\n"));
+        assert!(contents.contains("X-GNOME-Autostart-enabled=true\n"));
+        assert!(autostart_enabled_at(&config_home));
+
+        assert!(!set_autostart_at(&config_home, executable, false).unwrap());
+        assert!(!path.exists());
+        assert!(!set_autostart_at(&config_home, executable, false).unwrap());
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn desktop_exec_escapes_field_codes_and_shell_characters() {
+        let value = desktop_exec_value(Path::new("/opt/100%/$bridge`/m590-ui")).unwrap();
+        assert_eq!(value, "\"/opt/100%%/\\$bridge\\`/m590-ui\"");
+    }
+
+    #[test]
+    fn desktop_exec_rejects_relative_or_control_paths() {
+        assert!(desktop_exec_value(Path::new("m590-ui")).is_err());
+        assert!(desktop_exec_value(Path::new("/opt/m590-ui\nother")).is_err());
+    }
 }

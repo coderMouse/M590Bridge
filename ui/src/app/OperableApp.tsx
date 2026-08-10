@@ -9,6 +9,7 @@ import { Toggle } from '@/components/Toggle'
 import { cn } from '@/lib/cn'
 import {
   bytesToBase64,
+  fetchAutostartEnabled,
   fetchConfig,
   fetchDiscover,
   postDiscoverRefresh,
@@ -27,6 +28,8 @@ import {
   postSendFile,
   postSendFileBytes,
   pickSendFileNative,
+  setAutostartEnabled,
+  isLinuxTauriShell,
   isTauriShell,
   randomPairCode,
   type DiscoveredPeer,
@@ -62,6 +65,8 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const [pushText, setPushText] = useState('')
   const [autoSync, setAutoSync] = useState(true)
   const [autoReconnect, setAutoReconnect] = useState(true)
+  const [autostartEnabled, setAutostartEnabledState] = useState(false)
+  const [autostartBusy, setAutostartBusy] = useState(false)
   const [prefsLoaded, setPrefsLoaded] = useState(false)
   const [settingsDeviceId, setSettingsDeviceId] = useState('')
   const [settingsPort, setSettingsPort] = useState(5901)
@@ -78,6 +83,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const apiBase = useMemo(() => getApiBase(), [])
+  const autostartSupported = useMemo(() => isLinuxTauriShell(), [])
 
   const refresh = useCallback(async () => {
     const ok = await fetchHealth()
@@ -159,6 +165,21 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
       }
     })()
   }, [hubOnline, prefsLoaded])
+
+  useEffect(() => {
+    if (!autostartSupported) return
+    let cancelled = false
+    void fetchAutostartEnabled()
+      .then((enabled) => {
+        if (!cancelled) setAutostartEnabledState(enabled)
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [autostartSupported])
 
   const connLabel: ConnectionStatus = status
     ? (phaseToStatusLabel(status.phase, status.connection) as ConnectionStatus)
@@ -326,6 +347,28 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setAutoReconnect(!next)
+    }
+  }
+
+  async function onToggleAutostart(next: boolean) {
+    if (autostartBusy) return
+    const previous = autostartEnabled
+    setAutostartEnabledState(next)
+    setAutostartBusy(true)
+    setSettingsSaved(null)
+    setError(null)
+    try {
+      const enabled = await setAutostartEnabled(next)
+      setAutostartEnabledState(enabled)
+      if (enabled !== next) {
+        throw new Error('当前平台不支持登录自启')
+      }
+      setSettingsSaved(enabled ? '登录自启已开启' : '登录自启已关闭')
+    } catch (e) {
+      setAutostartEnabledState(previous)
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setAutostartBusy(false)
     }
   }
 
@@ -929,6 +972,26 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                 ) : null}
               </div>
             </section>
+
+            {autostartSupported ? (
+              <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white">
+                <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">
+                  启动
+                </div>
+                <div
+                  className={cn(
+                    'px-4 py-3',
+                    autostartBusy && 'pointer-events-none opacity-60',
+                  )}
+                >
+                  <Toggle
+                    label="登录时自动启动"
+                    checked={autostartEnabled}
+                    onChange={(next) => void onToggleAutostart(next)}
+                  />
+                </div>
+              </section>
+            ) : null}
 
             <section className="overflow-hidden rounded-[12px] border border-black/8 bg-white lg:col-span-2">
               <div className="border-b border-black/5 px-4 py-3 text-[12px] font-semibold text-[#6B7589] uppercase tracking-wide">

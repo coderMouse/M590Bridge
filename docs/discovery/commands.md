@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-07（task-035）
+> 更新日期：2026-08-10（task-038）
 
 ## 桌面（推荐）
 
@@ -48,7 +48,14 @@ sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
 sudo apt remove m590-bridge
 ```
 
-产物在 `target/release/bundle/deb/`，不提交仓库。当前仅验证 `amd64`、未签名、不含开机自启。
+产物在 `target/release/bundle/deb/`，不提交仓库。当前仅验证 `amd64`、未签名；包本身不写系统级自启入口。
+
+### Linux 用户登录自启（task-038）
+
+- 设置页「启动」→「登录时自动启动」会为当前用户创建 XDG autostart 入口。
+- 默认入口：`~/.config/autostart/M590Bridge.desktop`；设置了绝对路径 `XDG_CONFIG_HOME` 时改用 `$XDG_CONFIG_HOME/autostart/M590Bridge.desktop`。
+- 开启不需要 root；`Exec` 指向当前运行的 `m590-ui`，安装包运行时通常为 `/usr/bin/m590-ui`。
+- 关闭开关会删除入口。`apt remove` 不会也不应遍历各用户主目录；卸载前先关闭开关，或卸载后手工删除上述文件。
 
 ## Rust 测试 / CLI
 
@@ -77,6 +84,7 @@ cargo run -p m590-clipboard --example probe_clipboard
 - 文件：`FileOffer/Request/Chunk/Complete` + 路径流式 + SHA-256 + hub 落盘 + UI 发送/进度（软上限 8GiB；`send_file_bytes` 仍限内存）
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
+- **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart，不需要 root（task-038）
 
 ## 文件 API（task-021+）
 
@@ -123,7 +131,7 @@ UI 加入页「局域网设备」旁有刷新图标。
 ## 未做
 
 - 文件夹 / OS 文件剪贴板 / 断点续传 / 独立数据连接
-- Windows 安装包 / Linux 与 Windows 开机自启
+- Windows 安装包 / Windows 开机自启
 - 设置页「发现方式」开关  
 - （已取消）019A  
 
