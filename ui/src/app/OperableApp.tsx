@@ -31,7 +31,7 @@ import {
   pickSendFileNative,
   resolveHubOfflineReason,
   setAutostartEnabled,
-  isLinuxTauriShell,
+  isDesktopAutostartShell,
   isTauriShell,
   randomPairCode,
   type DiscoveredPeer,
@@ -89,7 +89,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
 
   const apiBase = useMemo(() => getApiBase(), [])
   const tauriShell = useMemo(() => isTauriShell(), [])
-  const autostartSupported = useMemo(() => isLinuxTauriShell(), [])
+  const autostartSupported = useMemo(() => isDesktopAutostartShell(), [])
 
   const refresh = useCallback(async () => {
     const reason = await resolveHubOfflineReason()

@@ -66,7 +66,7 @@ cargo build -p m590-ui --release --features custom-protocol
 - `cargo clippy -p m590-ui --lib --no-deps --features custom-protocol -- -D warnings`：通过。
 - `cd ui && npm run build`：通过。
 - `cargo build -p m590-ui --release --features custom-protocol`：通过。
-- GUI 实机需用户确认横幅消失。
+- GUI 实机：用户于 2026-08-11 确认通过，「API 已连接」且离线横幅消失。
 
 ## 文档影响检查
 
@@ -79,5 +79,4 @@ cargo build -p m590-ui --release --features custom-protocol
 
 ## 下一步
 
-- 用户本机验证 API 已连接。
-- 然后 Windows 安装包/自启。
+- task-042：Windows NSIS 安装包与用户登录自启。

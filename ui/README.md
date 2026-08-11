@@ -11,8 +11,8 @@ npm run desktop:standalone
 ```
 
 该命令先构建前端，再以 release + `custom-protocol` 运行 Tauri；UI 和 Hub 都内嵌，
-不需要浏览器或 `127.0.0.1:5173`。从这个版本开启 Linux 登录自启时，入口会指向
-`target/release/m590-ui`。
+不需要浏览器或 `127.0.0.1:5173`。Linux 登录自启写 XDG autostart；Windows 登录
+自启写当前用户 HKCU Run。两者都指向当前运行的 release/安装版程序。
 
 ### 2. 桌面开发壳
 
@@ -46,6 +46,7 @@ cd ui && npm run dev
 | `npm run desktop:dev` | Tauri 开发 |
 | `npm run desktop:standalone` | 构建并运行不依赖开发服务器的 release 桌面端 |
 | `npm run desktop:build` | Tauri 构建 |
+| `npm run desktop:build:windows` | 在 Windows 上构建当前用户 NSIS `.exe` |
 
 ## Ubuntu / Debian 安装包
 
@@ -79,6 +80,24 @@ sudo apt remove m590-bridge
 
 `target/` 是忽略的本机构建产物，不提交仓库。当前安装包未签名；包本身不预设开机
 自启，安装后可在设置页为当前用户开启。
+
+## Windows 10 NSIS 安装包
+
+构建机需要 Node.js 22 LTS、Rust stable MSVC、Visual Studio Build Tools 2022
+（Desktop development with C++ + Windows SDK）。在 Windows PowerShell 执行：
+
+```powershell
+cd ui
+npm ci
+npm run build
+cargo test -p m590-ui --lib
+npm run desktop:build:windows
+Get-ChildItem ..\target\release\bundle\nsis\*.exe
+```
+
+安装包采用当前用户模式，不要求管理员权限。设置页「登录时自动启动」写入 HKCU Run；
+关闭开关或卸载会删除 `M590Bridge` 值。安装包当前未签名，SmartScreen 可能提示未知
+发布者。完整打包、安装、注销登录和卸载流程见 `docs/tasks/task-042.md`。
 
 ## 设计来源
 

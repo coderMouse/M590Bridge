@@ -490,7 +490,7 @@ export function isTauriShell(): boolean {
   return Boolean(w.__TAURI_INTERNALS__ || w.__TAURI__)
 }
 
-export function isLinuxTauriShell(): boolean {
+export function isDesktopAutostartShell(): boolean {
   if (!isTauriShell() || typeof navigator === 'undefined') return false
-  return /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent)
+  return /Linux|Windows/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent)
 }

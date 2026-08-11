@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-11
-> 阶段：文本+图片+V2 文件流式 + mDNS + Linux .deb/用户登录自启 + 自适应桌面 UI
+> 阶段：文本+图片+V2 文件流式 + mDNS + Linux 发布完成 + Windows NSIS/登录自启待真机验收
 
 ## 目标（近期）
 
@@ -38,7 +38,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
-- [ ] Windows 安装包 / 开机自启（待建 task-042）
+- [ ] **task-042** Windows NSIS 安装包 / 用户登录自启（代码已实现，待 Windows 10 真机打包与验收）
 
 ## 产品分期对照
 
@@ -48,7 +48,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | V2 · 图片 | 图片剪贴板双向 | **已完成** |
 | V2 · 文件 | 元数据 + 按需 + 进度 + 流式 | **基本可用**（task-033 流式+SHA-256；无文件夹/OS 桌面粘贴/断点续传） |
 | V3 · mDNS | 局域网发现 | **第一刀完成**（task-029） |
-| V3 · 安装 | 安装包/自启 | **Linux `.deb` + 用户登录自启已完成**；跨机文件复测已通过；Windows 安装/自启未做 |
+| V3 · 安装 | 安装包/自启 | **Linux `.deb` + 用户登录自启已完成**；Windows NSIS/HKCU 自启代码已实现，待真机打包验收 |
 
 ### 明确取消
 
@@ -74,18 +74,20 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | mDNS 发现（`_m590bridge._tcp`） | **有**（task-029；仍需配对码） |
 | Linux `.deb` 安装包 | **有**（task-032；amd64、未签名） |
 | Linux 用户登录自启 | **有**（task-038/039；正式/standalone 桌面端显式启停，开发壳拒绝开启） |
+| Windows NSIS 安装包 | **待真机验收**（task-042；当前用户安装、未签名） |
+| Windows 用户登录自启 | **待真机验收**（task-042；HKCU Run、开发壳拒绝开启、卸载清理） |
 | localhost Hub API 鉴权 | **有**（task-035；进程临时令牌 + 限定 CORS） |
 | 设置「发现方式」开关 | 无（默认开启 browse） |
 
 ## 下一步（有序）
 
-1. Windows 安装包 / 开机自启
+1. Windows 10 真机打包并验收 task-042 安装/登录自启
 2. （后续）文件失败反馈、取消/重试、会话加密与配对码随机性
 3. （可选）独立文件数据连接 / 更高吞吐调优
 4. （可选）设置页发现开关 / 本机显示名
 5. （可选）多文件并行 / 文件夹 / OS 文件剪贴板
 
-> task-041 已完成：桌面壳经 IPC 访问内嵌 Hub。请用户用新 release/standalone 确认「API 已连接」。
+> task-041 已完成并经用户真机确认「API 已连接」。task-042 保持 `in_progress`，等待 Windows 真机结果。
 
 ## 用户怎么用
 
@@ -106,10 +108,19 @@ cd ..
 sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
 ```
 
+Windows 10（在 Windows 开发终端中）：
+
+```powershell
+cd ui
+npm ci
+npm run desktop:build:windows
+Get-ChildItem ..\target\release\bundle\nsis\*.exe
+```
+
 - **创建配对**：本机生成配对码 → 开始等待（会 mDNS 广播）  
 - **加入**：同一局域网列表点选对端，或手动填 `host:port`，输入同一配对码连接  
 - 主面板「文件传输」：原生选文件/拖放；设置里改接收目录  
-- Linux 设置页「启动」可显式开启/关闭当前用户登录自启；需从安装版或 standalone 桌面端设置
+- Linux/Windows 设置页「启动」可显式开启/关闭当前用户登录自启；需从安装版或 standalone 桌面端设置
 
 ```bash
 export M590_HUB_TOKEN='[REDACTED]' # 独立 Hub 的实际临时令牌；Tauri 内嵌模式无需手工设置

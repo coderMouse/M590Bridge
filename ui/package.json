@@ -11,7 +11,8 @@
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:standalone": "npm run build && cargo run --manifest-path src-tauri/Cargo.toml --release --features custom-protocol",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "desktop:build:windows": "tauri build --bundles nsis"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",

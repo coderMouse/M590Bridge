@@ -15,6 +15,12 @@ use tauri::{
     Manager, WindowEvent, Wry,
 };
 
+#[cfg(target_os = "windows")]
+use winreg::{
+    enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
+    RegKey,
+};
+
 const HUB_API: &str = "127.0.0.1:5910";
 
 #[cfg(target_os = "linux")]
@@ -22,6 +28,12 @@ const AUTOSTART_DESKTOP_FILE: &str = "M590Bridge.desktop";
 
 #[cfg(target_os = "linux")]
 static AUTOSTART_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+const WINDOWS_AUTOSTART_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+#[cfg(target_os = "windows")]
+const WINDOWS_AUTOSTART_VALUE: &str = "M590Bridge";
 
 struct HubAuthToken(String);
 
@@ -151,11 +163,10 @@ fn autostart_enabled_at(config_home: &Path) -> bool {
     autostart_path_from_config_home(config_home).is_file()
 }
 
-#[cfg(target_os = "linux")]
 fn ensure_autostart_build_supported(is_dev: bool) -> Result<(), String> {
     if is_dev {
         return Err(
-            "开发版桌面壳依赖 Vite，不能用于登录自启；请运行 npm run desktop:standalone 或安装 .deb 后再开启"
+            "开发版桌面壳依赖 Vite，不能用于登录自启；请运行 npm run desktop:standalone 或安装正式包后再开启"
                 .into(),
         );
     }
@@ -203,6 +214,70 @@ fn set_autostart_at(config_home: &Path, executable: &Path, enabled: bool) -> Res
     }
     write_result?;
     Ok(autostart_enabled_at(config_home))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_autostart_command_value(executable: &str) -> Result<String, String> {
+    if executable.is_empty() {
+        return Err("autostart executable path must not be empty".into());
+    }
+    if executable.chars().any(char::is_control) || executable.contains('"') {
+        return Err("autostart executable path contains invalid characters".into());
+    }
+    Ok(format!("\"{executable}\""))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_autostart_command(executable: &Path) -> Result<String, String> {
+    if !executable.is_absolute() {
+        return Err("autostart executable path must be absolute".into());
+    }
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| "autostart executable path must be valid UTF-8".to_string())?;
+    windows_autostart_command_value(executable)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_autostart_enabled_for(executable: &Path) -> Result<bool, String> {
+    let expected = windows_autostart_command(executable)?;
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    let run_key = match current_user.open_subkey(WINDOWS_AUTOSTART_KEY) {
+        Ok(key) => key,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("open Windows autostart registry key: {err}")),
+    };
+    match run_key.get_value::<String, _>(WINDOWS_AUTOSTART_VALUE) {
+        Ok(value) => Ok(value == expected),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("read Windows autostart registry value: {err}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_windows_autostart(executable: &Path, enabled: bool) -> Result<bool, String> {
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    if enabled {
+        let command = windows_autostart_command(executable)?;
+        let (run_key, _) = current_user
+            .create_subkey(WINDOWS_AUTOSTART_KEY)
+            .map_err(|err| format!("create Windows autostart registry key: {err}"))?;
+        run_key
+            .set_value(WINDOWS_AUTOSTART_VALUE, &command)
+            .map_err(|err| format!("write Windows autostart registry value: {err}"))?;
+        return windows_autostart_enabled_for(executable);
+    }
+
+    let run_key = match current_user.open_subkey_with_flags(WINDOWS_AUTOSTART_KEY, KEY_SET_VALUE) {
+        Ok(key) => key,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("open Windows autostart registry key: {err}")),
+    };
+    match run_key.delete_value(WINDOWS_AUTOSTART_VALUE) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("delete Windows autostart registry value: {err}")),
+    }
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -350,7 +425,13 @@ fn autostart_enabled() -> Result<bool, String> {
     {
         Ok(autostart_enabled_at(&xdg_config_home()?))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        let executable =
+            std::env::current_exe().map_err(|err| format!("resolve current executable: {err}"))?;
+        windows_autostart_enabled_for(&executable)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         Ok(false)
     }
@@ -367,7 +448,16 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
             std::env::current_exe().map_err(|err| format!("resolve current executable: {err}"))?;
         set_autostart_at(&xdg_config_home()?, &executable, enabled)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        if enabled {
+            ensure_autostart_build_supported(tauri::is_dev())?;
+        }
+        let executable =
+            std::env::current_exe().map_err(|err| format!("resolve current executable: {err}"))?;
+        set_windows_autostart(&executable, enabled)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = enabled;
         Ok(false)
@@ -498,6 +588,30 @@ mod hub_proxy_tests {
         assert!(validate_hub_api_path("/status").is_err());
         assert!(validate_hub_api_path("/api/../etc/passwd").is_err());
         assert!(validate_hub_api_path("/api/health http").is_err());
+    }
+}
+
+#[cfg(test)]
+mod windows_autostart_value_tests {
+    use super::windows_autostart_command_value;
+
+    #[test]
+    fn windows_autostart_value_quotes_paths_with_spaces() {
+        let value = windows_autostart_command_value(
+            r"C:\Users\Example User\AppData\Local\M590Bridge\m590-ui.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            r#""C:\Users\Example User\AppData\Local\M590Bridge\m590-ui.exe""#
+        );
+    }
+
+    #[test]
+    fn windows_autostart_value_rejects_quotes_and_controls() {
+        assert!(windows_autostart_command_value("").is_err());
+        assert!(windows_autostart_command_value("C:\\bad\"path.exe").is_err());
+        assert!(windows_autostart_command_value("C:\\bad\npath.exe").is_err());
     }
 }
 

@@ -1,7 +1,7 @@
 # 项目结构图 · M590Bridge
 
-> 更新日期：2026-08-10
-> 状态：文本+图片+流式文件+mDNS+桌面壳发布硬化+Linux 用户登录自启（task-020..038）
+> 更新日期：2026-08-11
+> 状态：文本+图片+流式文件+mDNS+Linux 发布+Windows NSIS/登录自启待真机验收（task-020..042）
 
 ```text
 crates/
@@ -11,12 +11,14 @@ crates/
   m590-daemon/     # hub：临时令牌/CORS、send_file、无覆盖落盘、status、mDNS
 ui/
   src/             # React：OperableApp 配对/发现/文件发送/登录自启；bridgeApi 自动鉴权
-  src-tauri/       # Tauri 2 m590-ui；托盘与 XDG autostart commands
+  src-tauri/       # Tauri 2 m590-ui；托盘、Linux XDG / Windows HKCU autostart commands
     permissions/
-      autostart.toml       # Linux 用户登录自启读写
+      autostart.toml       # Linux/Windows 用户登录自启读写
       hub-auth-token.toml  # 主窗口读取进程临时 Hub 令牌
+    windows/
+      installer-hooks.nsh # NSIS 卸载清理当前用户 Run 值
 docs/
   plans/current.md
-  tasks/           # ..038
+  tasks/           # ..042
   domain/          # 协议草案
 ```
