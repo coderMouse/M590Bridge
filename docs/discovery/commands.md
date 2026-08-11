@@ -1,17 +1,18 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-10（task-038）
+> 更新日期：2026-08-10（task-039）
 
 ## 桌面（推荐）
 
 ```bash
-cargo build -p m590-ui
-cargo run -p m590-ui
-cd ui && npm run desktop:dev    # 前端热更 + tauri
-cd ui && npm run build          # 仅前端
+cd ui && npm run desktop:standalone # 日常桌面：release + 内嵌 UI/Hub，不需要浏览器
+cd ui && npm run desktop:dev        # 开发：Vite 热更 + Tauri，仅开发会话使用
+cd ui && npm run build              # 仅前端
 ```
 
 内嵌 hub：`http://127.0.0.1:5910`。Tauri WebView 自动取得进程临时令牌，无需手工配置。
+`desktop:dev` 与 `cargo run -p m590-ui` 会加载 `127.0.0.1:5173`，不可作为登录自启目标；
+`desktop:standalone` 使用内嵌前端资源，适合不使用 Web 端的源码运行方式。
 
 仅运行浏览器开发服务器并连接独立 Hub 时，两边需使用同一个临时令牌；不要放进 URL、共享文档或提交文件：
 
@@ -50,11 +51,13 @@ sudo apt remove m590-bridge
 
 产物在 `target/release/bundle/deb/`，不提交仓库。当前仅验证 `amd64`、未签名；包本身不写系统级自启入口。
 
-### Linux 用户登录自启（task-038）
+### Linux 用户登录自启（task-038 / task-039）
 
 - 设置页「启动」→「登录时自动启动」会为当前用户创建 XDG autostart 入口。
 - 默认入口：`~/.config/autostart/M590Bridge.desktop`；设置了绝对路径 `XDG_CONFIG_HOME` 时改用 `$XDG_CONFIG_HOME/autostart/M590Bridge.desktop`。
 - 开启不需要 root；`Exec` 指向当前运行的 `m590-ui`，安装包运行时通常为 `/usr/bin/m590-ui`。
+- 只能从 `.deb` 安装版或 `npm run desktop:standalone` 启动的正式桌面端开启；开发壳会明确拒绝，避免登录后因 Vite 未运行而连接 `127.0.0.1:5173` 失败。
+- 若旧入口已指向 `target/debug/m590-ui`，先关闭开关（或删除该入口），再从正式/standalone 桌面端重新开启。
 - 关闭开关会删除入口。`apt remove` 不会也不应遍历各用户主目录；卸载前先关闭开关，或卸载后手工删除上述文件。
 
 ## Rust 测试 / CLI
@@ -84,7 +87,7 @@ cargo run -p m590-clipboard --example probe_clipboard
 - 文件：`FileOffer/Request/Chunk/Complete` + 路径流式 + SHA-256 + hub 落盘 + UI 发送/进度（软上限 8GiB；`send_file_bytes` 仍限内存）
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
-- **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart，不需要 root（task-038）
+- **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart；正式/standalone 桌面端可用，开发壳拒绝开启（task-038/039）
 
 ## 文件 API（task-021+）
 

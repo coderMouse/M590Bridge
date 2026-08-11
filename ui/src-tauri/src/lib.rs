@@ -113,6 +113,17 @@ fn autostart_enabled_at(config_home: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn ensure_autostart_build_supported(is_dev: bool) -> Result<(), String> {
+    if is_dev {
+        return Err(
+            "开发版桌面壳依赖 Vite，不能用于登录自启；请运行 npm run desktop:standalone 或安装 .deb 后再开启"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn set_autostart_at(config_home: &Path, executable: &Path, enabled: bool) -> Result<bool, String> {
     let path = autostart_path_from_config_home(config_home);
     if !enabled {
@@ -239,6 +250,9 @@ fn autostart_enabled() -> Result<bool, String> {
 fn set_autostart(enabled: bool) -> Result<bool, String> {
     #[cfg(target_os = "linux")]
     {
+        if enabled {
+            ensure_autostart_build_supported(tauri::is_dev())?;
+        }
         let executable =
             std::env::current_exe().map_err(|err| format!("resolve current executable: {err}"))?;
         set_autostart_at(&xdg_config_home()?, &executable, enabled)
@@ -384,6 +398,23 @@ mod autostart_tests {
         assert!(!path.exists());
         assert!(!set_autostart_at(&config_home, executable, false).unwrap());
         let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn development_build_is_rejected_for_autostart() {
+        let error = ensure_autostart_build_supported(true).unwrap_err();
+        assert!(error.contains("desktop:standalone"));
+        assert!(ensure_autostart_build_supported(false).is_ok());
+    }
+
+    #[test]
+    fn tauri_build_mode_matches_autostart_policy() {
+        let result = ensure_autostart_build_supported(tauri::is_dev());
+        if cfg!(feature = "custom-protocol") {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.is_err());
+        }
     }
 
     #[test]

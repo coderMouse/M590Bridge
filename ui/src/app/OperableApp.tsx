@@ -83,6 +83,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const apiBase = useMemo(() => getApiBase(), [])
+  const tauriShell = useMemo(() => isTauriShell(), [])
   const autostartSupported = useMemo(() => isLinuxTauriShell(), [])
 
   const refresh = useCallback(async () => {
@@ -435,11 +436,17 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
 
       {!hubOnline ? (
         <div className="m-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-900">
-          未检测到本机 hub。请先在仓库根目录运行：
-          <pre className="mt-2 overflow-x-auto rounded bg-white/80 p-2 text-[11px]">
-            cargo run -p m590-daemon -- hub --api 127.0.0.1:5910
-          </pre>
-          然后刷新本页。可用 <code>?api=http://127.0.0.1:5910</code> 指定地址。
+          {tauriShell ? (
+            <>内嵌 Hub 正在启动；若持续离线，请退出重复进程后重新打开 M590Bridge。</>
+          ) : (
+            <>
+              未检测到本机 hub。请先在仓库根目录运行：
+              <pre className="mt-2 overflow-x-auto rounded bg-white/80 p-2 text-[11px]">
+                cargo run -p m590-daemon -- hub --api 127.0.0.1:5910
+              </pre>
+              然后刷新本页。可用 <code>?api=http://127.0.0.1:5910</code> 指定地址。
+            </>
+          )}
         </div>
       ) : null}
 

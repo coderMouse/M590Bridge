@@ -29,6 +29,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-036** 桌面文件传输吞吐调优（工作感知调度 / 顺序读取 / TCP 多帧缓冲修复）
 - [x] **task-037** 文件通道安全边界
 - [x] **task-038** Linux 用户级登录自启（XDG autostart + 设置页开关）
+- [x] **task-039** Linux 自启开发壳保护 + 独立桌面运行（release 内嵌 UI/Hub）
 
 ## 进行中 / 下一 task
 
@@ -67,7 +68,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 托盘菜单文案保活 | **有**（task-027） |
 | mDNS 发现（`_m590bridge._tcp`） | **有**（task-029；仍需配对码） |
 | Linux `.deb` 安装包 | **有**（task-032；amd64、未签名） |
-| Linux 用户登录自启 | **有**（task-038；设置页显式启停，XDG autostart，无需 root） |
+| Linux 用户登录自启 | **有**（task-038/039；正式/standalone 桌面端显式启停，开发壳拒绝开启） |
 | localhost Hub API 鉴权 | **有**（task-035；进程临时令牌 + 限定 CORS） |
 | 设置「发现方式」开关 | 无（默认开启 browse） |
 
@@ -80,13 +81,17 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 5. （可选）设置页发现开关 / 本机显示名
 6. （可选）多文件并行 / 文件夹 / OS 文件剪贴板
 
-> task-038 已完成；下一步先做 Linux↔Windows 实机复测，再单独创建 Windows 安装/自启 task。
+> task-039 已完成；下一步先做 Linux↔Windows 实机复测，再单独创建 Windows 安装/自启 task。
 
 ## 用户怎么用
 
 ```bash
-cargo build -p m590-ui && cargo run -p m590-ui
+cd ui
+npm run desktop:standalone
 ```
+
+该命令运行内嵌 UI/Hub 的 release 桌面端，不需要浏览器或 Vite。`desktop:dev` 与
+`cargo run -p m590-ui` 仅用于开发，不能作为登录自启目标。
 
 Linux 安装包：
 
@@ -100,7 +105,7 @@ sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
 - **创建配对**：本机生成配对码 → 开始等待（会 mDNS 广播）  
 - **加入**：同一局域网列表点选对端，或手动填 `host:port`，输入同一配对码连接  
 - 主面板「文件传输」：原生选文件/拖放；设置里改接收目录  
-- Linux 设置页「启动」可显式开启/关闭当前用户登录自启
+- Linux 设置页「启动」可显式开启/关闭当前用户登录自启；需从安装版或 standalone 桌面端设置
 
 ```bash
 export M590_HUB_TOKEN='[REDACTED]' # 独立 Hub 的实际临时令牌；Tauri 内嵌模式无需手工设置
