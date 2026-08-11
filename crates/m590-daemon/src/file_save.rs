@@ -43,7 +43,11 @@ pub fn save_received_file(dir: &Path, file_name: &str, data: &[u8]) -> Result<Pa
 }
 
 /// Move a completed `.part` (or temp) file into `dir` under a unique basename.
-pub fn finalize_part_file(dir: &Path, file_name: &str, part_path: &Path) -> Result<PathBuf, String> {
+pub fn finalize_part_file(
+    dir: &Path,
+    file_name: &str,
+    part_path: &Path,
+) -> Result<PathBuf, String> {
     let base = validate_basename(file_name)?;
     fs::create_dir_all(dir).map_err(|e| format!("create save dir: {e}"))?;
 
@@ -204,9 +208,7 @@ mod tests {
 
     #[test]
     fn session_transfer_then_save_like_hub() {
-        use m590_core::{
-            DeviceId, InboundFileResult, QueueFileResult, Session, SessionEvent,
-        };
+        use m590_core::{DeviceId, InboundFileResult, QueueFileResult, Session, SessionEvent};
 
         let mut host = Session::new(DeviceId::new("host")).unwrap();
         let recv = temp_dir();
@@ -249,7 +251,10 @@ mod tests {
             host.take_inbound_file(),
             Some(InboundFileResult::Offered { .. })
         ));
-        assert_eq!(host.request_file("t-save").unwrap(), QueueFileResult::Queued);
+        assert_eq!(
+            host.request_file("t-save").unwrap(),
+            QueueFileResult::Queued
+        );
         let req = host.take_outbox().pop().unwrap();
         joiner.handle(SessionEvent::Message(req)).unwrap();
         loop {

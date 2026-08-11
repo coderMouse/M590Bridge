@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::AtomicU64,
 };
 
 use tauri::{
@@ -22,6 +24,43 @@ const AUTOSTART_DESKTOP_FILE: &str = "M590Bridge.desktop";
 static AUTOSTART_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct HubAuthToken(String);
+
+#[derive(Default)]
+struct HubRuntimeState {
+    ready: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
+impl HubRuntimeState {
+    fn mark_ready(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+        if let Ok(mut slot) = self.error.lock() {
+            *slot = None;
+        }
+    }
+
+    fn mark_error(&self, err: String) {
+        self.ready.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = self.error.lock() {
+            *slot = Some(err);
+        }
+    }
+
+    fn snapshot(&self) -> HubRuntimeInfo {
+        HubRuntimeInfo {
+            ready: self.ready.load(Ordering::SeqCst),
+            error: self.error.lock().ok().and_then(|guard| guard.clone()),
+            api: format!("http://{HUB_API}"),
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct HubRuntimeInfo {
+    ready: bool,
+    error: Option<String>,
+    api: String,
+}
 
 struct TrayState {
     /// Keep tray + menu items alive for the process lifetime (Linux AppIndicator).
@@ -188,35 +227,89 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-fn post_hub_send_file(path: &Path, auth_token: &str) -> Result<(), String> {
-    let path_s = path.to_string_lossy();
-    let body = serde_json::json!({ "path": path_s.as_ref() }).to_string();
+fn validate_hub_api_path(path: &str) -> Result<(), String> {
+    if !path.starts_with("/api/") {
+        return Err("hub path must start with /api/".into());
+    }
+    if path.contains('\n') || path.contains('\r') || path.contains(' ') {
+        return Err("hub path contains invalid characters".into());
+    }
+    if path.contains("://") || path.contains("..") {
+        return Err("hub path is not allowed".into());
+    }
+    Ok(())
+}
+
+fn hub_http_exchange(
+    method: &str,
+    path: &str,
+    body: &str,
+    auth_token: &str,
+) -> Result<(u16, String), String> {
+    validate_hub_api_path(path)?;
+    let method = method.trim().to_ascii_uppercase();
+    if !matches!(
+        method.as_str(),
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+    ) {
+        return Err(format!("unsupported hub method: {method}"));
+    }
     let mut stream =
         std::net::TcpStream::connect(HUB_API).map_err(|e| format!("hub connect failed: {e}"))?;
+    // Large send_file_bytes payloads need more than the default short timeout.
+    let timeout_secs = if body.len() > 64 * 1024 { 60 } else { 5 };
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_read_timeout(Some(std::time::Duration::from_secs(timeout_secs)))
         .map_err(|e| format!("hub read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(timeout_secs)))
+        .map_err(|e| format!("hub write timeout: {e}"))?;
     use std::io::{Read, Write};
     let req = format!(
-        "POST /api/send_file HTTP/1.1\r\nHost: {HUB_API}\r\nContent-Type: application/json\r\nX-M590-Token: {auth_token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {HUB_API}\r\nContent-Type: application/json\r\nX-M590-Token: {auth_token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("hub write failed: {e}"))?;
-    let mut response = String::new();
+    let mut response = Vec::new();
     stream
-        .read_to_string(&mut response)
+        .read_to_end(&mut response)
         .map_err(|e| format!("hub response failed: {e}"))?;
-    if response.starts_with("HTTP/1.1 200 ") {
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (header, resp_body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or((response.as_str(), ""));
+    let status = header
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| format!("invalid hub response status: {header}"))?;
+    Ok((status, resp_body.to_string()))
+}
+
+fn post_hub_send_file(path: &Path, auth_token: &str) -> Result<(), String> {
+    let path_s = path.to_string_lossy();
+    let body = serde_json::json!({ "path": path_s.as_ref() }).to_string();
+    let (status, detail) = hub_http_exchange("POST", "/api/send_file", &body, auth_token)?;
+    if status == 200 {
         Ok(())
     } else {
-        let detail = response
-            .split("\r\n\r\n")
-            .nth(1)
-            .unwrap_or("request failed");
         Err(format!("hub rejected file: {detail}"))
     }
+}
+
+#[derive(serde::Deserialize)]
+struct HubApiRequestArgs {
+    method: String,
+    path: String,
+    body: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct HubApiResponse {
+    status: u16,
+    body: String,
 }
 
 /// Native file dialog (starts at Desktop/桌面). Returns absolute path.
@@ -232,6 +325,23 @@ fn pick_send_file() -> Result<Option<String>, String> {
 #[tauri::command]
 fn hub_auth_token(token: tauri::State<'_, HubAuthToken>) -> String {
     token.0.clone()
+}
+
+#[tauri::command]
+fn hub_runtime_info(state: tauri::State<'_, Arc<HubRuntimeState>>) -> HubRuntimeInfo {
+    state.snapshot()
+}
+
+/// Desktop WebView proxy for the loopback Hub API.
+/// Avoids mixed-content/CORS failures when the shell is served from https://tauri.localhost.
+#[tauri::command]
+fn hub_api_request(
+    args: HubApiRequestArgs,
+    token: tauri::State<'_, HubAuthToken>,
+) -> Result<HubApiResponse, String> {
+    let body = args.body.unwrap_or_default();
+    let (status, body) = hub_http_exchange(&args.method, &args.path, &body, &token.0)?;
+    Ok(HubApiResponse { status, body })
 }
 
 #[tauri::command]
@@ -268,21 +378,34 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
 pub fn run() {
     let hub_token = m590_daemon::hub::generate_hub_token().expect("generate hub auth token");
     let hub_token_for_setup = hub_token.clone();
+    let hub_runtime = Arc::new(HubRuntimeState::default());
+    let hub_runtime_for_setup = Arc::clone(&hub_runtime);
     tauri::Builder::default()
         .manage(HubAuthToken(hub_token))
+        .manage(hub_runtime)
         .invoke_handler(tauri::generate_handler![
             pick_send_file,
             hub_auth_token,
+            hub_runtime_info,
+            hub_api_request,
             autostart_enabled,
             set_autostart
         ])
         .setup(move |app| {
             let hub_token = hub_token_for_setup.clone();
+            let hub_runtime = Arc::clone(&hub_runtime_for_setup);
             std::thread::Builder::new()
                 .name("m590-hub".into())
                 .spawn(move || {
-                    if let Err(err) = m590_daemon::hub::run_hub_with_token(HUB_API, hub_token) {
+                    let runtime = Arc::clone(&hub_runtime);
+                    let result = m590_daemon::hub::run_hub_with_token_on_ready(
+                        HUB_API,
+                        hub_token,
+                        Some(Box::new(move || runtime.mark_ready())),
+                    );
+                    if let Err(err) = result {
                         eprintln!("hub_error={err}");
+                        hub_runtime.mark_error(err);
                     }
                 })
                 .expect("spawn hub thread");
@@ -363,6 +486,19 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod hub_proxy_tests {
+    use super::validate_hub_api_path;
+
+    #[test]
+    fn hub_api_path_validation_rejects_traversal_and_non_api() {
+        assert!(validate_hub_api_path("/api/health").is_ok());
+        assert!(validate_hub_api_path("/status").is_err());
+        assert!(validate_hub_api_path("/api/../etc/passwd").is_err());
+        assert!(validate_hub_api_path("/api/health http").is_err());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

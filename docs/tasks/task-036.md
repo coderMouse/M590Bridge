@@ -60,7 +60,7 @@ cargo clippy -p m590-core -p m590-net -p m590-daemon --lib --no-deps -- -D warni
 - [x] 路径流式发送保持分片、进度和 SHA-256 正确。
 - [x] 连续到达且累计超过 16 MiB 的多个合法帧不会被误判为单帧超限。
 - [x] core/net/daemon 单测、桌面构建和范围内 Clippy 通过。
-- [x] 记录本机性能 smoke；明确 Linux↔Windows 实机复测状态。
+- [x] 记录本机性能 smoke；明确 Linux↔Windows 实机复测状态（2026-08-11 用户确认两边可复制文件）。
 
 ## 实施记录
 
@@ -89,6 +89,7 @@ cargo clippy -p m590-core -p m590-net -p m590-daemon --lib --no-deps -- -D warni
 - 本机双 Hub/TCP 512 MiB：从 `/api/send_file` 到接收状态 `done` 用时约 1.261 s，约 406.0 MiB/s；接收 536870912 bytes，双方保持 `connected`、`last_error=null`。
 - `sha256sum`：源文件与最终落盘文件均为 `9acca8e8c22201155389f65abbf6bc9723edc7384ead80503839f49dcc56d767`；接收目录只有最终文件，无遗留 `.part`。
 - `git diff --check -- crates/m590-core/src/session.rs crates/m590-net/src/tcp.rs crates/m590-daemon/src/hub.rs docs/plans/current.md docs/tasks/task-036.md`：通过。
+- 2026-08-11 用户实机复测：Linux↔Windows 两边可复制文件，功能通过。未提供具体吞吐数字；本记录只确认跨机文件通道可用，不冒充 LocalSend 对比结果。
 
 ## 文档影响检查
 
@@ -98,10 +99,11 @@ cargo clippy -p m590-core -p m590-net -p m590-daemon --lib --no-deps -- -D warni
 
 ## 风险 / blocker
 
-- 当前环境不能代替 Windows 测试机验证真实 Wi-Fi、Windows 文件系统和杀毒扫描影响。
-- Linux↔Windows 同文件、同网络的 3–5 MB/s 现场结果尚未复测；本机回环只能证明程序内部固定节流和累计缓冲错误已移除，不能冒充 Wi-Fi 吞吐。
+- 2026-08-11 用户已确认 Linux↔Windows 两边可复制文件；跨机功能 blocker 关闭。
+- 用户未提供同文件吞吐数字，因此不能据此宣称已超过 LocalSend 或达到本机回环水平。
 - 全文件 `rustfmt --check` 仍会报告 `session.rs`、`hub.rs`、`tcp.rs` 中 task-036 前已有的格式差异；本 task 未做全文件格式化，以免混入无关改动，本次新增行已按 rustfmt 输出修正。
 
 ## 下一步
 
-- 在 Linux↔Windows 上用同一个大文件复测吞吐和稳定性；若仍明显低于 LocalSend，再单独评估帧复制/独立数据连接，不在本 task 扩展。
+- 跨机文件复测已通过；后续若仍关心吞吐对比，另开任务记录同文件/同网络 MB/s。
+- 产品下一优先：Windows 安装包 / 开机自启。

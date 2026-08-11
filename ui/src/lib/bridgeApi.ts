@@ -96,26 +96,123 @@ export function getApiBase(): string {
   return DEFAULT_API
 }
 
-let hubTokenPromise: Promise<string | null> | null = null
+let cachedHubToken: string | null = null
+let hubTokenInflight: Promise<string | null> | null = null
 
 async function getHubAuthToken(): Promise<string | null> {
-  if (hubTokenPromise) return hubTokenPromise
-  hubTokenPromise = (async () => {
-    const invoke = getTauriInvoke()
-    if (invoke) {
-      const token = await invoke('hub_auth_token')
-      return typeof token === 'string' && token.length >= 32 ? token : null
+  if (cachedHubToken) return cachedHubToken
+  if (hubTokenInflight) return hubTokenInflight
+  hubTokenInflight = (async () => {
+    try {
+      const invoke = getTauriInvoke()
+      if (invoke) {
+        const token = await invoke('hub_auth_token')
+        if (typeof token === 'string' && token.length >= 32) {
+          cachedHubToken = token
+          return cachedHubToken
+        }
+        return null
+      }
+      const env = (import.meta as ImportMeta & {
+        env?: { DEV?: boolean; VITE_M590_HUB_TOKEN?: string }
+      }).env
+      const envToken = env?.DEV ? env.VITE_M590_HUB_TOKEN?.trim() : null
+      if (envToken && envToken.length >= 32) {
+        cachedHubToken = envToken
+        return cachedHubToken
+      }
+      return null
+    } catch {
+      return null
+    } finally {
+      hubTokenInflight = null
     }
-    const env = (import.meta as ImportMeta & {
-      env?: { DEV?: boolean; VITE_M590_HUB_TOKEN?: string }
-    }).env
-    const envToken = env?.DEV ? env.VITE_M590_HUB_TOKEN?.trim() : null
-    return envToken && envToken.length >= 32 ? envToken : null
-  })().catch(() => null)
-  return hubTokenPromise
+  })()
+  return hubTokenInflight
 }
 
-async function request<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+export type HubRuntimeInfo = {
+  ready: boolean
+  error: string | null
+  api: string
+}
+
+export type HubOfflineReason =
+  | 'online'
+  | 'starting'
+  | 'unreachable'
+  | 'token_unavailable'
+  | 'unauthorized'
+  | 'origin_denied'
+  | 'port_in_use'
+  | 'start_failed'
+  | 'http_error'
+
+export async function fetchHubRuntimeInfo(): Promise<HubRuntimeInfo | null> {
+  const invoke = getTauriInvoke()
+  if (!invoke) return null
+  try {
+    const info = await invoke('hub_runtime_info')
+    if (!info || typeof info !== 'object') return null
+    const rec = info as { ready?: unknown; error?: unknown; api?: unknown }
+    return {
+      ready: Boolean(rec.ready),
+      error: typeof rec.error === 'string' ? rec.error : rec.error == null ? null : String(rec.error),
+      api: typeof rec.api === 'string' ? rec.api : DEFAULT_API,
+    }
+  } catch {
+    return null
+  }
+}
+
+type HubApiProxyResponse = {
+  status: number
+  body: string
+}
+
+function parseHubBody(text: string): unknown {
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return { raw: text }
+  }
+}
+
+function hubErrorMessage(data: unknown, statusText: string, status: number): string {
+  if (data && typeof data === 'object' && data !== null && 'error' in data) {
+    return String((data as { error: unknown }).error)
+  }
+  return statusText || `HTTP ${status}`
+}
+
+async function requestViaTauri<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+  const invoke = getTauriInvoke()
+  if (!invoke) throw new Error('Tauri invoke unavailable')
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const body =
+    typeof init?.body === 'string'
+      ? init.body
+      : init?.body == null
+        ? ''
+        : String(init.body)
+  const response = (await invoke('hub_api_request', {
+    args: {
+      method,
+      path,
+      body,
+    },
+  })) as HubApiProxyResponse
+  const text = typeof response?.body === 'string' ? response.body : ''
+  const status = typeof response?.status === 'number' ? response.status : 0
+  const data = parseHubBody(text)
+  if (status < 200 || status >= 300) {
+    throw new Error(hubErrorMessage(data, '', status))
+  }
+  return data as T
+}
+
+async function requestViaFetch<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const base = getApiBase()
   const authToken = await getHubAuthToken()
   if (!authToken) throw new Error('Hub authentication token unavailable')
@@ -128,28 +225,100 @@ async function request<T = unknown>(path: string, init?: RequestInit): Promise<T
     },
   })
   const text = await res.text()
-  let data: unknown = null
-  try {
-    data = text ? JSON.parse(text) : null
-  } catch {
-    data = { raw: text }
-  }
+  const data = parseHubBody(text)
   if (!res.ok) {
-    const errMsg =
-      data && typeof data === 'object' && data !== null && 'error' in data
-        ? String((data as { error: unknown }).error)
-        : res.statusText
-    throw new Error(errMsg || `HTTP ${res.status}`)
+    throw new Error(hubErrorMessage(data, res.statusText, res.status))
   }
   return data as T
 }
 
+async function request<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+  if (getTauriInvoke()) {
+    return requestViaTauri<T>(path, init)
+  }
+  return requestViaFetch<T>(path, init)
+}
+
 export async function fetchHealth(): Promise<boolean> {
+  const result = await probeHubHealth()
+  return result === 'online'
+}
+
+export async function probeHubHealth(): Promise<HubOfflineReason> {
   try {
-    await request('/api/health')
-    return true
-  } catch {
-    return false
+    if (getTauriInvoke()) {
+      // Token is injected by the Rust proxy; only ensure the command is reachable.
+      const token = await getHubAuthToken()
+      if (!token) return 'token_unavailable'
+      await requestViaTauri('/api/health', { method: 'GET' })
+      return 'online'
+    }
+    const authToken = await getHubAuthToken()
+    if (!authToken) return 'token_unavailable'
+    const base = getApiBase()
+    const res = await fetch(`${base}/api/health`, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-M590-Token': authToken,
+      },
+    })
+    if (res.ok) return 'online'
+    if (res.status === 401) return 'unauthorized'
+    if (res.status === 403) return 'origin_denied'
+    return 'http_error'
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    const lower = msg.toLowerCase()
+    if (lower.includes('hub authentication required') || lower.includes('unauthorized')) {
+      return 'unauthorized'
+    }
+    if (lower.includes('origin not allowed')) {
+      return 'origin_denied'
+    }
+    if (lower.includes('hub connect failed') || lower.includes('connection refused')) {
+      return 'unreachable'
+    }
+    // Tauri proxy path: surface generic transport failures as unreachable.
+    return 'unreachable'
+  }
+}
+
+export async function resolveHubOfflineReason(): Promise<HubOfflineReason> {
+  const health = await probeHubHealth()
+  if (health === 'online') return 'online'
+  if (health !== 'unreachable') return health
+
+  const runtime = await fetchHubRuntimeInfo()
+  if (runtime?.error) {
+    const err = runtime.error.toLowerCase()
+    if (err.includes('address already in use') || err.includes('addrinuse')) {
+      return 'port_in_use'
+    }
+    return 'start_failed'
+  }
+  if (runtime && !runtime.ready) return 'starting'
+  return 'unreachable'
+}
+
+export function hubOfflineMessage(reason: HubOfflineReason, runtimeError?: string | null): string {
+  switch (reason) {
+    case 'port_in_use':
+      return '内嵌 Hub 端口 5910 被占用。请退出重复的 M590Bridge/m590-daemon 进程后重新打开。'
+    case 'start_failed':
+      return `内嵌 Hub 启动失败：${runtimeError || '未知错误'}。请重启 M590Bridge。`
+    case 'token_unavailable':
+      return '无法获取内嵌 Hub 鉴权令牌。请重启 M590Bridge。'
+    case 'unauthorized':
+      return '内嵌 Hub 鉴权失败（可能连到了其它进程）。请退出全部 M590Bridge 后只打开一个。'
+    case 'origin_denied':
+      return '内嵌 Hub 拒绝了当前页面来源。请使用正式/standalone 桌面端，不要混用异常入口。'
+    case 'http_error':
+      return '内嵌 Hub 响应异常。请重启 M590Bridge。'
+    case 'unreachable':
+      return '内嵌 Hub 仍不可达。请确认未混用开发壳，并退出重复进程后重新打开正式/standalone 桌面端。'
+    case 'starting':
+    default:
+      return '内嵌 Hub 正在启动…'
   }
 }
 

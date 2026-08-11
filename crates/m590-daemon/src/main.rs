@@ -7,9 +7,7 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use m590_clipboard::{
-    available_backends, ClipboardService, NullClipboard, PlatformClipboard,
-};
+use m590_clipboard::{available_backends, ClipboardService, NullClipboard, PlatformClipboard};
 use m590_core::{
     ConnectionState, DeviceId, InboundClipboardResult, Message, QueueClipboardResult,
     QueueFileResult, Session, SessionEvent, APP_NAME, DEFAULT_HEARTBEAT_MISS_THRESHOLD,
@@ -71,7 +69,9 @@ fn run() -> Result<(), String> {
             hub::run_hub(&api)
         }
         "--clipboard-demo" => run_default_demo(true),
-        other if other.starts_with('-') => run_default_demo(args.iter().any(|a| a == "--clipboard-demo")),
+        other if other.starts_with('-') => {
+            run_default_demo(args.iter().any(|a| a == "--clipboard-demo"))
+        }
         other => Err(format!("unknown command '{other}'. Try --help")),
     }
 }
@@ -237,19 +237,22 @@ fn run_listen(cfg: SyncCli) -> Result<(), String> {
     let bind = format!("0.0.0.0:{}", cfg.port);
     println!("{APP_NAME} daemon {VERSION} mode=listen");
     println!("protocol_version={PROTOCOL_VERSION}");
-    println!("listen_addr={bind} code_len={} device_id={}", cfg.code.len(), cfg.device_id);
+    println!(
+        "listen_addr={bind} code_len={} device_id={}",
+        cfg.code.len(),
+        cfg.device_id
+    );
 
     let listener = listen_on(&bind).map_err(|e| e.to_string())?;
-    let local = listener
-        .local_addr()
-        .map_err(|e| e.to_string())?;
+    let local = listener.local_addr().map_err(|e| e.to_string())?;
     println!("listening on {local}; waiting for one peer...");
 
     let mut conn = accept_framed(&listener).map_err(|e| e.to_string())?;
     let peer = conn.peer_addr().map_err(|e| e.to_string())?;
     println!("peer_accepted={peer}");
 
-    let mut session = Session::new(DeviceId::new(cfg.device_id.clone())).map_err(|e| e.to_string())?;
+    let mut session =
+        Session::new(DeviceId::new(cfg.device_id.clone())).map_err(|e| e.to_string())?;
     // Host holds expected code; do not proactively send joiner-style outbox.
     session
         .handle(SessionEvent::StartPairing {
@@ -265,7 +268,11 @@ fn run_connect(cfg: SyncCli) -> Result<(), String> {
     let addr = cfg.addr.clone().ok_or("missing --addr")?;
     println!("{APP_NAME} daemon {VERSION} mode=connect");
     println!("protocol_version={PROTOCOL_VERSION}");
-    println!("connect_addr={addr} code_len={} device_id={}", cfg.code.len(), cfg.device_id);
+    println!(
+        "connect_addr={addr} code_len={} device_id={}",
+        cfg.code.len(),
+        cfg.device_id
+    );
 
     let mut conn = connect_framed(&addr).map_err(|e| e.to_string())?;
     println!(
@@ -274,7 +281,8 @@ fn run_connect(cfg: SyncCli) -> Result<(), String> {
         conn.peer_addr().ok()
     );
 
-    let mut session = Session::new(DeviceId::new(cfg.device_id.clone())).map_err(|e| e.to_string())?;
+    let mut session =
+        Session::new(DeviceId::new(cfg.device_id.clone())).map_err(|e| e.to_string())?;
     session
         .handle(SessionEvent::StartPairing {
             expected_code: cfg.code.clone(),
@@ -421,10 +429,7 @@ fn run_bridge(
 
                     match session.take_inbound_clipboard() {
                         Some(InboundClipboardResult::Applied { content_id, text }) => {
-                            println!(
-                                "sync_rx content_id={content_id} len={}",
-                                text.len()
-                            );
+                            println!("sync_rx content_id={content_id} len={}", text.len());
                             if let Some(clip) = clipboard.as_mut() {
                                 match clip.write_text(&text) {
                                     Ok(()) => println!("clipboard_write=ok"),
@@ -497,9 +502,9 @@ fn run_bridge(
                             let h = image.height;
                             match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
                                 Ok((encoding, data)) => {
-                                    match session.queue_clipboard_image_encoded(
-                                        cid, w, h, encoding, data,
-                                    ) {
+                                    match session
+                                        .queue_clipboard_image_encoded(cid, w, h, encoding, data)
+                                    {
                                         Ok(QueueClipboardResult::Queued) => {
                                             let out = session.take_outbox();
                                             conn.send_all(out.iter()).map_err(|e| e.to_string())?;
@@ -508,7 +513,10 @@ fn run_bridge(
                                             );
                                             handled = true;
                                         }
-                                        Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                        Ok(QueueClipboardResult::ImageTooLarge {
+                                            byte_len,
+                                            limit,
+                                        }) => {
                                             println!(
                                                 "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
                                             );
@@ -530,8 +538,7 @@ fn run_bridge(
                         if !handled {
                             if let Some(path) = m590_clipboard::first_regular_file(&paths) {
                                 content_seq += 1;
-                                let tid =
-                                    format!("clip-file-{}-{content_seq}", process::id());
+                                let tid = format!("clip-file-{}-{content_seq}", process::id());
                                 let name = path
                                     .file_name()
                                     .and_then(|s| s.to_str())
@@ -540,8 +547,7 @@ fn run_bridge(
                                 match session.offer_file_path(tid, &path) {
                                     Ok(QueueFileResult::Queued) => {
                                         let out = session.take_outbox();
-                                        conn.send_all(out.iter())
-                                            .map_err(|e| e.to_string())?;
+                                        conn.send_all(out.iter()).map_err(|e| e.to_string())?;
                                         clip.adopt_text_baseline();
                                         println!("sync_tx_file_offer name={name}");
                                     }
@@ -568,9 +574,9 @@ fn run_bridge(
                             let h = image.height;
                             match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
                                 Ok((encoding, data)) => {
-                                    match session.queue_clipboard_image_encoded(
-                                        cid, w, h, encoding, data,
-                                    ) {
+                                    match session
+                                        .queue_clipboard_image_encoded(cid, w, h, encoding, data)
+                                    {
                                         Ok(QueueClipboardResult::Queued) => {
                                             let out = session.take_outbox();
                                             conn.send_all(out.iter()).map_err(|e| e.to_string())?;
@@ -584,7 +590,10 @@ fn run_bridge(
                                         Ok(QueueClipboardResult::UnchangedImage) => {
                                             println!("clipboard_poll_image=skip_echo");
                                         }
-                                        Ok(QueueClipboardResult::ImageTooLarge { byte_len, limit }) => {
+                                        Ok(QueueClipboardResult::ImageTooLarge {
+                                            byte_len,
+                                            limit,
+                                        }) => {
                                             println!(
                                                 "sync_tx_image=skip too_large bytes={byte_len} limit={limit}"
                                             );
@@ -709,11 +718,9 @@ fn run_bridge(
     }
 }
 
-fn recv_with_idle(
-    conn: &mut TcpFrameStream,
-    idle: Duration,
-) -> Result<Option<Message>, String> {
-    conn.set_read_timeout(Some(idle)).map_err(|e| e.to_string())?;
+fn recv_with_idle(conn: &mut TcpFrameStream, idle: Duration) -> Result<Option<Message>, String> {
+    conn.set_read_timeout(Some(idle))
+        .map_err(|e| e.to_string())?;
     conn.set_nonblocking(false).map_err(|e| e.to_string())?;
     match conn.recv() {
         Ok(msg) => Ok(Some(msg)),
@@ -731,7 +738,10 @@ fn recv_with_idle(
 fn check_timeout(cfg: &SyncCli, started: Instant, phase: &str) -> Result<(), String> {
     if let Some(timeout) = cfg.timeout {
         if started.elapsed() > timeout {
-            return Err(format!("timeout after {}s during {phase}", timeout.as_secs()));
+            return Err(format!(
+                "timeout after {}s during {phase}",
+                timeout.as_secs()
+            ));
         }
     }
     Ok(())
@@ -802,7 +812,10 @@ fn run_default_demo(clipboard_demo: bool) -> Result<(), String> {
                     );
                 }
                 Err(err) => {
-                    println!("clipboard_open=ok backend={:?} read_err={err}", clip.backend())
+                    println!(
+                        "clipboard_open=ok backend={:?} read_err={err}",
+                        clip.backend()
+                    )
                 }
             },
             Err(err) => println!("clipboard_open=unavailable ({err})"),

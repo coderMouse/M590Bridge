@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-hub-api-request"
+description = "Allow the main desktop WebView to call the loopback Hub API through a Rust IPC proxy."
+commands.allow = ["hub_api_request"]

@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-hub-runtime-info"
+description = "Allow the main desktop WebView to read embedded Hub ready/error state."
+commands.allow = ["hub_runtime_info"]

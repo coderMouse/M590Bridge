@@ -13,11 +13,12 @@ import {
   fetchConfig,
   fetchDiscover,
   postDiscoverRefresh,
-  fetchHealth,
+  fetchHubRuntimeInfo,
   fetchStatus,
   filePhaseLabel,
   fileProgressPercent,
   getApiBase,
+  hubOfflineMessage,
   MAX_SEND_FILE_BYTES,
   phaseToStatusLabel,
   postConfig,
@@ -28,11 +29,13 @@ import {
   postSendFile,
   postSendFileBytes,
   pickSendFileNative,
+  resolveHubOfflineReason,
   setAutostartEnabled,
   isLinuxTauriShell,
   isTauriShell,
   randomPairCode,
   type DiscoveredPeer,
+  type HubOfflineReason,
   type HubStatus,
 } from '@/lib/bridgeApi'
 import type { ConnectionStatus } from '@/lib/tokens'
@@ -54,6 +57,8 @@ function formatCodeDisplay(code: string) {
 export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const [tab, setTab] = useState<Tab>('pair')
   const [hubOnline, setHubOnline] = useState(false)
+  const [hubOfflineReason, setHubOfflineReason] = useState<HubOfflineReason>('starting')
+  const [hubRuntimeError, setHubRuntimeError] = useState<string | null>(null)
   const [status, setStatus] = useState<HubStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -87,12 +92,17 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const autostartSupported = useMemo(() => isLinuxTauriShell(), [])
 
   const refresh = useCallback(async () => {
-    const ok = await fetchHealth()
+    const reason = await resolveHubOfflineReason()
+    const ok = reason === 'online'
     setHubOnline(ok)
+    setHubOfflineReason(reason)
     if (!ok) {
+      const runtime = await fetchHubRuntimeInfo()
+      setHubRuntimeError(runtime?.error ?? null)
       setStatus(null)
       return
     }
+    setHubRuntimeError(null)
     try {
       const s = await fetchStatus()
       setStatus(s)
@@ -437,7 +447,7 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
       {!hubOnline ? (
         <div className="m-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-900">
           {tauriShell ? (
-            <>内嵌 Hub 正在启动；若持续离线，请退出重复进程后重新打开 M590Bridge。</>
+            <>{hubOfflineMessage(hubOfflineReason, hubRuntimeError)}</>
           ) : (
             <>
               未检测到本机 hub。请先在仓库根目录运行：

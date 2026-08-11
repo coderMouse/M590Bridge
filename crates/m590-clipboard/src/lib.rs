@@ -161,25 +161,21 @@ impl ImageClipboard {
         max_bytes: usize,
     ) -> Result<(m590_core::ImageEncoding, Vec<u8>), ClipboardError> {
         match self.to_png_bytes() {
-            Ok(png) if png.len() <= max_bytes => {
-                return Ok((m590_core::ImageEncoding::Png, png));
-            }
+            Ok(png) if png.len() <= max_bytes => Ok((m590_core::ImageEncoding::Png, png)),
             Ok(png) if self.rgba.len() <= max_bytes => {
                 // PNG larger than budget somehow but raw fits — rare.
                 let _ = png;
-                return Ok((m590_core::ImageEncoding::RawRgba, self.rgba.clone()));
+                Ok((m590_core::ImageEncoding::RawRgba, self.rgba.clone()))
             }
-            Ok(png) => {
-                return Err(ClipboardError::Backend(format!(
-                    "image too large for inline sync png={}B raw={}B limit={max_bytes}B",
-                    png.len(),
-                    self.rgba.len()
-                )));
-            }
+            Ok(png) => Err(ClipboardError::Backend(format!(
+                "image too large for inline sync png={}B raw={}B limit={max_bytes}B",
+                png.len(),
+                self.rgba.len()
+            ))),
             Err(_png_err) if self.rgba.len() <= max_bytes => {
-                return Ok((m590_core::ImageEncoding::RawRgba, self.rgba.clone()));
+                Ok((m590_core::ImageEncoding::RawRgba, self.rgba.clone()))
             }
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         }
     }
 }
@@ -535,10 +531,7 @@ pub fn file_clipboard_watch_likely() -> bool {
         }
         // Same gate arboard uses before selecting the Wayland data-control backend.
         // Only Ok(_) means ext/wlr-data-control is present; any Err → cannot watch.
-        matches!(
-            wl_clipboard_rs::utils::is_primary_selection_supported(),
-            Ok(_)
-        )
+        wl_clipboard_rs::utils::is_primary_selection_supported().is_ok()
     }
     #[cfg(target_os = "windows")]
     {

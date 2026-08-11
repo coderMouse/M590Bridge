@@ -5,15 +5,15 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use m590_clipboard::{ClipboardService, PlatformClipboard};
 use m590_core::{
     ConnectionState, DeviceId, InboundClipboardResult, InboundFileResult, Message,
-    QueueClipboardResult, QueueFileResult, Session, SessionEvent,
-    DEFAULT_HEARTBEAT_MISS_THRESHOLD, MAX_FILE_BYTES, MAX_MEMORY_FILE_BYTES,
+    QueueClipboardResult, QueueFileResult, Session, SessionEvent, DEFAULT_HEARTBEAT_MISS_THRESHOLD,
+    MAX_FILE_BYTES, MAX_MEMORY_FILE_BYTES,
 };
 use m590_net::{accept_framed, connect_framed, listen_on, TcpFrameStream};
 
@@ -25,7 +25,11 @@ use crate::status::{persist_status_config, with_status, HubPhase, SharedStatus};
 static STOP_BRIDGE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_RUNNING: AtomicBool = AtomicBool::new(false);
 
-type SharedDiscovery = Arc<Option<Arc<DiscoveryHandle>>>;
+type SharedDiscovery = Arc<Mutex<Option<Arc<DiscoveryHandle>>>>;
+
+fn discovery_handle(discovery: &SharedDiscovery) -> Option<Arc<DiscoveryHandle>> {
+    discovery.lock().ok().and_then(|guard| guard.clone())
+}
 
 const HUB_TOKEN_ENV: &str = "M590_HUB_TOKEN";
 const HUB_TOKEN_HEADER: &str = "x-m590-token";
@@ -80,6 +84,17 @@ pub fn run_hub(api_addr: &str) -> Result<(), String> {
 }
 
 pub fn run_hub_with_token(api_addr: &str, auth_token: String) -> Result<(), String> {
+    run_hub_with_token_on_ready(api_addr, auth_token, None)
+}
+
+/// Same as [`run_hub_with_token`], but invokes `on_ready` after the control API socket is bound
+/// and before the accept loop blocks. mDNS starts in a background thread so a slow/hung
+/// multicast stack cannot keep `/api/health` offline.
+pub fn run_hub_with_token_on_ready(
+    api_addr: &str,
+    auth_token: String,
+    on_ready: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<(), String> {
     if auth_token.trim().len() < 32 {
         return Err("hub auth token must be at least 32 characters".into());
     }
@@ -97,18 +112,8 @@ pub fn run_hub_with_token(api_addr: &str, auth_token: String) -> Result<(), Stri
         );
     }
 
-    let device_id = with_status(&shared, |s| s.device_id.clone());
-    let discovery: SharedDiscovery = match DiscoveryHandle::start(device_id) {
-        Ok(h) => {
-            println!("mdns_browse=on type={}", crate::discovery::SERVICE_TYPE);
-            Arc::new(Some(h))
-        }
-        Err(err) => {
-            eprintln!("mdns_browse=off error={err}");
-            Arc::new(None)
-        }
-    };
-
+    // Bind the localhost control API first so the desktop shell can become online even when
+    // mDNS startup is slow or blocked at login.
     let listener = TcpListener::bind(api_addr).map_err(|e| format!("bind hub api failed: {e}"))?;
     println!("hub_api=http://{api_addr}");
     println!("hub_auth=required header=X-M590-Token");
@@ -118,6 +123,27 @@ pub fn run_hub_with_token(api_addr: &str, auth_token: String) -> Result<(), Stri
     );
     let cfg_path = config::default_config_path();
     println!("config_path={}", cfg_path.display());
+    if let Some(cb) = on_ready {
+        cb();
+    }
+
+    let device_id = with_status(&shared, |s| s.device_id.clone());
+    let discovery: SharedDiscovery = Arc::new(Mutex::new(None));
+    let discovery_for_mdns = Arc::clone(&discovery);
+    thread::Builder::new()
+        .name("m590-mdns-init".into())
+        .spawn(move || match DiscoveryHandle::start(device_id) {
+            Ok(h) => {
+                if let Ok(mut slot) = discovery_for_mdns.lock() {
+                    *slot = Some(h);
+                }
+                println!("mdns_browse=on type={}", crate::discovery::SERVICE_TYPE);
+            }
+            Err(err) => {
+                eprintln!("mdns_browse=off error={err}");
+            }
+        })
+        .map_err(|e| format!("spawn mdns init: {e}"))?;
 
     for stream in listener.incoming() {
         match stream {
@@ -151,12 +177,7 @@ fn handle_http(
         .filter(|origin| origin_allowed(origin));
 
     if request.origin.is_some() && cors_origin.is_none() {
-        return write_json_error(
-            &mut stream,
-            403,
-            "origin not allowed",
-            None,
-        );
+        return write_json_error(&mut stream, 403, "origin not allowed", None);
     }
 
     if request.method == "OPTIONS" {
@@ -164,24 +185,17 @@ fn handle_http(
     }
 
     if !token_matches(&auth_token, request.auth_token.as_deref()) {
-        return write_json_error(
-            &mut stream,
-            401,
-            "hub authentication required",
-            cors_origin,
-        );
+        return write_json_error(&mut stream, 401, "hub authentication required", cors_origin);
     }
 
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/api/health") => {
-            write_response(
-                &mut stream,
-                200,
-                "application/json",
-                "{\"ok\":true}",
-                cors_origin,
-            )
-        }
+        ("GET", "/api/health") => write_response(
+            &mut stream,
+            200,
+            "application/json",
+            "{\"ok\":true}",
+            cors_origin,
+        ),
         ("GET", "/api/status") => {
             let json = with_status(&shared, |s| s.to_json());
             write_response(&mut stream, 200, "application/json", &json, cors_origin)
@@ -191,7 +205,7 @@ fn handle_http(
             write_response(&mut stream, 200, "application/json", &json, cors_origin)
         }
         ("GET", "/api/discover") => {
-            let json = match discovery.as_ref() {
+            let json = match discovery_handle(&discovery).as_ref() {
                 Some(d) => d.to_json(),
                 None => {
                     "{\"service_type\":\"_m590bridge._tcp.local.\",\"advertising\":false,\"peers\":[],\"error\":\"mdns unavailable\"}".into()
@@ -199,7 +213,7 @@ fn handle_http(
             };
             write_response(&mut stream, 200, "application/json", &json, cors_origin)
         }
-        ("POST", "/api/discover/refresh") => match discovery.as_ref() {
+        ("POST", "/api/discover/refresh") => match discovery_handle(&discovery).as_ref() {
             Some(d) => match d.refresh() {
                 Ok(()) => write_response(
                     &mut stream,
@@ -308,7 +322,7 @@ fn handle_http(
                 });
                 pending.clear();
             }
-            if let Some(d) = discovery.as_ref() {
+            if let Some(d) = discovery_handle(&discovery).as_ref() {
                 d.stop_advertise();
             }
             write_response(
@@ -341,7 +355,6 @@ fn apply_config_update(shared: &SharedStatus, body: &str) -> Result<String, Stri
     config::save_config(&cfg)?;
     Ok(cfg.to_json())
 }
-
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut data: Vec<u8> = Vec::with_capacity(4096);
@@ -430,7 +443,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     if content_length > 0 {
         body.truncate(content_length);
     }
-    let body = String::from_utf8_lossy(&body).trim_end_matches('\0').to_string();
+    let body = String::from_utf8_lossy(&body)
+        .trim_end_matches('\0')
+        .to_string();
     Ok(HttpRequest {
         method,
         path,
@@ -606,7 +621,7 @@ fn start_listen(
     });
     persist_status_config(&shared);
 
-    if let Some(d) = discovery.as_ref() {
+    if let Some(d) = discovery_handle(&discovery).as_ref() {
         if let Err(err) = d.advertise(&device_id, port) {
             eprintln!("mdns_advertise_error={err}");
         }
@@ -662,7 +677,7 @@ fn start_connect(
     persist_status_config(&shared);
 
     // Joiner does not advertise; ensure any leftover host ad is stopped.
-    if let Some(d) = discovery.as_ref() {
+    if let Some(d) = discovery_handle(&discovery).as_ref() {
         d.stop_advertise();
     }
 
@@ -730,7 +745,12 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
                 code,
                 addr,
                 device_id,
-            } => connect_worker(shared.clone(), code.clone(), addr.clone(), device_id.clone()),
+            } => connect_worker(
+                shared.clone(),
+                code.clone(),
+                addr.clone(),
+                device_id.clone(),
+            ),
         };
         {
             let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
@@ -819,7 +839,7 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
             }
         }
     }
-    if let Some(d) = discovery.as_ref() {
+    if let Some(d) = discovery_handle(&discovery).as_ref() {
         d.stop_advertise();
     }
     BRIDGE_RUNNING.store(false, Ordering::SeqCst);
@@ -828,17 +848,13 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
 fn humanize_bridge_error(err: &str) -> String {
     let lower = err.to_ascii_lowercase();
     if lower.contains("pairing rejected") || lower.contains("pairing code mismatch") {
-        return format!(
-            "配对码错误或已过期（两端请使用同一 6 位码）。详情：{err}"
-        );
+        return format!("配对码错误或已过期（两端请使用同一 6 位码）。详情：{err}");
     }
     if lower.contains("pairing timeout") {
         return err.to_string();
     }
     if lower.contains("unexpected peer device id") {
-        return format!(
-            "两端 device_id 冲突或异常（设置里改成本机唯一名称后重试）。详情：{err}"
-        );
+        return format!("两端 device_id 冲突或异常（设置里改成本机唯一名称后重试）。详情：{err}");
     }
     if lower.contains("unknown message type") {
         let ty = lower
@@ -1023,9 +1039,7 @@ fn listen_worker(
         s.listen_port = port;
         s.connection = Some(ConnectionState::Disconnected);
     });
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let mut conn = loop {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             return Ok(());
@@ -1239,13 +1253,10 @@ fn run_session_loop(
 
         // Stream more file chunks without starving the rest of the loop forever.
         if session.has_pending_outbound_file() {
-            session
-                .pump_outbound_file()
-                .map_err(|e| e.to_string())?;
+            session.pump_outbound_file().map_err(|e| e.to_string())?;
             file_progressed = true;
             let outbox = session.take_outbox();
-            conn.send_all(outbox.iter())
-                .map_err(|e| e.to_string())?;
+            conn.send_all(outbox.iter()).map_err(|e| e.to_string())?;
             note_outbound_file_completes(&shared, &outbox);
             if let Some((tid, sent, total)) = session.outbound_file_progress() {
                 with_status(&shared, |s| {
@@ -1270,8 +1281,7 @@ fn run_session_loop(
                         .map_err(|e| e.to_string())?;
                     last_peer_rx = Instant::now();
                     let outbox = session.take_outbox();
-                    conn.send_all(outbox.iter())
-                        .map_err(|e| e.to_string())?;
+                    conn.send_all(outbox.iter()).map_err(|e| e.to_string())?;
                     note_outbound_file_completes(&shared, &outbox);
                     match session.take_inbound_clipboard() {
                         Some(InboundClipboardResult::Applied { content_id, text }) => {
@@ -1290,10 +1300,8 @@ fn run_session_loop(
                             encoding,
                             data,
                         }) => {
-                            let summary = format!(
-                                "[image {width}x{height} {}B {encoding:?}]",
-                                data.len()
-                            );
+                            let summary =
+                                format!("[image {width}x{height} {}B {encoding:?}]", data.len());
                             with_status(&shared, |s| {
                                 s.last_sync_content_id = Some(content_id);
                                 s.last_sync_text = Some(summary);
@@ -1306,16 +1314,14 @@ fn run_session_loop(
                                     Ok(image) => {
                                         if let Err(err) = clip.write_image(&image) {
                                             with_status(&shared, |s| {
-                                                s.last_error = Some(format!(
-                                                    "clipboard_write_image: {err}"
-                                                ));
+                                                s.last_error =
+                                                    Some(format!("clipboard_write_image: {err}"));
                                             });
                                         }
                                     }
                                     Err(err) => {
                                         with_status(&shared, |s| {
-                                            s.last_error =
-                                                Some(format!("image_decode: {err}"));
+                                            s.last_error = Some(format!("image_decode: {err}"));
                                         });
                                     }
                                 }
@@ -1350,8 +1356,7 @@ fn run_session_loop(
                     let mut handled = false;
                     if let Ok(Some(image)) = m590_clipboard::image_from_paths(&paths) {
                         content_seq += 1;
-                        let cid =
-                            format!("ui-clip-imgfiles-{}-{content_seq}", std::process::id());
+                        let cid = format!("ui-clip-imgfiles-{}-{content_seq}", std::process::id());
                         match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
                             Ok((encoding, data)) => {
                                 let summary = format!(
@@ -1484,21 +1489,11 @@ fn run_session_loop(
                         }
                     } else if let Some(path) = m590_clipboard::regular_file_from_text(&text) {
                         // Linux often exposes a copied file as plain path text only.
-                        match offer_local_file(
-                            session,
-                            &mut content_seq,
-                            &path.to_string_lossy(),
-                        ) {
+                        match offer_local_file(session, &mut content_seq, &path.to_string_lossy()) {
                             Ok((summary, transfer_id, file_name, bytes)) => {
                                 conn.send_all(session.take_outbox().iter())
                                     .map_err(|e| e.to_string())?;
-                                mark_file_sending(
-                                    &shared,
-                                    summary,
-                                    transfer_id,
-                                    file_name,
-                                    bytes,
-                                );
+                                mark_file_sending(&shared, summary, transfer_id, file_name, bytes);
                                 clip.adopt_text_baseline();
                             }
                             Err(err) => {
@@ -1586,7 +1581,6 @@ fn run_session_loop(
         }
     }
 }
-
 
 fn mark_file_sending(
     shared: &SharedStatus,
@@ -1814,6 +1808,8 @@ fn handle_inbound_file(
 mod tests {
     use super::*;
     use std::net::Shutdown;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1825,7 +1821,7 @@ mod tests {
             handle_http(
                 stream,
                 crate::status::new_shared_status(),
-                Arc::new(None),
+                Arc::new(Mutex::new(None)),
                 Arc::from(TEST_TOKEN),
             )
             .unwrap();
@@ -1852,6 +1848,50 @@ mod tests {
         let token = generate_hub_token().unwrap();
         assert_eq!(token.len(), 64);
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn hub_control_api_ready_before_mdns_init_completes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_flag = Arc::clone(&ready);
+        let token = TEST_TOKEN.to_string();
+        let addr_thread = addr.clone();
+        let server = thread::spawn(move || {
+            let _ = run_hub_with_token_on_ready(
+                &addr_thread,
+                token,
+                Some(Box::new(move || {
+                    ready_flag.store(true, Ordering::SeqCst);
+                })),
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.load(Ordering::SeqCst) {
+            if Instant::now() > deadline {
+                panic!("hub did not become ready within 2s");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut client = TcpStream::connect(&addr).unwrap();
+        let req = request(
+            "GET",
+            "/api/health",
+            &format!("X-M590-Token: {TEST_TOKEN}\r\n"),
+            "",
+        );
+        client.write_all(req.as_bytes()).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(response.contains("\"ok\":true"), "{response}");
+        let _ = server.thread().id();
     }
 
     #[test]

@@ -243,8 +243,13 @@ mod tests {
         deadline: Instant,
     ) {
         while session.state() != ConnectionState::Connected {
-            assert!(Instant::now() < deadline, "{label} pairing timeout state={:?}", session.state());
-            conn.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "{label} pairing timeout state={:?}",
+                session.state()
+            );
+            conn.set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
             match conn.recv() {
                 Ok(msg) => {
                     session.handle(SessionEvent::Message(msg)).unwrap();
@@ -319,9 +324,7 @@ mod tests {
         exchange_until_connected(&mut joiner, &mut joiner_conn, "joiner", deadline);
 
         joiner.queue_clipboard_text("cid-tcp", "tcp-hello").unwrap();
-        joiner_conn
-            .send_all(joiner.take_outbox().iter())
-            .unwrap();
+        joiner_conn.send_all(joiner.take_outbox().iter()).unwrap();
 
         let got = server.join().expect("host thread panicked");
         assert_eq!(got.as_deref(), Some("tcp-hello"));
