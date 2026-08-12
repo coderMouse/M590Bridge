@@ -19,6 +19,7 @@ use image::ImageDecoder;
 mod error;
 mod file_paths;
 mod image_file;
+mod virtual_file;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod arboard_text;
@@ -29,9 +30,18 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(target_os = "windows")]
+mod windows_virtual_file;
+
 pub use error::ClipboardError;
 pub use file_paths::{first_regular_file, read_file_for_offer, regular_file_from_text};
 pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
+pub use virtual_file::VirtualFile;
+
+#[cfg(target_os = "windows")]
+pub use windows_virtual_file::{
+    publish_virtual_file, pump_virtual_file_messages, VirtualFileClipboard,
+};
 
 /// Which OS/display backend is selected or available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

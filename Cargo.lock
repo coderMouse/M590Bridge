@@ -2157,6 +2157,8 @@ dependencies = [
  "arboard",
  "image",
  "m590-core",
+ "windows",
+ "windows-core 0.61.2",
  "wl-clipboard-rs",
 ]
 

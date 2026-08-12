@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
-> 更新：2026-08-11
-> 阶段：文本+图片+V2 文件流式 + mDNS + Linux 发布完成 + Windows NSIS/登录自启待真机验收
+> 更新：2026-08-12
+> 阶段：Windows NSIS 已成功打包安装；task-043 虚拟文件原型代码完成、待 Explorer 真机验收
 
 ## 目标（近期）
 
@@ -38,7 +38,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
-- [ ] **task-042** Windows NSIS 安装包 / 用户登录自启（代码已实现，待 Windows 10 真机打包与验收）
+- [ ] **task-042** Windows NSIS 安装包 / 用户登录自启（NSIS 已成功打包安装；登录自启、卸载清理与跨机回归待验收）
+- [ ] **task-043** Windows 单文件 OLE 虚拟剪贴板原型（代码/Windows target 检查完成，待 Explorer 真机验收；暂不接网络）
 
 ## 产品分期对照
 
@@ -62,7 +63,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 文件 offer/request/chunk/complete | 有 |
 | hub 自动落盘 + send_file(_bytes) | 有 |
 | UI 选文件发送 + 进度 + 保存目录 | **有** |
-| 文件夹 / OS 文件剪贴板 | 无 |
+| 文件夹 / OS 文件剪贴板 | 端到端无；Windows 单文件 OLE 原型待 Explorer 真机验收（task-043） |
 | 大文件流式（磁盘流+SHA-256，软上限 8GiB） | **有**（task-033；同连接串行；task-036 已移除固定批次节流和多帧累计误判） |
 | file_list 触发原文件 offer（非图片，路径流式） | **有** |
 | 路径文本（非图片）→ file offer | **有**（task-025） |
@@ -74,20 +75,21 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | mDNS 发现（`_m590bridge._tcp`） | **有**（task-029；仍需配对码） |
 | Linux `.deb` 安装包 | **有**（task-032；amd64、未签名） |
 | Linux 用户登录自启 | **有**（task-038/039；正式/standalone 桌面端显式启停，开发壳拒绝开启） |
-| Windows NSIS 安装包 | **待真机验收**（task-042；当前用户安装、未签名） |
+| Windows NSIS 安装包 | **已成功打包安装**（task-042；当前用户安装、未签名；功能回归待验收） |
 | Windows 用户登录自启 | **待真机验收**（task-042；HKCU Run、开发壳拒绝开启、卸载清理） |
 | localhost Hub API 鉴权 | **有**（task-035；进程临时令牌 + 限定 CORS） |
 | 设置「发现方式」开关 | 无（默认开启 browse） |
 
 ## 下一步（有序）
 
-1. Windows 10 真机打包并验收 task-042 安装/登录自启
-2. （后续）文件失败反馈、取消/重试、会话加密与配对码随机性
-3. （可选）独立文件数据连接 / 更高吞吐调优
-4. （可选）设置页发现开关 / 本机显示名
-5. （可选）多文件并行 / 文件夹 / OS 文件剪贴板
+1. Windows 10 真机验证 task-043：Explorer 粘贴虚拟文件时才读取内容
+2. 恢复 task-042 剩余的登录自启与跨机回归验收
+3. （后续）把虚拟文件 `IStream` 接入 `FileRequest`，补取消/超时
+4. （可选）独立文件数据连接 / 更高吞吐调优
+5. （可选）设置页发现开关 / 本机显示名
+6. （可选）多文件并行 / 文件夹 / Linux FUSE
 
-> task-041 已完成并经用户真机确认「API 已连接」。task-042 保持 `in_progress`，等待 Windows 真机结果。
+> task-041 已完成。task-042 已确认 NSIS 可生成并安装，但剩余验收暂停且仍为 `in_progress`；当前一次只做 task-043。
 
 ## 用户怎么用
 

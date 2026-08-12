@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-11（task-042）
+> 更新日期：2026-08-12（task-043）
 
 ## 桌面（推荐）
 
@@ -60,7 +60,7 @@ sudo apt remove m590-bridge
 - 若旧入口已指向 `target/debug/m590-ui`，先关闭开关（或删除该入口），再从正式/standalone 桌面端重新开启。
 - 关闭开关会删除入口。`apt remove` 不会也不应遍历各用户主目录；卸载前先关闭开关，或卸载后手工删除上述文件。
 
-### Windows NSIS / 用户登录自启（task-042，待真机验收）
+### Windows NSIS / 用户登录自启（task-042，NSIS 已打包安装、自启待验收）
 
 Windows 构建机需要 Node.js 22 LTS、Rust stable MSVC、Visual Studio Build Tools 2022
 （Desktop development with C++ + Windows SDK）。从仓库根目录执行：
@@ -78,7 +78,20 @@ Get-ChildItem ..\target\release\bundle\nsis\*.exe
 - 设置页开关读写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `M590Bridge` 值。
 - 开启后可用 `reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge` 检查；关闭或卸载后该值应不存在。
 - 依赖 Vite 的开发壳拒绝开启自启；必须用安装版或 release/standalone。
-- 当前 Linux 环境只能验证代码、前端和 release；Windows `.exe`、安装、注销登录与卸载仍需真机确认。
+- 用户已确认 Windows `.exe` 可生成并安装；当前 Linux 环境不能复验。注销登录自启、关闭/卸载清理和跨机回归仍需 Windows 真机确认。
+
+### Windows OLE 虚拟文件原型（task-043，待 Explorer 真机验收）
+
+在 Windows 10 仓库根目录运行：
+
+```powershell
+cargo run -p m590-clipboard --example windows_virtual_file -- 268435456 8
+```
+
+- 参数依次为虚拟文件大小（字节）和每次读取延迟（毫秒）；示例为 256 MiB / 8 ms。
+- 看到 `virtual_file_ready` 后，先确认尚无 `content_opened`，再到 Explorer 目标目录按 `Ctrl+V`。
+- Explorer 请求 `CFSTR_FILECONTENTS` 时终端才应打印 `content_opened`；确认系统复制进度出现，最终文件大小为 268435456 字节。
+- 按 Enter 退出原型。它只验证本机 OLE/Shell 按需取流，不连接 M590Bridge 网络会话，也不会先生成永久中间文件。
 
 ## Rust 测试 / CLI
 
@@ -108,7 +121,8 @@ cargo run -p m590-clipboard --example probe_clipboard
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
 - **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart；正式/standalone 桌面端可用，开发壳拒绝开启（task-038/039）
-- **Windows NSIS/登录自启代码**：当前用户 NSIS + HKCU Run + 卸载清理已实现；待 Windows 10 真机验证（task-042）
+- **Windows NSIS/登录自启**：当前用户 NSIS 已成功打包安装；HKCU Run + 卸载清理代码已实现，运行行为待 Windows 10 真机验证（task-042）
+- **Windows OLE 虚拟文件代码**：单文件 `FILEDESCRIPTORW` + 延迟 `IStream` 已通过 Windows target 静态检查；Explorer 行为待真机验证（task-043）
 
 ## 文件 API（task-021+）
 
@@ -154,8 +168,8 @@ UI 加入页「局域网设备」旁有刷新图标。
 
 ## 未做
 
-- 文件夹 / OS 文件剪贴板 / 断点续传 / 独立数据连接
-- Windows NSIS 安装、登录自启、卸载真机验收（task-042）
+- 文件夹 / 端到端 OS 文件剪贴板 / 断点续传 / 独立数据连接
+- Windows 登录自启、卸载清理与跨机回归真机验收（task-042）
 - 设置页「发现方式」开关  
 - （已取消）019A  
 
@@ -165,4 +179,5 @@ UI 加入页「局域网设备」旁有刷新图标。
 docs/plans/current.md
 docs/domain/protocol-draft.md
 docs/tasks/task-042.md
+docs/tasks/task-043.md
 ```

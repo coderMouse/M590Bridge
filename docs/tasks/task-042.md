@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（Linux 侧实现与静态验证；待 Windows 10 真机打包/安装/登录自启验收）
+`in_progress`（Windows 10 已成功打包并安装；用户暂缓登录自启与跨机回归验收）
 
 ## 目标
 
@@ -64,7 +64,7 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge
 - [x] Windows 后端可写、读、删当前用户 Run 值，并拒绝开发壳开启。
 - [x] NSIS 配置为当前用户安装，卸载 hook 清理 Run 值。
 - [x] Linux 可执行的 Rust/前端/release 验证通过。
-- [ ] Windows 10 真机成功生成并安装 NSIS `.exe`。
+- [x] Windows 10 真机成功生成并安装 NSIS `.exe`（用户于 2026-08-11 确认）。
 - [ ] 开启后注销/重新登录只启动一个 M590Bridge，托盘和内嵌 Hub 正常。
 - [ ] 关闭后 Run 值消失，重新登录不启动；卸载后 Run 值也不存在。
 - [ ] Windows 安装版与 Linux 完成文本、图片、文件回归。
@@ -96,7 +96,8 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge
 - `cd ui && npm run build`：通过，Vite 生成 production dist。
 - `cargo build -p m590-ui --release --features custom-protocol`：通过。
 - `cargo check -p m590-ui --target x86_64-pc-windows-gnu --features custom-protocol`：首次因全局 Cargo cache 只读失败；改用 `/tmp` 独立 cache 后已编译 Windows 依赖和 `winreg`，最终被缺少 `x86_64-w64-mingw32-windres` 的 Tauri 资源构建步骤阻塞。未将其记为 Windows 构建通过。
-- Windows NSIS/安装/登录自启：未运行，等待用户真机。
+- Windows NSIS 打包与安装：用户于 2026-08-11 确认通过。
+- Windows 登录自启、卸载清理与跨机回归：尚未反馈，保持待验收。
 
 ## 文档影响检查
 
@@ -122,4 +123,4 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge
 
 ## 下一步
 
-- Windows 10 真机本地打包并按验收步骤反馈结果。
+- 用户已明确暂缓本 task；后续恢复时从登录自启、卸载清理与跨机回归继续。
