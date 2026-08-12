@@ -80,7 +80,7 @@ Get-ChildItem ..\target\release\bundle\nsis\*.exe
 - 依赖 Vite 的开发壳拒绝开启自启；必须用安装版或 release/standalone。
 - 用户已确认 Windows `.exe` 可生成并安装；当前 Linux 环境不能复验。注销登录自启、关闭/卸载清理和跨机回归仍需 Windows 真机确认。
 
-### Windows OLE 虚拟文件原型（task-043，待 Explorer 真机验收）
+### Windows OLE 虚拟文件原型（task-043，Explorer 真机已通过）
 
 在 Windows 10 仓库根目录运行：
 
@@ -122,7 +122,7 @@ cargo run -p m590-clipboard --example probe_clipboard
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
 - **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart；正式/standalone 桌面端可用，开发壳拒绝开启（task-038/039）
 - **Windows NSIS/登录自启**：当前用户 NSIS 已成功打包安装；HKCU Run + 卸载清理代码已实现，运行行为待 Windows 10 真机验证（task-042）
-- **Windows OLE 虚拟文件代码**：单文件 `FILEDESCRIPTORW` + 延迟 `IStream` 已通过 Windows target 静态检查；Explorer 行为待真机验证（task-043）
+- **Windows OLE 虚拟文件原型**：单文件 `FILEDESCRIPTORW` + 延迟 `IStream` 已通过 Windows target 静态检查和 Windows 10 Explorer 真机验证（task-043）
 
 ## 文件 API（task-021+）
 

@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（原型代码与 Linux/Windows target 静态验证已完成，等待 Windows 10 Explorer 真机验收）
+`completed`（2026-08-12：Windows 10 Explorer 真机验收通过）
 
 ## 目标
 
@@ -57,7 +57,7 @@ cargo run -p m590-clipboard --example windows_virtual_file -- 268435456 8
 - [x] `IDataObject::QueryGetData/GetData` 只接受本 task 声明的三种格式和合法 `lindex` / `tymed`。
 - [x] 文件描述符拒绝空名、路径分隔符、`.` / `..` 和超长 UTF-16 名称。
 - [x] 内容工厂只在 `CFSTR_FILECONTENTS` 请求时调用；流支持 Explorer 所需的 `Read` / `Seek` / `Stat`。
-- [ ] Windows 10 Explorer 可粘贴出内容正确的单文件，并观察到系统复制进度。
+- [x] Windows 10 Explorer 可粘贴出内容正确的单文件，并观察到系统复制进度。
 
 ## 实施记录
 
@@ -76,7 +76,7 @@ cargo run -p m590-clipboard --example windows_virtual_file -- 268435456 8
 - `crates/m590-clipboard/src/windows_virtual_file.rs`：OLE `IDataObject`、延迟 `IStream`、STA 生命周期与消息泵。
 - `crates/m590-clipboard/src/lib.rs`：导出平台无关描述和 Windows 发布 API。
 - `crates/m590-clipboard/examples/windows_virtual_file.rs`：Windows Explorer 真机原型入口。
-- `AGENTS.md`、`docs/plans/current.md`、`docs/discovery/commands.md`、`docs/discovery/project-map.md`、`docs/tasks/task-042.md`、本 task：同步当前边界、状态、命令与结构。
+- `AGENTS.md`、`docs/plans/current.md`、`docs/discovery/commands.md`、`docs/discovery/project-map.md`、`docs/tasks/task-042.md`、`项目说明.md`、本 task：同步当前边界、状态、命令与结构。
 
 ## 验证结果
 
@@ -86,19 +86,18 @@ cargo run -p m590-clipboard --example windows_virtual_file -- 268435456 8
 - `cargo clippy -p m590-clipboard --lib --no-deps -- -D warnings`：未通过；被 task-043 范围外既有 `src/image_file.rs:16` 的 `clippy::doc_lazy_continuation` 拦截。
 - `cargo clippy -p m590-clipboard --target x86_64-pc-windows-gnu --lib --examples --no-deps -- -D warnings -A clippy::doc_lazy_continuation`：通过；只豁免上述既有文档注释告警后，task-043 Windows 库/example 无新增 clippy 告警。
 - `rustfmt --edition 2021 --check crates/m590-clipboard/src/virtual_file.rs crates/m590-clipboard/src/windows_virtual_file.rs crates/m590-clipboard/examples/windows_virtual_file.rs`：通过。
-- Windows 10 Explorer 运行：当前 Linux 环境无法执行，待用户按本 task 命令真机验收；未记为通过。
+- Windows 10 Explorer 运行：用户于 2026-08-12 确认真机测试通过；粘贴前未打开内容，按 `Ctrl+V` 后开始取流，文件生成和系统复制进度符合预期。
 
 ## 文档影响检查
 
-- 已更新：当前计划、常用命令、项目结构与 Agent 当前阶段说明。
-- 无需更新：没有修改协议、Hub API、网络状态机、UI 或配置字段，因此 `docs/domain/protocol-draft.md`、`docs/ui-spec.md` 与 `项目说明.md` 不因本原型更新。
+- 已更新：当前计划、常用命令、项目结构、项目说明与 Agent 当前阶段说明。
+- 无需更新：没有修改协议、Hub API、网络状态机、UI 或配置字段，因此 `docs/domain/protocol-draft.md` 与 `docs/ui-spec.md` 无需更新。
 
 ## 风险 / blocker
 
-- 当前 Linux 环境不能运行 Windows OLE/Explorer，只能做 Windows target 类型检查；Shell 运行行为必须由 Windows 10 真机确认。
 - Explorer 或安全软件可能在实际粘贴前请求文件内容；本原型只能保证按 `FILECONTENTS` 消费请求取流，不能识别请求一定来自键盘 `Ctrl+V`。
 - 当前网络协议没有取消消息；因此本 task 明确不接网络，避免用户取消 Explorer 复制后发送端仍持续占用连接。
 
 ## 下一步
 
-- 在 Windows 10 运行 example，并在 Explorer 粘贴验证惰性打开、内容/大小和系统复制进度；通过后再另建 task 接入 `FileRequest` 与取消语义。
+- 另建 task-044，设计并实现虚拟文件 `IStream` 与现有 `FileRequest` 的端到端桥接及取消语义。

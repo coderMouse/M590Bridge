@@ -1,7 +1,7 @@
 # 项目结构图 · M590Bridge
 
 > 更新日期：2026-08-12
-> 状态：文本+图片+流式文件+mDNS+Linux 发布；Windows NSIS/登录自启与 OLE 虚拟文件待真机验收（task-020..043）
+> 状态：文本+图片+流式文件+mDNS+Linux 发布；Windows OLE 虚拟文件原型已真机通过，NSIS 登录自启仍待验收（task-020..043）
 
 ```text
 crates/
