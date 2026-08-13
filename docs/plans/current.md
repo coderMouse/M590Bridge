@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-12
-> 阶段：Windows NSIS 已成功打包安装；task-044 Windows 按粘贴取流网络桥已完成代码与 Linux 验证，待 Windows↔Linux 真机验收
+> 阶段：Windows NSIS 已成功打包安装；task-044 首轮真机发现 OLE 剪贴板所有权误判，已修复待 Windows↔Linux 复测
 
 ## 目标（近期）
 

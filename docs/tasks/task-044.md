@@ -51,6 +51,7 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 - 新增 `request_file_stream`：只登记流目标并发出 `FileRequest`；后续 `FileChunk` 仍由 core 校验 offset、大小、offer/complete SHA-256，再以 `Chunk` 事件交给 daemon。
 - 在 `m590-daemon` 新增有界 `VirtualFileBridge`：首次打开 reader 才发 `Request`，网络 producer 背压写入，reader drop 或已开始传输后读写连续 30 秒无进展时发 `Cancel`；未粘贴的 offer 不受该超时影响。Windows-only STA manager 持有 OLE guard 并泵消息。
 - Hub Windows 分支发布单文件虚拟剪贴板，暂停普通文件列表轮询，按 OLE 请求启动网络拉取；流完成后保留虚拟剪贴板直到用户替换，取消/超时清理并发 `FileCancel`。
+- Windows↔Linux 首轮真机发现：Windows 发布虚拟文件后立即误报 `clipboard replaced`。根因是用 `OleGetClipboard` 返回对象与原对象的 `IUnknown` 指针地址比较身份；OLE 可返回代理/包装对象，地址比较不代表剪贴板所有权。改用系统 `OleIsCurrentClipboard` 的原生 `S_OK` 结果判断。
 
 ## 修改文件
 
@@ -73,6 +74,11 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 - `CARGO_HOME=<临时可写缓存> cargo clippy -p m590-daemon --target x86_64-pc-windows-gnu --lib --no-deps -- -D warnings`：通过。
 - `cargo test -p m590-daemon virtual_file_bridge`：通过；3 个有界管道测试全部通过，包含 producer 在消费者停滞时超时并发出取消事件。
 - `cargo clippy -p m590-daemon --lib --no-deps -- -D warnings`：通过；新增 producer 超时路径无告警。
+- Windows↔Linux 首轮真机：失败；Windows `Ctrl+V` 前后收到 `clipboard replaced` 取消，已定位为 OLE 所有权身份误判并修复，待复测。
+- `cargo test -p m590-clipboard -p m590-daemon`：OLE 所有权修复后通过；clipboard 21、daemon lib 25 + bin 1。
+- `cargo clippy -p m590-clipboard -p m590-daemon --lib --no-deps -- -D warnings -A clippy::doc_lazy_continuation`：通过。
+- `CARGO_HOME=<临时可写缓存> cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --examples`、`cargo check -p m590-daemon --target x86_64-pc-windows-gnu`：OLE 所有权修复后均通过。
+- `CARGO_HOME=<临时可写缓存> cargo clippy -p m590-daemon --target x86_64-pc-windows-gnu --lib --no-deps -- -D warnings`：OLE 所有权修复后通过。
 - Windows↔Linux Explorer 真机：待用户测试，不能以 Linux/交叉检查替代。
 
 ## 文档影响检查
@@ -84,6 +90,7 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 
 - OLE `IStream` 只允许所有 seek origin 计算后仍位于当前位置的 no-op；网络流不能任意回退，需在 Windows 真机确认 Explorer 行为。
 - Explorer 可能重复请求 `FILECONTENTS`；本 task 先限制单个活动消费者并返回清晰错误，记录后续扩展点。
+- `OleIsCurrentClipboard` 修复已通过 Windows 目标交叉编译，但是否消除真机的立即取消仍需 Windows↔Linux 复测。
 
 ## 下一步
 

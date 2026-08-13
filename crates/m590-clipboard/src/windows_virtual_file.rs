@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::thread::ThreadId;
 
-use windows::core::{implement, ComObject, Error, IUnknown, Interface, Ref, Result, BOOL, HRESULT};
+use windows::core::{implement, ComObject, Error, Interface, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
     DATA_S_SAMEFORMATETC, DV_E_CLIPFORMAT, DV_E_DVASPECT, DV_E_DVTARGETDEVICE, DV_E_LINDEX,
     DV_E_TYMED, E_ACCESSDENIED, E_NOTIMPL, E_POINTER, OLE_E_ADVISENOTSUPPORTED, OLE_E_NOCONNECTION,
@@ -20,7 +20,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{
-    OleGetClipboard, OleInitialize, OleSetClipboard, OleUninitialize, DROPEFFECT_COPY,
+    OleInitialize, OleSetClipboard, OleUninitialize, DROPEFFECT_COPY,
 };
 use windows::Win32::UI::Shell::{
     SHCreateStdEnumFmtEtc, CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_PREFERREDDROPEFFECT,
@@ -34,6 +34,12 @@ use crate::virtual_file::ReadSeek;
 use crate::{ClipboardError, VirtualFile};
 
 const FORMAT_INDEX_NONE: i32 = -1;
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    #[link_name = "OleIsCurrentClipboard"]
+    fn ole_is_current_clipboard(data_object: *mut std::ffi::c_void) -> i32;
+}
 
 #[derive(Clone, Copy)]
 struct ClipboardFormats {
@@ -463,15 +469,9 @@ impl Drop for VirtualFileClipboard {
 }
 
 fn is_current_clipboard(object: &IDataObject) -> bool {
-    let Ok(current) = (unsafe { OleGetClipboard() }) else {
-        return false;
-    };
-    let (Ok(current_identity), Ok(object_identity)) =
-        (current.cast::<IUnknown>(), object.cast::<IUnknown>())
-    else {
-        return false;
-    };
-    current_identity.as_raw() == object_identity.as_raw()
+    // OleGetClipboard may return an OLE proxy/wrapper whose IUnknown address differs from the
+    // object passed to OleSetClipboard. Only OleIsCurrentClipboard defines ownership identity.
+    unsafe { ole_is_current_clipboard(object.as_raw()) == S_OK.0 }
 }
 
 pub fn publish_virtual_file(
