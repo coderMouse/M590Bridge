@@ -1523,29 +1523,39 @@ fn run_session_loop(
                         }
                     }
                 }
-                while keep_current {
-                    let Some(msg) = ole_manager.take_event() else {
-                        break;
-                    };
-                    match msg {
-                        ManagerEvent::PublishFailed(error) => {
-                            current.producer.fail(error.clone());
-                            with_status(&shared, |s| {
-                                s.last_error = Some(format!("OLE publish: {error}"))
-                            });
-                        }
-                        ManagerEvent::ClipboardReplaced => {
-                            current.producer.fail("clipboard replaced");
-                            if !current.completed {
-                                let transfer_id = current.transfer_id.clone();
-                                session
-                                    .cancel_file(transfer_id, "clipboard replaced")
-                                    .map_err(|e| e.to_string())?;
-                                conn.send_all(session.take_outbox().iter())
-                                    .map_err(|e| e.to_string())?;
+                if keep_current {
+                    if let Some(msg) = ole_manager.take_event() {
+                        match msg {
+                            ManagerEvent::PublishFailed(error) => {
+                                current.producer.fail(error.clone());
+                                if !current.completed {
+                                    session
+                                        .cancel_file(
+                                            current.transfer_id.clone(),
+                                            format!("OLE publish failed: {error}"),
+                                        )
+                                        .map_err(|e| e.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                with_status(&shared, |s| {
+                                    s.file_transfer_phase = Some("failed".into());
+                                    s.last_error = Some(format!("OLE publish: {error}"));
+                                });
+                                keep_current = false;
                             }
-                            keep_current = false;
-                            break;
+                            ManagerEvent::ClipboardReplaced => {
+                                current.producer.fail("clipboard replaced");
+                                if !current.completed {
+                                    let transfer_id = current.transfer_id.clone();
+                                    session
+                                        .cancel_file(transfer_id, "clipboard replaced")
+                                        .map_err(|e| e.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                keep_current = false;
+                            }
                         }
                     }
                 }

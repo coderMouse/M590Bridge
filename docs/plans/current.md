@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-12
-> 阶段：Windows NSIS 已成功打包安装；task-044 已改用序列号检测 OLE 替换并去除 file_list/路径文本重复 offer，待 Windows↔Linux 复测
+> 阶段：Windows NSIS 已成功打包安装；task-044 Linux→Windows Explorer 基本粘贴已真机通过，待按需/进度/取消细项验收
 
 ## 目标（近期）
 
@@ -48,7 +48,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 |--------|------|------|
 | MVP | 配对 + 文本 | **已完成** |
 | V2 · 图片 | 图片剪贴板双向 | **已完成** |
-| V2 · 文件 | 元数据 + 按需 + 进度 + 流式 | **基本可用**（task-033 流式+SHA-256；Windows 本机粘贴原型已通过，尚无端到端 OS 桌面粘贴/文件夹/断点续传） |
+| V2 · 文件 | 元数据 + 按需 + 进度 + 流式 | **基本可用**（task-033 流式+SHA-256；Linux→Windows Explorer 单文件粘贴已通过，无文件夹/断点续传） |
 | V3 · mDNS | 局域网发现 | **第一刀完成**（task-029） |
 | V3 · 安装 | 安装包/自启 | **Linux `.deb` + 用户登录自启已完成**；Windows NSIS 已成功打包安装，HKCU 自启待真机验收 |
 
@@ -64,7 +64,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 文件 offer/request/chunk/complete | 有 |
 | hub 自动落盘 + send_file(_bytes) | 有 |
 | UI 选文件发送 + 进度 + 保存目录 | **有** |
-| 文件夹 / OS 文件剪贴板 | Windows 单文件按粘贴取流已接入网络，待 Windows↔Linux 真机验收；无文件夹/FUSE |
+| 文件夹 / OS 文件剪贴板 | Windows 单文件 Explorer 粘贴基本链路已真机通过，按需/进度/取消细项待验收；无文件夹/FUSE |
 | 大文件流式（磁盘流+SHA-256，软上限 8GiB） | **有**（task-033；同连接串行；task-036 已移除固定批次节流和多帧累计误判） |
 | file_list 触发原文件 offer（非图片，路径流式） | **有** |
 | 路径文本（非图片）→ file offer | **有**（task-025） |

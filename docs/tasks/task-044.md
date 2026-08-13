@@ -54,6 +54,7 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 - Windows↔Linux 首轮真机发现：Windows 发布虚拟文件后立即误报 `clipboard replaced`。根因是用 `OleGetClipboard` 返回对象与原对象的 `IUnknown` 指针地址比较身份；OLE 可返回代理/包装对象，地址比较不代表剪贴板所有权。改用系统 `OleIsCurrentClipboard` 的原生 `S_OK` 结果判断。
 - 第二轮真机仍立即误报且 Explorer 粘贴为灰色，说明 `OleIsCurrentClipboard` 在当前延迟渲染/STA 生命周期中也不能作为发布后立即轮询的稳定信号。改为记录 `OleSetClipboard` 后的 Windows 剪贴板序列号，只有检测到明确的新序列号才判定被替换；序列号不可用时保留虚拟文件，不再误取消。
 - 复查发送端发现文件管理器可能同时发布 `file_list` 与同一路径文本；旧逻辑会连续发送两个 `FileOffer`，接收端重发 OLE 对象并使 Explorer 看到灰色粘贴。成功处理 `file_list` 后现在立即收养文本基线，确保一次复制只发一个 offer。
+- 用户第三轮真机确认 Linux 复制单文件后可在 Windows Explorer 粘贴。继续补齐 OLE 发布失败路径：立即向对端发送 `FileCancel`、将传输标为失败并释放虚拟接收状态，避免发布失败后永久暂停普通剪贴板轮询。
 
 ## 修改文件
 
@@ -82,7 +83,11 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 - `CARGO_HOME=<临时可写缓存> cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --examples`、`cargo check -p m590-daemon --target x86_64-pc-windows-gnu`：OLE 所有权修复后均通过。
 - `CARGO_HOME=<临时可写缓存> cargo clippy -p m590-daemon --target x86_64-pc-windows-gnu --lib --no-deps -- -D warnings`：OLE 所有权修复后通过。
 - Windows↔Linux 第二轮真机：失败；仍收到 `clipboard replaced`，且 Explorer 粘贴为灰色。已将替换检测改为剪贴板序列号，待第三轮复测。
-- Windows↔Linux Explorer 真机：待用户测试，不能以 Linux/交叉检查替代。
+- Windows↔Linux 第三轮真机：Linux 复制 MP4 后 Windows Explorer 可粘贴，灰色粘贴与 `clipboard replaced` 误取消已消失（用户确认）。未粘贴不传内容、系统进度、取消/超时仍需分别验收。
+- `cargo test -p m590-daemon`：OLE 发布失败清理补齐后通过；daemon lib 25 + bin 1。
+- `cargo clippy -p m590-daemon --lib --no-deps -- -D warnings`：通过。
+- `CARGO_HOME=<临时可写缓存> cargo check -p m590-daemon --target x86_64-pc-windows-gnu`、`cargo clippy -p m590-daemon --target x86_64-pc-windows-gnu --lib --no-deps -- -D warnings`：通过。
+- Windows↔Linux Explorer 真机：基本粘贴链路已通过；按需时机、系统进度、取消/超时仍待用户实测，不能以 Linux/交叉检查替代。
 
 ## 文档影响检查
 
@@ -93,8 +98,8 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 
 - OLE `IStream` 只允许所有 seek origin 计算后仍位于当前位置的 no-op；网络流不能任意回退，需在 Windows 真机确认 Explorer 行为。
 - Explorer 可能重复请求 `FILECONTENTS`；本 task 先限制单个活动消费者并返回清晰错误，记录后续扩展点。
-- 剪贴板序列号修复需 Windows↔Linux 真机确认是否消除立即取消并恢复 Explorer 粘贴入口。
+- 基本 Explorer 粘贴链路已通过；未粘贴不传内容、系统进度、用户取消/停滞超时和非 no-op seek 行为仍需真机观察。
 
 ## 下一步
 
-下一步由用户在 Windows↔Linux 真机验证 offer 不传内容、Explorer `Ctrl+V` 后传输、系统进度以及取消/超时；根据实际失败日志再开修复 task，task-042 继续暂停。
+下一步由用户在 Windows↔Linux 真机补验未粘贴不传内容、系统进度以及取消/超时；根据实际失败日志再返工，task-042 继续暂停。
