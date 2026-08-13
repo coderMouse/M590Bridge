@@ -1638,7 +1638,7 @@ fn run_session_loop(
                                         file_name,
                                         bytes,
                                     );
-                                    clip.adopt_text_baseline();
+                                    handled = true;
                                 }
                                 Err(err) => {
                                     with_status(&shared, |s| {
@@ -1647,6 +1647,12 @@ fn run_session_loop(
                                 }
                             }
                         }
+                    }
+                    // File managers may publish both a file list and the same path as text.
+                    // Once the file-list representation was handled, adopt the text baseline so
+                    // the same copy produces one offer instead of replacing the OLE clipboard.
+                    if handled {
+                        clip.adopt_text_baseline();
                     }
                 }
                 if let Ok(Some(text)) = clip.poll_text_change() {

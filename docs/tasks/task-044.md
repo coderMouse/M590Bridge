@@ -52,6 +52,8 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 - 在 `m590-daemon` 新增有界 `VirtualFileBridge`：首次打开 reader 才发 `Request`，网络 producer 背压写入，reader drop 或已开始传输后读写连续 30 秒无进展时发 `Cancel`；未粘贴的 offer 不受该超时影响。Windows-only STA manager 持有 OLE guard 并泵消息。
 - Hub Windows 分支发布单文件虚拟剪贴板，暂停普通文件列表轮询，按 OLE 请求启动网络拉取；流完成后保留虚拟剪贴板直到用户替换，取消/超时清理并发 `FileCancel`。
 - Windows↔Linux 首轮真机发现：Windows 发布虚拟文件后立即误报 `clipboard replaced`。根因是用 `OleGetClipboard` 返回对象与原对象的 `IUnknown` 指针地址比较身份；OLE 可返回代理/包装对象，地址比较不代表剪贴板所有权。改用系统 `OleIsCurrentClipboard` 的原生 `S_OK` 结果判断。
+- 第二轮真机仍立即误报且 Explorer 粘贴为灰色，说明 `OleIsCurrentClipboard` 在当前延迟渲染/STA 生命周期中也不能作为发布后立即轮询的稳定信号。改为记录 `OleSetClipboard` 后的 Windows 剪贴板序列号，只有检测到明确的新序列号才判定被替换；序列号不可用时保留虚拟文件，不再误取消。
+- 复查发送端发现文件管理器可能同时发布 `file_list` 与同一路径文本；旧逻辑会连续发送两个 `FileOffer`，接收端重发 OLE 对象并使 Explorer 看到灰色粘贴。成功处理 `file_list` 后现在立即收养文本基线，确保一次复制只发一个 offer。
 
 ## 修改文件
 
@@ -79,6 +81,7 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 - `cargo clippy -p m590-clipboard -p m590-daemon --lib --no-deps -- -D warnings -A clippy::doc_lazy_continuation`：通过。
 - `CARGO_HOME=<临时可写缓存> cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --examples`、`cargo check -p m590-daemon --target x86_64-pc-windows-gnu`：OLE 所有权修复后均通过。
 - `CARGO_HOME=<临时可写缓存> cargo clippy -p m590-daemon --target x86_64-pc-windows-gnu --lib --no-deps -- -D warnings`：OLE 所有权修复后通过。
+- Windows↔Linux 第二轮真机：失败；仍收到 `clipboard replaced`，且 Explorer 粘贴为灰色。已将替换检测改为剪贴板序列号，待第三轮复测。
 - Windows↔Linux Explorer 真机：待用户测试，不能以 Linux/交叉检查替代。
 
 ## 文档影响检查
@@ -90,7 +93,7 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 
 - OLE `IStream` 只允许所有 seek origin 计算后仍位于当前位置的 no-op；网络流不能任意回退，需在 Windows 真机确认 Explorer 行为。
 - Explorer 可能重复请求 `FILECONTENTS`；本 task 先限制单个活动消费者并返回清晰错误，记录后续扩展点。
-- `OleIsCurrentClipboard` 修复已通过 Windows 目标交叉编译，但是否消除真机的立即取消仍需 Windows↔Linux 复测。
+- 剪贴板序列号修复需 Windows↔Linux 真机确认是否消除立即取消并恢复 Explorer 粘贴入口。
 
 ## 下一步
 

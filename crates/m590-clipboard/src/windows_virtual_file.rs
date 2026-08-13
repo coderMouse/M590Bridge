@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::thread::ThreadId;
 
-use windows::core::{implement, ComObject, Error, Interface, Ref, Result, BOOL, HRESULT};
+use windows::core::{implement, ComObject, Error, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
     DATA_S_SAMEFORMATETC, DV_E_CLIPFORMAT, DV_E_DVASPECT, DV_E_DVTARGETDEVICE, DV_E_LINDEX,
     DV_E_TYMED, E_ACCESSDENIED, E_NOTIMPL, E_POINTER, OLE_E_ADVISENOTSUPPORTED, OLE_E_NOCONNECTION,
@@ -17,7 +17,7 @@ use windows::Win32::System::Com::{
     STGMEDIUM, STGMEDIUM_0, STGM_READ, STGTY_STREAM, STREAM_SEEK, STREAM_SEEK_CUR, STREAM_SEEK_END,
     STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
 };
-use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+use windows::Win32::System::DataExchange::{GetClipboardSequenceNumber, RegisterClipboardFormatW};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{
     OleInitialize, OleSetClipboard, OleUninitialize, DROPEFFECT_COPY,
@@ -34,12 +34,6 @@ use crate::virtual_file::ReadSeek;
 use crate::{ClipboardError, VirtualFile};
 
 const FORMAT_INDEX_NONE: i32 = -1;
-
-#[link(name = "ole32")]
-unsafe extern "system" {
-    #[link_name = "OleIsCurrentClipboard"]
-    fn ole_is_current_clipboard(data_object: *mut std::ffi::c_void) -> i32;
-}
 
 #[derive(Clone, Copy)]
 struct ClipboardFormats {
@@ -431,13 +425,28 @@ fn hglobal_medium_from_copy<T: Copy>(value: &T) -> Result<STGMEDIUM> {
 #[must_use = "dropping the guard removes this virtual file from the clipboard"]
 pub struct VirtualFileClipboard {
     object: Option<IDataObject>,
+    published_sequence: Option<u32>,
     owner_thread: ThreadId,
     _not_send: PhantomData<Rc<()>>,
 }
 
 impl VirtualFileClipboard {
     pub fn is_current(&self) -> bool {
-        self.object.as_ref().is_some_and(is_current_clipboard)
+        self.object.is_some() && !self.clipboard_was_replaced()
+    }
+
+    fn clipboard_was_replaced(&self) -> bool {
+        matches!(
+            (self.published_sequence, clipboard_sequence()),
+            (Some(published), Some(current)) if published != current
+        )
+    }
+
+    fn owns_current_clipboard(&self) -> bool {
+        matches!(
+            (self.published_sequence, clipboard_sequence()),
+            (Some(published), Some(current)) if published == current
+        )
     }
 
     pub fn pump_messages(&self) -> std::result::Result<(), ClipboardError> {
@@ -457,10 +466,8 @@ impl Drop for VirtualFileClipboard {
             return;
         }
         unsafe {
-            if let Some(object) = self.object.as_ref() {
-                if is_current_clipboard(object) {
-                    let _ = OleSetClipboard(None::<&IDataObject>);
-                }
+            if self.owns_current_clipboard() {
+                let _ = OleSetClipboard(None::<&IDataObject>);
             }
             drop(self.object.take());
             OleUninitialize();
@@ -468,10 +475,9 @@ impl Drop for VirtualFileClipboard {
     }
 }
 
-fn is_current_clipboard(object: &IDataObject) -> bool {
-    // OleGetClipboard may return an OLE proxy/wrapper whose IUnknown address differs from the
-    // object passed to OleSetClipboard. Only OleIsCurrentClipboard defines ownership identity.
-    unsafe { ole_is_current_clipboard(object.as_raw()) == S_OK.0 }
+fn clipboard_sequence() -> Option<u32> {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    (sequence != 0).then_some(sequence)
 }
 
 pub fn publish_virtual_file(
@@ -492,8 +498,10 @@ pub fn publish_virtual_file(
         unsafe { OleUninitialize() };
         return Err(ClipboardError::Backend(err.to_string()));
     }
+    let published_sequence = clipboard_sequence();
     Ok(VirtualFileClipboard {
         object: Some(object),
+        published_sequence,
         owner_thread: std::thread::current().id(),
         _not_send: PhantomData,
     })
