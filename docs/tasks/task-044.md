@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`
+`completed`
 
 ## 目标
 
@@ -24,11 +24,11 @@
 
 ## 完成标准
 
-- 文件 offer 只发布安全元数据；Windows 接收端未粘贴前不发送 `FileRequest`，不创建 `.part` 或用户可见临时文件。
-- Explorer `Ctrl+V` 触发请求后，网络 chunk 经有界管道进入 `IStream`，目标目录只出现最终文件，系统复制进度可见。
-- SHA-256、大小、offset 校验继续由 `m590-core` 执行；错误或取消清理活动传输。
-- 取消消息可停止发送方活动文件，管道读写端和等待请求在超时/断连时被唤醒。
-- 不影响 Linux 现有 offer 后自动请求、`.part` 落盘行为。
+- [x] 文件 offer 只发布安全元数据；Windows 接收端未粘贴前不发送 `FileRequest`，不创建 `.part` 或用户可见临时文件。
+- [x] Explorer `Ctrl+V` 触发请求后，网络 chunk 经有界管道进入 `IStream`，目标目录只出现最终文件，系统复制进度可见。
+- [x] SHA-256、大小、offset 校验继续由 `m590-core` 执行；错误或取消清理活动传输。
+- [x] 取消消息可停止发送方活动文件，管道读写端和等待请求在超时/断连时被唤醒。
+- [x] 不影响 Linux 现有 offer 后自动请求、`.part` 落盘行为。
 
 ## 验证命令
 
@@ -88,6 +88,7 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 - `cargo clippy -p m590-daemon --lib --no-deps -- -D warnings`：通过。
 - `CARGO_HOME=<临时可写缓存> cargo check -p m590-daemon --target x86_64-pc-windows-gnu`、`cargo clippy -p m590-daemon --target x86_64-pc-windows-gnu --lib --no-deps -- -D warnings`：通过。
 - Windows↔Linux Explorer 真机：基本粘贴链路已通过；按需时机、系统进度、取消/超时仍待用户实测，不能以 Linux/交叉检查替代。
+- Windows↔Linux 最终真机验收（用户确认通过）：未粘贴前不传文件内容；Explorer 粘贴后才开始传输；系统文件复制进度正常；取消系统进度窗口后停止发送；粘贴前在 Windows 复制其他内容会取消旧 offer；空文件可正常粘贴。
 
 ## 文档影响检查
 
@@ -96,10 +97,10 @@ Windows 真机由用户完成：A/B 双机复制只发 offer、B 未粘贴不传
 
 ## 风险 / blocker
 
-- OLE `IStream` 只允许所有 seek origin 计算后仍位于当前位置的 no-op；网络流不能任意回退，需在 Windows 真机确认 Explorer 行为。
-- Explorer 可能重复请求 `FILECONTENTS`；本 task 先限制单个活动消费者并返回清晰错误，记录后续扩展点。
-- 基本 Explorer 粘贴链路已通过；未粘贴不传内容、系统进度、用户取消/停滞超时和非 no-op seek 行为仍需真机观察。
+- 当前只支持 Linux→Windows 单文件 Explorer 粘贴；不支持文件夹、多文件并行和断点续传。
+- OLE 网络流不支持任意回退，且同一 offer 只允许一个活动消费者；如后续客户端行为需要重复请求 `FILECONTENTS`，应另建 task 扩展。
+- task-044 无剩余 blocker。
 
 ## 下一步
 
-下一步由用户在 Windows↔Linux 真机补验未粘贴不传内容、系统进度以及取消/超时；根据实际失败日志再返工，task-042 继续暂停。
+task-044 已完成。task-042 继续暂停；后续由用户决定恢复 task-042，或另建独立数据连接、多文件等新 task。
