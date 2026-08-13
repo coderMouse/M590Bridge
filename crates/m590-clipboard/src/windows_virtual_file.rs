@@ -430,6 +430,10 @@ pub struct VirtualFileClipboard {
 }
 
 impl VirtualFileClipboard {
+    pub fn is_current(&self) -> bool {
+        self.object.as_ref().is_some_and(is_current_clipboard)
+    }
+
     pub fn pump_messages(&self) -> std::result::Result<(), ClipboardError> {
         if std::thread::current().id() != self.owner_thread {
             return Err(ClipboardError::Backend(

@@ -107,6 +107,9 @@ mod tests {
             Message::file_complete(
                 m590_core::FileCompletePayload::new(DeviceId::new("a"), "t1", true, "").unwrap(),
             ),
+            Message::file_cancel(
+                m590_core::FileCancelPayload::new(DeviceId::new("b"), "t1", "cancelled").unwrap(),
+            ),
             Message::goodbye(DeviceId::new("a"), "bye").unwrap(),
         ];
 

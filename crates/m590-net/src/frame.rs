@@ -9,9 +9,9 @@
 //! - payload: type-specific fields (strings = u32 BE len + UTF-8 bytes; u64 = BE)
 
 use m590_core::{
-    ClipboardImagePayload, ClipboardTextPayload, DeviceId, FileChunkPayload, FileCompletePayload,
-    FileOfferPayload, FileRequestPayload, ImageEncoding, Message, MAX_FILE_CHUNK_BYTES,
-    MAX_INLINE_IMAGE_BYTES, PROTOCOL_VERSION,
+    ClipboardImagePayload, ClipboardTextPayload, DeviceId, FileCancelPayload, FileChunkPayload,
+    FileCompletePayload, FileOfferPayload, FileRequestPayload, ImageEncoding, Message,
+    MAX_FILE_CHUNK_BYTES, MAX_INLINE_IMAGE_BYTES, PROTOCOL_VERSION,
 };
 
 /// Wire magic bytes.
@@ -70,6 +70,7 @@ const TYPE_FILE_OFFER: u8 = 11;
 const TYPE_FILE_REQUEST: u8 = 12;
 const TYPE_FILE_CHUNK: u8 = 13;
 const TYPE_FILE_COMPLETE: u8 = 14;
+const TYPE_FILE_CANCEL: u8 = 15;
 
 /// Encode one message into a single frame buffer.
 pub fn encode_frame(message: &Message) -> Result<Vec<u8>, FrameError> {
@@ -201,6 +202,12 @@ fn encode_payload(message: &Message) -> Result<(u8, Vec<u8>), FrameError> {
             write_string(&mut payload, &body.message)?;
             write_string(&mut payload, &body.sha256_hex)?;
             TYPE_FILE_COMPLETE
+        }
+        Message::FileCancel(body) => {
+            write_string(&mut payload, body.device_id.as_str())?;
+            write_string(&mut payload, &body.transfer_id)?;
+            write_string(&mut payload, &body.message)?;
+            TYPE_FILE_CANCEL
         }
         Message::Goodbye { device_id, reason } => {
             write_string(&mut payload, device_id.as_str())?;
@@ -374,6 +381,21 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
                     })
                 })?;
             Ok(Message::FileComplete(body))
+        }
+        TYPE_FILE_CANCEL => {
+            let device_id = DeviceId::new(read_string(&mut payload)?);
+            let transfer_id = read_string(&mut payload)?;
+            let message = read_string(&mut payload)?;
+            ensure_empty(payload)?;
+            let body = FileCancelPayload::new(device_id, transfer_id, message).map_err(|e| {
+                FrameError::InvalidField(match e {
+                    m590_core::ProtocolError::EmptyDeviceId => "device_id",
+                    m590_core::ProtocolError::EmptyTransferId => "transfer_id",
+                    m590_core::ProtocolError::InvalidFile(_) => "file_cancel",
+                    _ => "file_cancel",
+                })
+            })?;
+            Ok(Message::FileCancel(body))
         }
         TYPE_GOODBYE => {
             let device_id = DeviceId::new(read_string(&mut payload)?);
@@ -566,6 +588,9 @@ mod tests {
             ),
             Message::file_complete(
                 FileCompletePayload::new(DeviceId::new("a"), "t1", false, "nope").unwrap(),
+            ),
+            Message::file_cancel(
+                FileCancelPayload::new(DeviceId::new("b"), "t1", "user cancelled").unwrap(),
             ),
         ];
         for msg in samples {

@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-12
-> 阶段：Windows NSIS 已成功打包安装；task-043 Windows OLE 虚拟文件原型已真机通过
+> 阶段：Windows NSIS 已成功打包安装；task-044 Windows 按粘贴取流网络桥已完成代码与 Linux 验证，待 Windows↔Linux 真机验收
 
 ## 目标（近期）
 
@@ -33,6 +33,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示（先 bind API / token 可重试 / 原因文案）
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（避免 https WebView fetch http 被拦）
 - [x] **task-043** Windows 单文件 OLE 虚拟剪贴板原型（Explorer 按粘贴取流 + 系统复制进度，真机通过）
+- [ ] **task-044** Windows 按粘贴请求 FileRequest、网络有界流与 FileCancel（代码完成，待 Windows↔Linux 真机验收）
 
 ## 进行中 / 下一 task
 
@@ -63,7 +64,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 文件 offer/request/chunk/complete | 有 |
 | hub 自动落盘 + send_file(_bytes) | 有 |
 | UI 选文件发送 + 进度 + 保存目录 | **有** |
-| 文件夹 / OS 文件剪贴板 | 端到端无；Windows 单文件 OLE 原型已通过 Explorer 真机验收（task-043） |
+| 文件夹 / OS 文件剪贴板 | Windows 单文件按粘贴取流已接入网络，待 Windows↔Linux 真机验收；无文件夹/FUSE |
 | 大文件流式（磁盘流+SHA-256，软上限 8GiB） | **有**（task-033；同连接串行；task-036 已移除固定批次节流和多帧累计误判） |
 | file_list 触发原文件 offer（非图片，路径流式） | **有** |
 | 路径文本（非图片）→ file offer | **有**（task-025） |
@@ -82,7 +83,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 新建 task-044：把虚拟文件 `IStream` 接入 `FileRequest`，补取消/超时
+1. Windows↔Linux 真机验收 task-044：offer 不传内容、Explorer `Ctrl+V` 后传输、取消/超时
 2. 恢复 task-042 剩余的登录自启与跨机回归验收
 3. （可选）独立文件数据连接 / 更高吞吐调优
 4. （可选）设置页发现开关 / 本机显示名

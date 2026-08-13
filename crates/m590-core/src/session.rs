@@ -7,9 +7,9 @@ use fs2::available_space;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    bytes_to_hex, validate_transfer_id, ConnectionState, DeviceId, FileChunkPayload,
-    FileCompletePayload, FileOfferPayload, FileRequestPayload, Message, ProtocolError,
-    SessionError, SyncState, MAX_FILE_CHUNK_BYTES, PROTOCOL_VERSION,
+    bytes_to_hex, validate_transfer_id, ConnectionState, DeviceId, FileCancelPayload,
+    FileChunkPayload, FileCompletePayload, FileOfferPayload, FileRequestPayload, Message,
+    ProtocolError, SessionError, SyncState, MAX_FILE_CHUNK_BYTES, PROTOCOL_VERSION,
 };
 
 /// Max remembered clipboard content IDs for dedup (send + receive).
@@ -104,6 +104,15 @@ pub enum InboundFileResult {
         file_name: String,
         size: u64,
     },
+    /// Verified bytes from a stream-target transfer. The daemon should feed them to its pipe.
+    Chunk { transfer_id: String, data: Vec<u8> },
+    /// Stream-target transfer finished and passed size/hash validation.
+    StreamCompleted {
+        transfer_id: String,
+        file_name: String,
+        size: u64,
+        sha256_hex: String,
+    },
     /// Transfer finished; bytes live on disk at `path` (caller should move/rename).
     Applied {
         transfer_id: String,
@@ -163,10 +172,14 @@ struct IncomingFile {
     expected_sha256: String,
     #[allow(dead_code)]
     from: DeviceId,
-    part_path: PathBuf,
-    writer: File,
+    target: IncomingFileTarget,
     next_offset: u64,
     hasher: Sha256,
+}
+
+enum IncomingFileTarget {
+    Disk { part_path: PathBuf, writer: File },
+    Stream,
 }
 
 impl std::fmt::Debug for IncomingFile {
@@ -175,7 +188,13 @@ impl std::fmt::Debug for IncomingFile {
             .field("file_name", &self.file_name)
             .field("expected_size", &self.expected_size)
             .field("expected_sha256", &self.expected_sha256)
-            .field("part_path", &self.part_path)
+            .field(
+                "target",
+                &match &self.target {
+                    IncomingFileTarget::Disk { part_path, .. } => format!("disk:{:?}", part_path),
+                    IncomingFileTarget::Stream => "stream".to_string(),
+                },
+            )
             .field("next_offset", &self.next_offset)
             .finish()
     }
@@ -230,6 +249,8 @@ pub struct Session {
     inbound_offers: HashMap<String, InboundOffer>,
     /// In-progress receive writing to `.part` files.
     incoming_files: HashMap<String, IncomingFile>,
+    /// Offers explicitly requested as a network stream instead of a `.part` file.
+    stream_inbound: std::collections::HashSet<String>,
     /// Directory for inbound `.part` / temp files (defaults to system temp).
     file_receive_dir: Option<PathBuf>,
     /// Filled when an inbound file event is newly observed (daemon/UI should consume).
@@ -266,6 +287,7 @@ impl Session {
             active_outbound: None,
             inbound_offers: HashMap::new(),
             incoming_files: HashMap::new(),
+            stream_inbound: std::collections::HashSet::new(),
             file_receive_dir: None,
             last_inbound_file: None,
             last_file_transfer_id: None,
@@ -660,6 +682,54 @@ impl Session {
         Ok(QueueFileResult::Queued)
     }
 
+    /// Request a peer offer into an in-memory stream target. No `.part` file is created.
+    pub fn request_file_stream(
+        &mut self,
+        transfer_id: impl Into<String>,
+    ) -> Result<QueueFileResult, SessionError> {
+        self.pending_outbox.clear();
+        self.last_inbound_clipboard = None;
+        self.last_inbound_file = None;
+        if self.state != ConnectionState::Connected {
+            return Err(SessionError::InvalidTransition {
+                from: self.state,
+                event: "request_file_stream",
+            });
+        }
+        let transfer_id = transfer_id.into();
+        if transfer_id.is_empty() {
+            return Err(ProtocolError::EmptyTransferId.into());
+        }
+        if !self.inbound_offers.contains_key(&transfer_id) {
+            return Ok(QueueFileResult::UnknownTransferId);
+        }
+        self.stream_inbound.insert(transfer_id.clone());
+        let req = FileRequestPayload::new(self.local_device.clone(), transfer_id)?;
+        self.sync_state = SyncState::Syncing;
+        self.pending_outbox.push(Message::file_request(req));
+        self.sync_state = SyncState::Idle;
+        Ok(QueueFileResult::Queued)
+    }
+
+    /// Cancel a pending or active transfer and notify the peer.
+    pub fn cancel_file(
+        &mut self,
+        transfer_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), SessionError> {
+        self.pending_outbox.clear();
+        let transfer_id = transfer_id.into();
+        let payload =
+            FileCancelPayload::new(self.local_device.clone(), transfer_id.clone(), message)?;
+        self.abort_active_outbound_if(&transfer_id);
+        self.staged_outbound_files.remove(&transfer_id);
+        self.cleanup_incoming(&transfer_id);
+        self.inbound_offers.remove(&transfer_id);
+        self.stream_inbound.remove(&transfer_id);
+        self.pending_outbox.push(Message::file_cancel(payload));
+        Ok(())
+    }
+
     /// Emit up to [`OUTBOUND_CHUNKS_PER_PUMP`] file chunks (or a Complete) for the active send.
     ///
     /// Returns `true` if more pumping is still required. Appends to the outbox without clearing it.
@@ -773,6 +843,7 @@ impl Session {
             Message::FileRequest(payload) => self.on_file_request(payload),
             Message::FileChunk(payload) => self.on_file_chunk(payload),
             Message::FileComplete(payload) => self.on_file_complete(payload),
+            Message::FileCancel(payload) => self.on_file_cancel(payload),
             Message::Goodbye { .. } => {
                 self.reset_to_disconnected(true);
                 Ok(())
@@ -1098,6 +1169,25 @@ impl Session {
         Ok(())
     }
 
+    fn on_file_cancel(&mut self, payload: FileCancelPayload) -> Result<(), SessionError> {
+        self.ensure_connected_file_peer(&payload.device_id, "file_cancel")?;
+        validate_transfer_id(&payload.transfer_id)?;
+        self.abort_active_outbound_if(&payload.transfer_id);
+        self.staged_outbound_files.remove(&payload.transfer_id);
+        self.cleanup_incoming(&payload.transfer_id);
+        self.inbound_offers.remove(&payload.transfer_id);
+        self.stream_inbound.remove(&payload.transfer_id);
+        self.last_inbound_file = Some(InboundFileResult::Failed {
+            transfer_id: payload.transfer_id,
+            message: if payload.message.is_empty() {
+                "transfer cancelled by peer".into()
+            } else {
+                payload.message
+            },
+        });
+        Ok(())
+    }
+
     fn pump_outbound_file_inner(&mut self) -> Result<(), SessionError> {
         for _ in 0..OUTBOUND_CHUNKS_PER_PUMP {
             let Some(active) = self.active_outbound.as_mut() else {
@@ -1196,11 +1286,33 @@ impl Session {
                         .saturating_add(payload.data.len() as u64);
                     if new_len > incoming.expected_size || new_len > MAX_FILE_BYTES {
                         Some("chunk exceeds expected size".into())
-                    } else if incoming.writer.write_all(&payload.data).is_err() {
-                        Some("failed to write part file".into())
+                    } else if matches!(incoming.target, IncomingFileTarget::Disk { .. }) {
+                        let write_failed = match &mut incoming.target {
+                            IncomingFileTarget::Disk { writer, .. } => {
+                                writer.write_all(&payload.data).is_err()
+                            }
+                            IncomingFileTarget::Stream => false,
+                        };
+                        if write_failed {
+                            Some("failed to write part file".into())
+                        } else {
+                            incoming.hasher.update(&payload.data);
+                            incoming.next_offset = new_len;
+                            if matches!(incoming.target, IncomingFileTarget::Stream) {
+                                self.last_inbound_file = Some(InboundFileResult::Chunk {
+                                    transfer_id: payload.transfer_id.clone(),
+                                    data: payload.data.clone(),
+                                });
+                            }
+                            None
+                        }
                     } else {
                         incoming.hasher.update(&payload.data);
                         incoming.next_offset = new_len;
+                        self.last_inbound_file = Some(InboundFileResult::Chunk {
+                            transfer_id: payload.transfer_id.clone(),
+                            data: payload.data.clone(),
+                        });
                         None
                     }
                 }
@@ -1232,10 +1344,25 @@ impl Session {
             });
             return Ok(());
         }
-        match self.open_incoming(&payload.transfer_id, &offer, &payload.device_id) {
+        let stream_target = self.stream_inbound.remove(&payload.transfer_id);
+        match self.open_incoming(
+            &payload.transfer_id,
+            &offer,
+            &payload.device_id,
+            stream_target,
+        ) {
             Ok(mut incoming) => {
-                if incoming.writer.write_all(&payload.data).is_err() {
-                    let _ = fs::remove_file(&incoming.part_path);
+                let write_failed = match &mut incoming.target {
+                    IncomingFileTarget::Disk { writer, .. } => {
+                        writer.write_all(&payload.data).is_err()
+                    }
+                    IncomingFileTarget::Stream => false,
+                };
+                if write_failed {
+                    if let IncomingFileTarget::Disk { part_path, writer } = incoming.target {
+                        drop(writer);
+                        let _ = fs::remove_file(part_path);
+                    }
                     self.last_inbound_file = Some(InboundFileResult::Failed {
                         transfer_id: payload.transfer_id,
                         message: "failed to write part file".into(),
@@ -1244,6 +1371,12 @@ impl Session {
                 }
                 incoming.hasher.update(&payload.data);
                 incoming.next_offset = payload.data.len() as u64;
+                if stream_target {
+                    self.last_inbound_file = Some(InboundFileResult::Chunk {
+                        transfer_id: payload.transfer_id.clone(),
+                        data: payload.data.clone(),
+                    });
+                }
                 self.incoming_files.insert(payload.transfer_id, incoming);
             }
             Err(msg) => {
@@ -1268,6 +1401,7 @@ impl Session {
         if !payload.ok {
             self.cleanup_incoming(&payload.transfer_id);
             self.inbound_offers.remove(&payload.transfer_id);
+            self.stream_inbound.remove(&payload.transfer_id);
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: if payload.message.is_empty() {
@@ -1283,7 +1417,13 @@ impl Session {
         if !self.incoming_files.contains_key(&payload.transfer_id) {
             if let Some(offer) = self.inbound_offers.remove(&payload.transfer_id) {
                 if offer.size == 0 {
-                    match self.open_incoming(&payload.transfer_id, &offer, &payload.device_id) {
+                    let stream_target = self.stream_inbound.remove(&payload.transfer_id);
+                    match self.open_incoming(
+                        &payload.transfer_id,
+                        &offer,
+                        &payload.device_id,
+                        stream_target,
+                    ) {
                         Ok(incoming) => {
                             self.incoming_files
                                 .insert(payload.transfer_id.clone(), incoming);
@@ -1315,19 +1455,21 @@ impl Session {
         };
         self.inbound_offers.remove(&payload.transfer_id);
 
-        if let Err(err) = incoming.writer.flush() {
-            drop(incoming.writer);
-            let _ = fs::remove_file(&incoming.part_path);
+        let flush_error = match &mut incoming.target {
+            IncomingFileTarget::Disk { writer, .. } => writer.flush().err(),
+            IncomingFileTarget::Stream => None,
+        };
+        if let Some(err) = flush_error {
+            cleanup_incoming_target(incoming.target);
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: format!("flush part file: {err}"),
             });
             return Ok(());
         }
-        drop(incoming.writer);
 
         if incoming.next_offset != incoming.expected_size {
-            let _ = fs::remove_file(&incoming.part_path);
+            cleanup_incoming_target(incoming.target);
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: format!(
@@ -1340,7 +1482,7 @@ impl Session {
 
         let digest = bytes_to_hex(&incoming.hasher.finalize());
         if !payload.sha256_hex.is_empty() && payload.sha256_hex != digest {
-            let _ = fs::remove_file(&incoming.part_path);
+            cleanup_incoming_target(incoming.target);
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: format!(
@@ -1351,7 +1493,7 @@ impl Session {
             return Ok(());
         }
         if !incoming.expected_sha256.is_empty() && incoming.expected_sha256 != digest {
-            let _ = fs::remove_file(&incoming.part_path);
+            cleanup_incoming_target(incoming.target);
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
                 message: format!(
@@ -1365,13 +1507,27 @@ impl Session {
         self.last_file_transfer_id = Some(payload.transfer_id.clone());
         self.last_file_name = Some(incoming.file_name.clone());
         self.last_file_bytes = Some(incoming.expected_size);
-        self.last_inbound_file = Some(InboundFileResult::Applied {
-            transfer_id: payload.transfer_id,
-            file_name: incoming.file_name,
-            path: incoming.part_path,
-            size: incoming.expected_size,
-            sha256_hex: digest,
-        });
+        let transfer_id = payload.transfer_id;
+        if matches!(incoming.target, IncomingFileTarget::Stream) {
+            self.last_inbound_file = Some(InboundFileResult::StreamCompleted {
+                transfer_id,
+                file_name: incoming.file_name,
+                size: incoming.expected_size,
+                sha256_hex: digest,
+            });
+        } else {
+            let IncomingFileTarget::Disk { part_path, writer } = incoming.target else {
+                unreachable!("stream target handled above")
+            };
+            drop(writer);
+            self.last_inbound_file = Some(InboundFileResult::Applied {
+                transfer_id,
+                file_name: incoming.file_name,
+                path: part_path,
+                size: incoming.expected_size,
+                sha256_hex: digest,
+            });
+        }
         self.sync_state = SyncState::Idle;
         Ok(())
     }
@@ -1381,6 +1537,7 @@ impl Session {
         transfer_id: &str,
         offer: &InboundOffer,
         from: &DeviceId,
+        stream: bool,
     ) -> Result<IncomingFile, String> {
         validate_transfer_id(transfer_id).map_err(|err| err.to_string())?;
         if offer.size > MAX_FILE_BYTES {
@@ -1388,6 +1545,17 @@ impl Session {
                 "offer exceeds file size limit: {} > {}",
                 offer.size, MAX_FILE_BYTES
             ));
+        }
+        if stream {
+            return Ok(IncomingFile {
+                file_name: offer.file_name.clone(),
+                expected_size: offer.size,
+                expected_sha256: offer.sha256_hex.clone(),
+                from: from.clone(),
+                target: IncomingFileTarget::Stream,
+                next_offset: 0,
+                hasher: Sha256::new(),
+            });
         }
         let dir = self.receive_dir();
         fs::create_dir_all(&dir).map_err(|e| format!("create receive dir: {e}"))?;
@@ -1419,8 +1587,7 @@ impl Session {
             expected_size: offer.size,
             expected_sha256: offer.sha256_hex.clone(),
             from: from.clone(),
-            part_path,
-            writer,
+            target: IncomingFileTarget::Disk { part_path, writer },
             next_offset: 0,
             hasher: Sha256::new(),
         })
@@ -1451,13 +1618,22 @@ impl Session {
 
     fn cleanup_incoming(&mut self, transfer_id: &str) {
         if let Some(incoming) = self.incoming_files.remove(transfer_id) {
-            drop(incoming.writer);
-            let _ = fs::remove_file(&incoming.part_path);
+            cleanup_incoming_target(incoming.target);
         }
     }
 
     fn abort_active_outbound(&mut self) {
         self.active_outbound = None;
+    }
+
+    fn abort_active_outbound_if(&mut self, transfer_id: &str) {
+        if self
+            .active_outbound
+            .as_ref()
+            .is_some_and(|active| active.transfer_id == transfer_id)
+        {
+            self.active_outbound = None;
+        }
     }
 
     fn cleanup_all_incoming_parts(&mut self) {
@@ -1518,6 +1694,7 @@ impl Session {
         self.staged_outbound_files.clear();
         self.abort_active_outbound();
         self.inbound_offers.clear();
+        self.stream_inbound.clear();
         self.cleanup_all_incoming_parts();
         self.last_inbound_file = None;
         self.last_file_transfer_id = None;
@@ -1526,6 +1703,13 @@ impl Session {
         if clear_outbox {
             self.pending_outbox.clear();
         }
+    }
+}
+
+fn cleanup_incoming_target(target: IncomingFileTarget) {
+    if let IncomingFileTarget::Disk { part_path, writer } = target {
+        drop(writer);
+        let _ = fs::remove_file(part_path);
     }
 }
 
@@ -2168,6 +2352,80 @@ mod tests {
         });
         assert_eq!(sha256_hex, expect_sha);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_stream_request_delivers_chunks_without_part_file() {
+        let (mut receiver, mut sender) = pair_host_joiner();
+        let data = b"streamed without a part file".to_vec();
+        sender
+            .offer_file("stream-1", "stream.txt", data.clone())
+            .unwrap();
+        receiver
+            .handle(SessionEvent::Message(sender.take_outbox().pop().unwrap()))
+            .unwrap();
+        assert!(matches!(
+            receiver.take_inbound_file(),
+            Some(InboundFileResult::Offered { .. })
+        ));
+        receiver.request_file_stream("stream-1").unwrap();
+        sender
+            .handle(SessionEvent::Message(receiver.take_outbox().pop().unwrap()))
+            .unwrap();
+
+        let mut received = Vec::new();
+        loop {
+            for message in sender.take_outbox() {
+                receiver.handle(SessionEvent::Message(message)).unwrap();
+                if let Some(event) = receiver.take_inbound_file() {
+                    match event {
+                        InboundFileResult::Chunk { data, .. } => received.extend(data),
+                        InboundFileResult::StreamCompleted {
+                            size, sha256_hex, ..
+                        } => {
+                            assert_eq!(size, data.len() as u64);
+                            assert_eq!(received, data);
+                            assert_eq!(
+                                sha256_hex,
+                                crate::bytes_to_hex(&{
+                                    use sha2::Digest;
+                                    sha2::Sha256::digest(&data)
+                                })
+                            );
+                            assert!(!receiver.has_active_file_transfer());
+                            return;
+                        }
+                        other => panic!("unexpected stream event: {other:?}"),
+                    }
+                }
+            }
+            if sender.has_pending_outbound_file() {
+                sender.pump_outbound_file().unwrap();
+            } else {
+                panic!("stream sender ended before complete");
+            }
+        }
+    }
+
+    #[test]
+    fn file_cancel_stops_active_sender_and_cleans_receiver_state() {
+        let (mut receiver, mut sender) = pair_host_joiner();
+        sender
+            .offer_file("cancel-1", "cancel.bin", vec![1, 2, 3])
+            .unwrap();
+        receiver
+            .handle(SessionEvent::Message(sender.take_outbox().pop().unwrap()))
+            .unwrap();
+        receiver.take_inbound_file();
+        receiver.cancel_file("cancel-1", "user cancelled").unwrap();
+        sender
+            .handle(SessionEvent::Message(receiver.take_outbox().pop().unwrap()))
+            .unwrap();
+        assert!(!sender.has_active_file_transfer());
+        assert!(matches!(
+            sender.take_inbound_file(),
+            Some(InboundFileResult::Failed { message, .. }) if message == "user cancelled"
+        ));
     }
 
     #[test]

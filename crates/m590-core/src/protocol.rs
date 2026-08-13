@@ -1,7 +1,7 @@
 use crate::{DeviceId, ProtocolError};
 
 /// Draft wire protocol version (frame header also carries this value).
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Maximum decoded clipboard image area accepted by the application.
 pub const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
@@ -13,6 +13,7 @@ pub const MAX_INLINE_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 pub const MAX_FILE_CHUNK_BYTES: usize = 256 * 1024;
 
 const MAX_TRANSFER_ID_BYTES: usize = 128;
+const MAX_FILE_STATUS_MESSAGE_BYTES: usize = 1024;
 
 /// Text clipboard payload carried on the wire after pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +338,39 @@ pub struct FileCompletePayload {
     pub sha256_hex: String,
 }
 
+/// Cancels a pending or active file transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCancelPayload {
+    pub device_id: DeviceId,
+    pub transfer_id: String,
+    pub message: String,
+}
+
+impl FileCancelPayload {
+    pub fn new(
+        device_id: DeviceId,
+        transfer_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        if device_id.as_str().is_empty() {
+            return Err(ProtocolError::EmptyDeviceId);
+        }
+        let transfer_id = transfer_id.into();
+        validate_transfer_id(&transfer_id)?;
+        let message = message.into();
+        if message.len() > MAX_FILE_STATUS_MESSAGE_BYTES {
+            return Err(ProtocolError::InvalidFile(
+                "file cancel message exceeds maximum size",
+            ));
+        }
+        Ok(Self {
+            device_id,
+            transfer_id,
+            message,
+        })
+    }
+}
+
 impl FileCompletePayload {
     pub fn new(
         device_id: DeviceId,
@@ -409,6 +443,8 @@ pub enum Message {
     FileChunk(FileChunkPayload),
     /// Transfer finished.
     FileComplete(FileCompletePayload),
+    /// Transfer was cancelled by either peer.
+    FileCancel(FileCancelPayload),
     /// Graceful teardown.
     Goodbye { device_id: DeviceId, reason: String },
 }
@@ -499,6 +535,10 @@ impl Message {
         Self::FileComplete(payload)
     }
 
+    pub fn file_cancel(payload: FileCancelPayload) -> Self {
+        Self::FileCancel(payload)
+    }
+
     pub fn goodbye(device_id: DeviceId, reason: impl Into<String>) -> Result<Self, ProtocolError> {
         validate_device(&device_id)?;
         Ok(Self::Goodbye {
@@ -522,6 +562,7 @@ impl Message {
             Self::FileRequest(_) => "file_request",
             Self::FileChunk(_) => "file_chunk",
             Self::FileComplete(_) => "file_complete",
+            Self::FileCancel(_) => "file_cancel",
             Self::Goodbye { .. } => "goodbye",
         }
     }
@@ -621,6 +662,15 @@ mod tests {
         assert_eq!(
             err,
             ProtocolError::InvalidFile("chunk exceeds maximum size")
+        );
+    }
+
+    #[test]
+    fn file_cancel_rejects_excessive_message() {
+        let err = FileCancelPayload::new(DeviceId::new("a"), "t1", "x".repeat(1025)).unwrap_err();
+        assert_eq!(
+            err,
+            ProtocolError::InvalidFile("file cancel message exceeds maximum size")
         );
     }
 }

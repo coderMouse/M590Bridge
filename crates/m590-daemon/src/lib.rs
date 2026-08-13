@@ -5,3 +5,6 @@ pub mod discovery;
 pub mod file_save;
 pub mod hub;
 pub mod status;
+pub mod virtual_file_bridge;
+#[cfg(target_os = "windows")]
+pub mod windows_virtual_file_manager;

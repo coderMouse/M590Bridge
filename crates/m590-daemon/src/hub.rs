@@ -19,8 +19,13 @@ use m590_net::{accept_framed, connect_framed, listen_on, TcpFrameStream};
 
 use crate::config;
 use crate::discovery::DiscoveryHandle;
+#[cfg(not(target_os = "windows"))]
 use crate::file_save;
 use crate::status::{persist_status_config, with_status, HubPhase, SharedStatus};
+#[cfg(target_os = "windows")]
+use crate::virtual_file_bridge::{BridgeEvent, PipeProducer, VirtualFileBridge};
+#[cfg(target_os = "windows")]
+use crate::windows_virtual_file_manager::{ManagerEvent, WindowsVirtualFileManager};
 
 static STOP_BRIDGE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -39,6 +44,15 @@ pub const MAX_HTTP_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HTTP_FILE_BODY_BYTES: usize = MAX_HTTP_FILE_BYTES.div_ceil(3) * 4 + 64 * 1024;
 const IDLE_SESSION_LOOP_DELAY: Duration = Duration::from_millis(50);
 const STALLED_FILE_LOOP_DELAY: Duration = Duration::from_millis(1);
+
+#[cfg(target_os = "windows")]
+struct WindowsVirtualReceive {
+    transfer_id: String,
+    bridge: VirtualFileBridge,
+    producer: PipeProducer,
+    requested: bool,
+    completed: bool,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum SessionLoopPause {
@@ -1098,6 +1112,10 @@ fn run_session_loop(
     let mut last_heartbeat = Instant::now();
     let mut last_peer_rx = Instant::now();
     let mut content_seq = 0u64;
+    #[cfg(target_os = "windows")]
+    let ole_manager = WindowsVirtualFileManager::start().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    let mut virtual_receive: Option<WindowsVirtualReceive> = None;
     const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
     let pairing_started = Instant::now();
 
@@ -1331,6 +1349,123 @@ fn run_session_loop(
                     }
 
                     if let Some(file_event) = session.take_inbound_file() {
+                        #[cfg(target_os = "windows")]
+                        {
+                            if let Some(current) = virtual_receive.as_mut() {
+                                if let InboundFileResult::Chunk { transfer_id, data } = &file_event
+                                {
+                                    if current.transfer_id == *transfer_id {
+                                        if let Err(err) = current.producer.push(data) {
+                                            with_status(&shared, |s| {
+                                                s.last_error =
+                                                    Some(format!("virtual file stream: {err}"));
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            match &file_event {
+                                InboundFileResult::Offered {
+                                    transfer_id,
+                                    file_name,
+                                    size,
+                                } => {
+                                    if let Some(previous) = virtual_receive.take() {
+                                        previous.producer.fail("replaced by a newer file offer");
+                                        session
+                                            .cancel_file(
+                                                previous.transfer_id,
+                                                "replaced by a newer file offer",
+                                            )
+                                            .map_err(|e| e.to_string())?;
+                                        conn.send_all(session.take_outbox().iter())
+                                            .map_err(|e| e.to_string())?;
+                                        ole_manager.clear();
+                                    }
+                                    let (bridge, producer) = VirtualFileBridge::new();
+                                    let file = bridge
+                                        .virtual_file(file_name.clone(), *size)
+                                        .map_err(|e| e.to_string())?;
+                                    ole_manager.publish(file)?;
+                                    virtual_receive = Some(WindowsVirtualReceive {
+                                        transfer_id: transfer_id.clone(),
+                                        bridge,
+                                        producer,
+                                        requested: false,
+                                        completed: false,
+                                    });
+                                    with_status(&shared, |s| {
+                                        s.file_transfer_phase = Some("offered".into());
+                                        s.last_file_transfer_id = Some(transfer_id.clone());
+                                        s.last_file_name = Some(file_name.clone());
+                                        s.last_file_bytes = Some(*size);
+                                        s.file_bytes_received = Some(0);
+                                        s.file_bytes_total = Some(*size);
+                                        s.last_sync_text = Some(format!(
+                                            "[file offer {file_name} {size}B; paste to transfer]"
+                                        ));
+                                        s.last_error = None;
+                                    });
+                                }
+                                InboundFileResult::Failed {
+                                    transfer_id,
+                                    message,
+                                } => {
+                                    if virtual_receive
+                                        .as_ref()
+                                        .is_some_and(|v| v.transfer_id == *transfer_id)
+                                    {
+                                        ole_manager.clear();
+                                        virtual_receive = None;
+                                    }
+                                    with_status(&shared, |s| {
+                                        s.file_transfer_phase = Some("failed".into());
+                                        s.last_file_transfer_id = Some(transfer_id.clone());
+                                        s.last_error =
+                                            Some(format!("file transfer failed: {message}"));
+                                    });
+                                }
+                                InboundFileResult::StreamCompleted {
+                                    transfer_id, size, ..
+                                } => {
+                                    if let Some(current) = virtual_receive.as_mut() {
+                                        current.producer.finish();
+                                        current.completed = true;
+                                    }
+                                    with_status(&shared, |s| {
+                                        s.file_transfer_phase = Some("done".into());
+                                        s.last_file_transfer_id = Some(transfer_id.clone());
+                                        s.file_bytes_received = Some(*size);
+                                        s.file_bytes_total = Some(*size);
+                                        s.last_error = None;
+                                    });
+                                }
+                                InboundFileResult::Chunk { transfer_id, data } => {
+                                    if let Some((_, received, total)) =
+                                        session.inbound_file_progress()
+                                    {
+                                        with_status(&shared, |s| {
+                                            s.file_transfer_phase = Some("receiving".into());
+                                            s.last_file_transfer_id = Some(transfer_id.clone());
+                                            s.file_bytes_received = Some(received);
+                                            s.file_bytes_total = Some(total);
+                                            s.last_file_bytes = Some(total);
+                                            s.last_error = None;
+                                        });
+                                    } else {
+                                        with_status(&shared, |s| {
+                                            s.file_bytes_received = Some(
+                                                s.file_bytes_received
+                                                    .unwrap_or(0)
+                                                    .saturating_add(data.len() as u64),
+                                            );
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        #[cfg(not(target_os = "windows"))]
                         handle_inbound_file(&shared, session, conn, file_event)?;
                     } else if let Some((tid, got, total)) = session.inbound_file_progress() {
                         with_status(&shared, |s| {
@@ -1347,9 +1482,86 @@ fn run_session_loop(
             }
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(mut current) = virtual_receive.take() {
+                let mut keep_current = true;
+                while let Some(event) = current.bridge.take_event() {
+                    if !keep_current {
+                        break;
+                    }
+                    match event {
+                        BridgeEvent::Request => {
+                            current.requested = true;
+                            if current.completed {
+                                current.producer.finish();
+                                continue;
+                            }
+                            match session.request_file_stream(current.transfer_id.clone()) {
+                                Ok(QueueFileResult::Queued) => {
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|e| e.to_string())?;
+                                    with_status(&shared, |s| {
+                                        s.file_transfer_phase = Some("receiving".into())
+                                    });
+                                }
+                                Ok(other) => {
+                                    current.producer.fail(format!("request failed: {other:?}"))
+                                }
+                                Err(err) => current.producer.fail(err.to_string()),
+                            }
+                        }
+                        BridgeEvent::Cancel(reason) => {
+                            session
+                                .cancel_file(current.transfer_id.clone(), reason)
+                                .map_err(|e| e.to_string())?;
+                            conn.send_all(session.take_outbox().iter())
+                                .map_err(|e| e.to_string())?;
+                            ole_manager.clear();
+                            keep_current = false;
+                            break;
+                        }
+                    }
+                }
+                while keep_current {
+                    let Some(msg) = ole_manager.take_event() else {
+                        break;
+                    };
+                    match msg {
+                        ManagerEvent::PublishFailed(error) => {
+                            current.producer.fail(error.clone());
+                            with_status(&shared, |s| {
+                                s.last_error = Some(format!("OLE publish: {error}"))
+                            });
+                        }
+                        ManagerEvent::ClipboardReplaced => {
+                            current.producer.fail("clipboard replaced");
+                            if !current.completed {
+                                let transfer_id = current.transfer_id.clone();
+                                session
+                                    .cancel_file(transfer_id, "clipboard replaced")
+                                    .map_err(|e| e.to_string())?;
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            keep_current = false;
+                            break;
+                        }
+                    }
+                }
+                if keep_current {
+                    virtual_receive = Some(current);
+                }
+            }
+        }
+
         if let Some(clip) = clipboard.as_mut() {
             let auto = with_status(&shared, |s| s.auto_sync);
-            if auto {
+            #[cfg(target_os = "windows")]
+            let virtual_clipboard_active = virtual_receive.is_some();
+            #[cfg(not(target_os = "windows"))]
+            let virtual_clipboard_active = false;
+            if auto && !virtual_clipboard_active {
                 // File-manager copies expose text/uri-list (file_list), not plain text/image.
                 if let Ok(Some(paths)) = clip.poll_file_list_change() {
                     // Images: keep bitmap clipboard path (Word/paint paste).
@@ -1706,6 +1918,7 @@ fn offer_file_bytes(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn handle_inbound_file(
     shared: &SharedStatus,
     session: &mut Session,
@@ -1801,6 +2014,7 @@ fn handle_inbound_file(
             });
             Ok(())
         }
+        InboundFileResult::Chunk { .. } | InboundFileResult::StreamCompleted { .. } => Ok(()),
     }
 }
 

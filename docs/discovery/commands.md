@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-12（task-043）
+> 更新日期：2026-08-12（task-044）
 
 ## 桌面（推荐）
 
@@ -93,6 +93,29 @@ cargo run -p m590-clipboard --example windows_virtual_file -- 268435456 8
 - Explorer 请求 `CFSTR_FILECONTENTS` 时终端才应打印 `content_opened`；确认系统复制进度出现，最终文件大小为 268435456 字节。
 - 按 Enter 退出原型。它只验证本机 OLE/Shell 按需取流，不连接 M590Bridge 网络会话，也不会先生成永久中间文件。
 
+### Windows 按粘贴取流真机验收（task-044）
+
+Windows 端使用安装版或 standalone 桌面端，Linux 端使用同版本桌面端。两端完成配对后：
+
+1. A 复制单个普通文件，B 只应收到文件名/大小 offer；B 保存目录和 `.partial` 不应出现内容文件。
+2. B 在 Explorer 目标目录按 `Ctrl+V`，此时才应出现 `FileRequest` 后开始网络流；Explorer 显示系统原生复制进度，目标目录只留下最终文件。
+3. 粘贴过程中取消 Explorer 复制或替换 B 剪贴板，确认双方状态停止且没有残留 `.part`；已开始读取后约 30 秒无网络进展应超时取消。未粘贴的 offer 应继续保留到剪贴板被替换或会话断开。
+
+当前 Linux 环境可运行以下协议/管道测试，但不能替代 Windows Explorer 真机验收：
+
+```bash
+cargo test -p m590-core -p m590-net -p m590-daemon
+cargo check --workspace
+cargo clippy -p m590-core -p m590-net -p m590-daemon --lib --no-deps -- -D warnings
+```
+
+Windows 交叉检查（若本机 Cargo 缓存和 GNU linker 可用）：
+
+```powershell
+cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --examples
+cargo check -p m590-daemon --target x86_64-pc-windows-gnu
+```
+
 ## Rust 测试 / CLI
 
 ```bash
@@ -122,7 +145,7 @@ cargo run -p m590-clipboard --example probe_clipboard
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
 - **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart；正式/standalone 桌面端可用，开发壳拒绝开启（task-038/039）
 - **Windows NSIS/登录自启**：当前用户 NSIS 已成功打包安装；HKCU Run + 卸载清理代码已实现，运行行为待 Windows 10 真机验证（task-042）
-- **Windows OLE 虚拟文件原型**：单文件 `FILEDESCRIPTORW` + 延迟 `IStream` 已通过 Windows target 静态检查和 Windows 10 Explorer 真机验证（task-043）
+- **Windows OLE 虚拟文件**：单文件 `FILEDESCRIPTORW` + 延迟 `IStream` 已接入 `FileRequest`，由网络有界管道供给；task-044 的 Windows↔Linux 端到端仍待用户真机验收
 
 ## 文件 API（task-021+）
 

@@ -892,6 +892,6 @@ mod tests {
     #[test]
     fn daemon_crate_loads() {
         assert!(!m590_core::VERSION.is_empty());
-        assert_eq!(m590_core::PROTOCOL_VERSION, 2);
+        assert_eq!(m590_core::PROTOCOL_VERSION, 3);
     }
 }
