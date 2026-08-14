@@ -52,6 +52,7 @@ struct WindowsVirtualReceive {
     producer: PipeProducer,
     requested: bool,
     completed: bool,
+    clipboard_replaced: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -73,6 +74,32 @@ struct QueuedFileStatus {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn active_virtual_receive_must_finish(requested: bool, completed: bool) -> bool {
     requested && !completed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardReplacementDisposition {
+    KeepActiveTransfer,
+    ReleaseClipboardOffer,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn clipboard_replacement_disposition(
+    requested: bool,
+    completed: bool,
+) -> ClipboardReplacementDisposition {
+    if active_virtual_receive_must_finish(requested, completed) {
+        ClipboardReplacementDisposition::KeepActiveTransfer
+    } else {
+        ClipboardReplacementDisposition::ReleaseClipboardOffer
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn completed_replaced_virtual_receive_can_detach(
+    completed: bool,
+    clipboard_replaced: bool,
+) -> bool {
+    completed && clipboard_replaced
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1568,18 +1595,6 @@ fn run_session_loop(
                                 }
                                 _ => {}
                             }
-                            let can_promote = virtual_receive
-                                .as_ref()
-                                .map(|current| current.completed)
-                                .unwrap_or(true);
-                            if can_promote {
-                                if let Some(next) = deferred_virtual_offer.take() {
-                                    virtual_receive.take();
-                                    virtual_receive =
-                                        Some(publish_windows_virtual_offer(&ole_manager, &next)?);
-                                    mark_windows_virtual_offer(&shared, &next);
-                                }
-                            }
                         }
                         #[cfg(not(target_os = "windows"))]
                         handle_inbound_file(&shared, session, conn, file_event)?;
@@ -1635,6 +1650,7 @@ fn run_session_loop(
         #[cfg(target_os = "windows")]
         {
             let mut promote_deferred = false;
+            let mut promote_deferred_if_current = false;
             let mut discard_deferred = false;
             if let Some(mut current) = virtual_receive.take() {
                 let mut keep_current = true;
@@ -1676,7 +1692,7 @@ fn run_session_loop(
                         }
                     }
                 }
-                if keep_current {
+                while keep_current {
                     if let Some(msg) = ole_manager.take_event() {
                         match msg {
                             ManagerEvent::PublishFailed(error) => {
@@ -1699,21 +1715,44 @@ fn run_session_loop(
                                 promote_deferred = true;
                             }
                             ManagerEvent::ClipboardReplaced => {
-                                current.producer.fail("clipboard replaced");
-                                if !current.completed {
-                                    let transfer_id = current.transfer_id.clone();
-                                    session
-                                        .cancel_file(transfer_id, "clipboard replaced")
-                                        .map_err(|e| e.to_string())?;
-                                    conn.send_all(session.take_outbox().iter())
-                                        .map_err(|e| e.to_string())?;
+                                match clipboard_replacement_disposition(
+                                    current.requested,
+                                    current.completed,
+                                ) {
+                                    ClipboardReplacementDisposition::KeepActiveTransfer => {
+                                        current.clipboard_replaced = true;
+                                    }
+                                    ClipboardReplacementDisposition::ReleaseClipboardOffer => {
+                                        if !current.completed {
+                                            current.producer.fail("clipboard replaced");
+                                            let transfer_id = current.transfer_id.clone();
+                                            session
+                                                .cancel_file(transfer_id, "clipboard replaced")
+                                                .map_err(|e| e.to_string())?;
+                                            conn.send_all(session.take_outbox().iter())
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                        keep_current = false;
+                                    }
                                 }
-                                keep_current = false;
                                 discard_deferred = true;
                                 latest_clipboard_file_offer_id = None;
                             }
                         }
+                    } else {
+                        break;
                     }
+                }
+                if keep_current
+                    && completed_replaced_virtual_receive_can_detach(
+                        current.completed,
+                        current.clipboard_replaced,
+                    )
+                {
+                    keep_current = false;
+                } else if keep_current && current.completed && deferred_virtual_offer.is_some() {
+                    keep_current = false;
+                    promote_deferred_if_current = true;
                 }
                 if keep_current {
                     virtual_receive = Some(current);
@@ -1731,6 +1770,24 @@ fn run_session_loop(
                 if let Some(next) = deferred_virtual_offer.take() {
                     virtual_receive = Some(publish_windows_virtual_offer(&ole_manager, &next)?);
                     mark_windows_virtual_offer(&shared, &next);
+                }
+            } else if promote_deferred_if_current {
+                if let Some(next) = deferred_virtual_offer.take() {
+                    match replace_windows_virtual_offer_if_current(&ole_manager, &next)? {
+                        Some(receive) => {
+                            virtual_receive = Some(receive);
+                            mark_windows_virtual_offer(&shared, &next);
+                        }
+                        None => {
+                            session
+                                .cancel_file(next.transfer_id, "clipboard replaced")
+                                .map_err(|e| e.to_string())?;
+                            conn.send_all(session.take_outbox().iter())
+                                .map_err(|e| e.to_string())?;
+                            latest_clipboard_file_offer_id = None;
+                            while ole_manager.take_event().is_some() {}
+                        }
+                    }
                 }
             }
         }
@@ -2162,18 +2219,39 @@ fn publish_windows_virtual_offer(
     manager: &WindowsVirtualFileManager,
     offer: &DeferredWindowsVirtualOffer,
 ) -> Result<WindowsVirtualReceive, String> {
+    let (file, receive) = prepare_windows_virtual_offer(offer)?;
+    manager.publish(file)?;
+    Ok(receive)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_windows_virtual_offer_if_current(
+    manager: &WindowsVirtualFileManager,
+    offer: &DeferredWindowsVirtualOffer,
+) -> Result<Option<WindowsVirtualReceive>, String> {
+    let (file, receive) = prepare_windows_virtual_offer(offer)?;
+    Ok(manager.replace_if_current(file)?.then_some(receive))
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_windows_virtual_offer(
+    offer: &DeferredWindowsVirtualOffer,
+) -> Result<(m590_clipboard::VirtualFile, WindowsVirtualReceive), String> {
     let (bridge, producer) = VirtualFileBridge::new();
     let file = bridge
         .virtual_file(offer.file_name.clone(), offer.size)
         .map_err(|e| e.to_string())?;
-    manager.publish(file)?;
-    Ok(WindowsVirtualReceive {
-        transfer_id: offer.transfer_id.clone(),
-        bridge,
-        producer,
-        requested: false,
-        completed: false,
-    })
+    Ok((
+        file,
+        WindowsVirtualReceive {
+            transfer_id: offer.transfer_id.clone(),
+            bridge,
+            producer,
+            requested: false,
+            completed: false,
+            clipboard_replaced: false,
+        },
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -2486,6 +2564,30 @@ mod tests {
         assert!(!active_virtual_receive_must_finish(false, false));
         assert!(active_virtual_receive_must_finish(true, false));
         assert!(!active_virtual_receive_must_finish(true, true));
+    }
+
+    #[test]
+    fn clipboard_replacement_preserves_only_an_active_requested_stream() {
+        assert_eq!(
+            clipboard_replacement_disposition(false, false),
+            ClipboardReplacementDisposition::ReleaseClipboardOffer
+        );
+        assert_eq!(
+            clipboard_replacement_disposition(true, false),
+            ClipboardReplacementDisposition::KeepActiveTransfer
+        );
+        assert_eq!(
+            clipboard_replacement_disposition(true, true),
+            ClipboardReplacementDisposition::ReleaseClipboardOffer
+        );
+    }
+
+    #[test]
+    fn replaced_virtual_receive_detaches_only_after_stream_completion() {
+        assert!(!completed_replaced_virtual_receive_can_detach(false, false));
+        assert!(!completed_replaced_virtual_receive_can_detach(false, true));
+        assert!(!completed_replaced_virtual_receive_can_detach(true, false));
+        assert!(completed_replaced_virtual_receive_can_detach(true, true));
     }
 
     #[test]

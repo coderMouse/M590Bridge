@@ -18,6 +18,10 @@ pub enum ManagerEvent {
 
 enum Command {
     Publish(VirtualFile),
+    ReplaceIfCurrent {
+        file: VirtualFile,
+        result: Sender<bool>,
+    },
     Clear,
     Stop,
 }
@@ -47,6 +51,23 @@ impl WindowsVirtualFileManager {
         self.commands
             .send(Command::Publish(file))
             .map_err(|_| "OLE STA stopped".into())
+    }
+
+    /// Replace an offer only while M590Bridge still owns the clipboard.
+    ///
+    /// This keeps a deferred remote offer from overwriting a native copy that
+    /// replaced the original virtual-file clipboard during an active stream.
+    pub fn replace_if_current(&self, file: VirtualFile) -> Result<bool, String> {
+        let (result_tx, result_rx) = mpsc::channel();
+        self.commands
+            .send(Command::ReplaceIfCurrent {
+                file,
+                result: result_tx,
+            })
+            .map_err(|_| "OLE STA stopped".to_string())?;
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "OLE STA did not answer conditional publish".into())
     }
 
     pub fn clear(&self) {
@@ -79,6 +100,22 @@ fn sta_loop(commands: Receiver<Command>, events: Sender<ManagerEvent>) {
                         let _ = events.send(ManagerEvent::PublishFailed(err.to_string()));
                     }
                 }
+            }
+            Ok(Command::ReplaceIfCurrent { file, result }) => {
+                let owns_clipboard = guard.as_ref().is_some_and(VirtualFileClipboard::is_current);
+                if !owns_clipboard {
+                    guard.take();
+                    let _ = result.send(false);
+                    continue;
+                }
+                guard.take();
+                match publish_virtual_file(file) {
+                    Ok(next) => guard = Some(next),
+                    Err(err) => {
+                        let _ = events.send(ManagerEvent::PublishFailed(err.to_string()));
+                    }
+                }
+                let _ = result.send(true);
             }
             Ok(Command::Clear) => {
                 guard.take();
