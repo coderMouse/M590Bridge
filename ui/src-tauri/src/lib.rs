@@ -286,19 +286,35 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.set_skip_taskbar(false);
         let _ = window.show();
         let _ = window.unminimize();
-        // GNOME/Wayland often ignores set_focus alone after tray restore.
         #[cfg(target_os = "linux")]
         {
-            if let Ok(gtk_win) = window.gtk_window() {
-                use gtk::prelude::GtkWindowExt;
-                gtk_win.present();
-            }
+            // GTK/Wayland may map a hidden window after this callback returns. Defer
+            // activation until the next main-loop turn so the first title-bar click
+            // is delivered to the close button instead of only activating the window.
+            let deferred_window = window.clone();
+            let _ = window.run_on_main_thread(move || {
+                gtk::glib::idle_add_local_once(move || {
+                    if let Ok(gtk_win) = deferred_window.gtk_window() {
+                        use gtk::prelude::GtkWindowExt;
+                        gtk_win.present();
+                    }
+                    let _ = deferred_window.set_always_on_top(true);
+                    let _ = deferred_window.set_focus();
+                    let _ = deferred_window.set_always_on_top(false);
+                    let _ = deferred_window.set_focus();
+                    let _ = deferred_window
+                        .request_user_attention(Some(tauri::UserAttentionType::Informational));
+                });
+            });
         }
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_focus();
-        let _ = window.set_always_on_top(false);
-        let _ = window.set_focus();
-        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_focus();
+            let _ = window.set_always_on_top(false);
+            let _ = window.set_focus();
+            let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        }
     }
 }
 
