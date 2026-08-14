@@ -35,7 +35,9 @@ impl LinuxClipboard {
         let backend = detect_backend()?;
         let mut clipboard = open_clipboard()?;
         let last_seen = read_text_raw(&mut clipboard)?;
-        let last_image_fp = read_image_raw(&mut clipboard)?.as_ref().map(|img| img.fingerprint());
+        let last_image_fp = read_image_raw(&mut clipboard)?
+            .as_ref()
+            .map(|img| img.fingerprint());
         let last_files = read_file_list_raw(&mut clipboard).unwrap_or_default();
         Ok(Self {
             backend,
@@ -101,9 +103,7 @@ impl ClipboardService for LinuxClipboard {
         read_file_list_raw(&mut self.clipboard)
     }
 
-    fn poll_file_list_change(
-        &mut self,
-    ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+    fn poll_file_list_change(&mut self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
         let current = read_file_list_raw(&mut self.clipboard)?;
         if current != self.last_files {
             self.last_files = current.clone();
@@ -116,6 +116,11 @@ impl ClipboardService for LinuxClipboard {
     fn prime_poll_to_emit_current(&mut self) {
         self.last_seen = None;
         self.last_image_fp = None;
+        self.last_files.clear();
+    }
+
+    fn rearm_file_offer_poll(&mut self) {
+        self.last_seen = None;
         self.last_files.clear();
     }
 

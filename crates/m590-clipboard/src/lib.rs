@@ -267,6 +267,15 @@ pub trait ClipboardService {
         let _ = self;
     }
 
+    /// Re-arm only file-list and path-text polling for the current clipboard.
+    ///
+    /// A streamed virtual file is single-use. After it completes or is cancelled,
+    /// the same local clipboard file needs to produce a fresh transfer without
+    /// re-emitting an unchanged bitmap.
+    fn rearm_file_offer_poll(&mut self) {
+        let _ = self;
+    }
+
     /// Set text poll baseline to whatever is currently on the clipboard (no emit).
     ///
     /// Used after a file_list / path-text file offer so the path string is not
@@ -353,6 +362,11 @@ impl ClipboardService for NullClipboard {
     fn prime_poll_to_emit_current(&mut self) {
         self.last_seen = None;
         self.last_image_fp = None;
+        self.last_files.clear();
+    }
+
+    fn rearm_file_offer_poll(&mut self) {
+        self.last_seen = None;
         self.last_files.clear();
     }
 
@@ -519,6 +533,13 @@ impl ClipboardService for PlatformClipboard {
         }
     }
 
+    fn rearm_file_offer_poll(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.rearm_file_offer_poll();
+        }
+    }
+
     fn adopt_text_baseline(&mut self) {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
@@ -606,6 +627,13 @@ mod tests {
             Some(vec![std::path::PathBuf::from("/tmp/a.png")])
         );
         assert_eq!(clip.poll_file_list_change().unwrap(), None);
+
+        clip.rearm_file_offer_poll();
+        assert_eq!(
+            clip.poll_file_list_change().unwrap(),
+            Some(vec![std::path::PathBuf::from("/tmp/a.png")])
+        );
+        assert_eq!(clip.poll_image_change().unwrap(), None);
     }
 
     #[test]

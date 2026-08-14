@@ -54,6 +54,27 @@ struct WindowsVirtualReceive {
     completed: bool,
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct DeferredWindowsVirtualOffer {
+    transfer_id: String,
+    file_name: String,
+    size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedFileStatus {
+    summary: String,
+    transfer_id: String,
+    file_name: String,
+    bytes: u64,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn active_virtual_receive_must_finish(requested: bool, completed: bool) -> bool {
+    requested && !completed
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SessionLoopPause {
     Yield,
@@ -1112,10 +1133,14 @@ fn run_session_loop(
     let mut last_heartbeat = Instant::now();
     let mut last_peer_rx = Instant::now();
     let mut content_seq = 0u64;
+    let mut latest_clipboard_file_offer_id: Option<String> = None;
+    let mut queued_file_status: Option<QueuedFileStatus> = None;
     #[cfg(target_os = "windows")]
     let ole_manager = WindowsVirtualFileManager::start().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
     let mut virtual_receive: Option<WindowsVirtualReceive> = None;
+    #[cfg(target_os = "windows")]
+    let mut deferred_virtual_offer: Option<DeferredWindowsVirtualOffer> = None;
     const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
     let pairing_started = Instant::now();
 
@@ -1211,6 +1236,7 @@ fn run_session_loop(
             .text
             .take();
         if let Some(text) = pending_text {
+            latest_clipboard_file_offer_id = None;
             content_seq += 1;
             let cid = format!("ui-push-{}-{content_seq}", std::process::id());
             if let Ok(QueueClipboardResult::Queued) =
@@ -1237,7 +1263,17 @@ fn run_session_loop(
                 Ok((summary, transfer_id, file_name, bytes)) => {
                     conn.send_all(session.take_outbox().iter())
                         .map_err(|e| e.to_string())?;
-                    mark_file_sending(&shared, summary, transfer_id, file_name, bytes);
+                    queue_or_mark_file_sending(
+                        &shared,
+                        session.outbound_file_progress().is_some(),
+                        &mut queued_file_status,
+                        QueuedFileStatus {
+                            summary,
+                            transfer_id,
+                            file_name,
+                            bytes,
+                        },
+                    );
                 }
                 Err(err) => {
                     with_status(&shared, |s| {
@@ -1258,7 +1294,17 @@ fn run_session_loop(
                 Ok((summary, transfer_id, file_name, bytes)) => {
                     conn.send_all(session.take_outbox().iter())
                         .map_err(|e| e.to_string())?;
-                    mark_file_sending(&shared, summary, transfer_id, file_name, bytes);
+                    queue_or_mark_file_sending(
+                        &shared,
+                        session.outbound_file_progress().is_some(),
+                        &mut queued_file_status,
+                        QueuedFileStatus {
+                            summary,
+                            transfer_id,
+                            file_name,
+                            bytes,
+                        },
+                    );
                 }
                 Err(err) => {
                     with_status(&shared, |s| {
@@ -1275,12 +1321,16 @@ fn run_session_loop(
             file_progressed = true;
             let outbox = session.take_outbox();
             conn.send_all(outbox.iter()).map_err(|e| e.to_string())?;
-            note_outbound_file_completes(&shared, &outbox);
+            let resolutions =
+                note_outbound_file_completes(&shared, &outbox, &mut queued_file_status);
+            rearm_completed_clipboard_offers(
+                clipboard.as_mut(),
+                &mut latest_clipboard_file_offer_id,
+                &resolutions,
+            );
             if let Some((tid, sent, total)) = session.outbound_file_progress() {
                 with_status(&shared, |s| {
-                    if s.last_file_transfer_id.as_deref() == Some(tid.as_str())
-                        || s.file_transfer_phase.as_deref() == Some("sending")
-                    {
+                    if s.last_file_transfer_id.as_deref() == Some(tid.as_str()) {
                         s.file_transfer_phase = Some("sending".into());
                         s.file_bytes_received = Some(sent);
                         s.file_bytes_total = Some(total);
@@ -1300,9 +1350,16 @@ fn run_session_loop(
                     last_peer_rx = Instant::now();
                     let outbox = session.take_outbox();
                     conn.send_all(outbox.iter()).map_err(|e| e.to_string())?;
-                    note_outbound_file_completes(&shared, &outbox);
+                    let resolutions =
+                        note_outbound_file_completes(&shared, &outbox, &mut queued_file_status);
+                    rearm_completed_clipboard_offers(
+                        clipboard.as_mut(),
+                        &mut latest_clipboard_file_offer_id,
+                        &resolutions,
+                    );
                     match session.take_inbound_clipboard() {
                         Some(InboundClipboardResult::Applied { content_id, text }) => {
+                            latest_clipboard_file_offer_id = None;
                             with_status(&shared, |s| {
                                 s.last_sync_text = Some(text.clone());
                                 s.last_sync_content_id = Some(content_id);
@@ -1318,6 +1375,7 @@ fn run_session_loop(
                             encoding,
                             data,
                         }) => {
+                            latest_clipboard_file_offer_id = None;
                             let summary =
                                 format!("[image {width}x{height} {}B {encoding:?}]", data.len());
                             with_status(&shared, |s| {
@@ -1349,6 +1407,21 @@ fn run_session_loop(
                     }
 
                     if let Some(file_event) = session.take_inbound_file() {
+                        let failed_transfer_id = match &file_event {
+                            InboundFileResult::Failed { transfer_id, .. } => {
+                                Some(transfer_id.clone())
+                            }
+                            _ => None,
+                        };
+                        let cancelled_clipboard_offer = match &file_event {
+                            InboundFileResult::Failed {
+                                transfer_id,
+                                message,
+                            } if file_failure_rearms_clipboard_offer(message) => {
+                                Some(transfer_id.clone())
+                            }
+                            _ => None,
+                        };
                         #[cfg(target_os = "windows")]
                         {
                             if let Some(current) = virtual_receive.as_mut() {
@@ -1370,53 +1443,80 @@ fn run_session_loop(
                                     file_name,
                                     size,
                                 } => {
-                                    if let Some(previous) = virtual_receive.take() {
-                                        previous.producer.fail("replaced by a newer file offer");
-                                        session
-                                            .cancel_file(
-                                                previous.transfer_id,
-                                                "replaced by a newer file offer",
-                                            )
-                                            .map_err(|e| e.to_string())?;
-                                        conn.send_all(session.take_outbox().iter())
-                                            .map_err(|e| e.to_string())?;
-                                        ole_manager.clear();
-                                    }
-                                    let (bridge, producer) = VirtualFileBridge::new();
-                                    let file = bridge
-                                        .virtual_file(file_name.clone(), *size)
-                                        .map_err(|e| e.to_string())?;
-                                    ole_manager.publish(file)?;
-                                    virtual_receive = Some(WindowsVirtualReceive {
+                                    let next = DeferredWindowsVirtualOffer {
                                         transfer_id: transfer_id.clone(),
-                                        bridge,
-                                        producer,
-                                        requested: false,
-                                        completed: false,
-                                    });
-                                    with_status(&shared, |s| {
-                                        s.file_transfer_phase = Some("offered".into());
-                                        s.last_file_transfer_id = Some(transfer_id.clone());
-                                        s.last_file_name = Some(file_name.clone());
-                                        s.last_file_bytes = Some(*size);
-                                        s.file_bytes_received = Some(0);
-                                        s.file_bytes_total = Some(*size);
-                                        s.last_sync_text = Some(format!(
-                                            "[file offer {file_name} {size}B; paste to transfer]"
-                                        ));
-                                        s.last_error = None;
-                                    });
+                                        file_name: file_name.clone(),
+                                        size: *size,
+                                    };
+                                    let must_defer =
+                                        virtual_receive.as_ref().is_some_and(|current| {
+                                            active_virtual_receive_must_finish(
+                                                current.requested,
+                                                current.completed,
+                                            )
+                                        });
+                                    if must_defer {
+                                        if let Some(stale) = deferred_virtual_offer.replace(next) {
+                                            session
+                                                .cancel_file(
+                                                    stale.transfer_id,
+                                                    "replaced by a newer deferred file offer",
+                                                )
+                                                .map_err(|e| e.to_string())?;
+                                            conn.send_all(session.take_outbox().iter())
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                    } else {
+                                        if let Some(previous) = virtual_receive.take() {
+                                            if !previous.completed {
+                                                previous
+                                                    .producer
+                                                    .fail("replaced by a newer file offer");
+                                                session
+                                                    .cancel_file(
+                                                        previous.transfer_id,
+                                                        "replaced by a newer file offer",
+                                                    )
+                                                    .map_err(|e| e.to_string())?;
+                                                conn.send_all(session.take_outbox().iter())
+                                                    .map_err(|e| e.to_string())?;
+                                            }
+                                        }
+                                        if let Some(stale) = deferred_virtual_offer.take() {
+                                            session
+                                                .cancel_file(
+                                                    stale.transfer_id,
+                                                    "replaced by a newer file offer",
+                                                )
+                                                .map_err(|e| e.to_string())?;
+                                            conn.send_all(session.take_outbox().iter())
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                        virtual_receive = Some(publish_windows_virtual_offer(
+                                            &ole_manager,
+                                            &next,
+                                        )?);
+                                        mark_windows_virtual_offer(&shared, &next);
+                                    }
                                 }
                                 InboundFileResult::Failed {
                                     transfer_id,
                                     message,
                                 } => {
+                                    if deferred_virtual_offer
+                                        .as_ref()
+                                        .is_some_and(|v| v.transfer_id == *transfer_id)
+                                    {
+                                        deferred_virtual_offer = None;
+                                    }
                                     if virtual_receive
                                         .as_ref()
                                         .is_some_and(|v| v.transfer_id == *transfer_id)
                                     {
+                                        if let Some(current) = virtual_receive.take() {
+                                            current.producer.fail(message.clone());
+                                        }
                                         ole_manager.clear();
-                                        virtual_receive = None;
                                     }
                                     with_status(&shared, |s| {
                                         mark_file_failed_if_current(s, transfer_id, message);
@@ -1425,19 +1525,26 @@ fn run_session_loop(
                                 InboundFileResult::StreamCompleted {
                                     transfer_id, size, ..
                                 } => {
-                                    if let Some(current) = virtual_receive.as_mut() {
+                                    if let Some(current) = virtual_receive
+                                        .as_mut()
+                                        .filter(|current| current.transfer_id == *transfer_id)
+                                    {
                                         current.producer.finish();
                                         current.completed = true;
+                                        with_status(&shared, |s| {
+                                            s.file_transfer_phase = Some("done".into());
+                                            s.last_file_transfer_id = Some(transfer_id.clone());
+                                            s.file_bytes_received = Some(*size);
+                                            s.file_bytes_total = Some(*size);
+                                            s.last_error = None;
+                                        });
                                     }
-                                    with_status(&shared, |s| {
-                                        s.file_transfer_phase = Some("done".into());
-                                        s.last_file_transfer_id = Some(transfer_id.clone());
-                                        s.file_bytes_received = Some(*size);
-                                        s.file_bytes_total = Some(*size);
-                                        s.last_error = None;
-                                    });
                                 }
-                                InboundFileResult::Chunk { transfer_id, data } => {
+                                InboundFileResult::Chunk { transfer_id, data }
+                                    if virtual_receive.as_ref().is_some_and(|current| {
+                                        current.transfer_id == *transfer_id
+                                    }) =>
+                                {
                                     if let Some((_, received, total)) =
                                         session.inbound_file_progress()
                                     {
@@ -1461,16 +1568,62 @@ fn run_session_loop(
                                 }
                                 _ => {}
                             }
+                            let can_promote = virtual_receive
+                                .as_ref()
+                                .map(|current| current.completed)
+                                .unwrap_or(true);
+                            if can_promote {
+                                if let Some(next) = deferred_virtual_offer.take() {
+                                    virtual_receive.take();
+                                    virtual_receive =
+                                        Some(publish_windows_virtual_offer(&ole_manager, &next)?);
+                                    mark_windows_virtual_offer(&shared, &next);
+                                }
+                            }
                         }
                         #[cfg(not(target_os = "windows"))]
                         handle_inbound_file(&shared, session, conn, file_event)?;
-                    } else if let Some((tid, got, total)) = session.inbound_file_progress() {
-                        with_status(&shared, |s| {
-                            s.file_transfer_phase = Some("receiving".into());
-                            s.last_file_transfer_id = Some(tid);
-                            s.file_bytes_received = Some(got);
-                            s.file_bytes_total = Some(total);
-                        });
+                        if let Some(transfer_id) = failed_transfer_id {
+                            discard_queued_file_status(&mut queued_file_status, &transfer_id);
+                            promote_queued_file_status_after(
+                                &shared,
+                                &mut queued_file_status,
+                                &transfer_id,
+                            );
+                        }
+                        if let Some(transfer_id) = cancelled_clipboard_offer {
+                            rearm_cancelled_clipboard_offer(
+                                clipboard.as_mut(),
+                                &mut latest_clipboard_file_offer_id,
+                                &transfer_id,
+                            );
+                        }
+                    } else {
+                        #[cfg(target_os = "windows")]
+                        if let Some(current) = virtual_receive
+                            .as_ref()
+                            .filter(|current| current.requested && !current.completed)
+                        {
+                            if let Some((tid, got, total)) = session.inbound_file_progress() {
+                                if tid == current.transfer_id {
+                                    with_status(&shared, |s| {
+                                        s.file_transfer_phase = Some("receiving".into());
+                                        s.last_file_transfer_id = Some(tid);
+                                        s.file_bytes_received = Some(got);
+                                        s.file_bytes_total = Some(total);
+                                    });
+                                }
+                            }
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        if let Some((tid, got, total)) = session.inbound_file_progress() {
+                            with_status(&shared, |s| {
+                                s.file_transfer_phase = Some("receiving".into());
+                                s.last_file_transfer_id = Some(tid);
+                                s.file_bytes_received = Some(got);
+                                s.file_bytes_total = Some(total);
+                            });
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -1481,6 +1634,8 @@ fn run_session_loop(
 
         #[cfg(target_os = "windows")]
         {
+            let mut promote_deferred = false;
+            let mut discard_deferred = false;
             if let Some(mut current) = virtual_receive.take() {
                 let mut keep_current = true;
                 while let Some(event) = current.bridge.take_event() {
@@ -1516,6 +1671,7 @@ fn run_session_loop(
                                 .map_err(|e| e.to_string())?;
                             ole_manager.clear();
                             keep_current = false;
+                            promote_deferred = true;
                             break;
                         }
                     }
@@ -1540,6 +1696,7 @@ fn run_session_loop(
                                     s.last_error = Some(format!("OLE publish: {error}"));
                                 });
                                 keep_current = false;
+                                promote_deferred = true;
                             }
                             ManagerEvent::ClipboardReplaced => {
                                 current.producer.fail("clipboard replaced");
@@ -1552,12 +1709,28 @@ fn run_session_loop(
                                         .map_err(|e| e.to_string())?;
                                 }
                                 keep_current = false;
+                                discard_deferred = true;
+                                latest_clipboard_file_offer_id = None;
                             }
                         }
                     }
                 }
                 if keep_current {
                     virtual_receive = Some(current);
+                }
+            }
+            if discard_deferred {
+                if let Some(stale) = deferred_virtual_offer.take() {
+                    session
+                        .cancel_file(stale.transfer_id, "clipboard replaced")
+                        .map_err(|e| e.to_string())?;
+                    conn.send_all(session.take_outbox().iter())
+                        .map_err(|e| e.to_string())?;
+                }
+            } else if promote_deferred {
+                if let Some(next) = deferred_virtual_offer.take() {
+                    virtual_receive = Some(publish_windows_virtual_offer(&ole_manager, &next)?);
+                    mark_windows_virtual_offer(&shared, &next);
                 }
             }
         }
@@ -1571,6 +1744,7 @@ fn run_session_loop(
             if auto && !virtual_clipboard_active {
                 // File-manager copies expose text/uri-list (file_list), not plain text/image.
                 if let Ok(Some(paths)) = clip.poll_file_list_change() {
+                    latest_clipboard_file_offer_id = None;
                     // Images: keep bitmap clipboard path (Word/paint paste).
                     let mut handled = false;
                     if let Ok(Some(image)) = m590_clipboard::image_from_paths(&paths) {
@@ -1638,12 +1812,17 @@ fn run_session_loop(
                                 Ok((summary, transfer_id, file_name, bytes)) => {
                                     conn.send_all(session.take_outbox().iter())
                                         .map_err(|e| e.to_string())?;
-                                    mark_file_sending(
+                                    latest_clipboard_file_offer_id = Some(transfer_id.clone());
+                                    queue_or_mark_file_sending(
                                         &shared,
-                                        summary,
-                                        transfer_id,
-                                        file_name,
-                                        bytes,
+                                        session.outbound_file_progress().is_some(),
+                                        &mut queued_file_status,
+                                        QueuedFileStatus {
+                                            summary,
+                                            transfer_id,
+                                            file_name,
+                                            bytes,
+                                        },
                                     );
                                     handled = true;
                                 }
@@ -1663,6 +1842,7 @@ fn run_session_loop(
                     }
                 }
                 if let Ok(Some(text)) = clip.poll_text_change() {
+                    latest_clipboard_file_offer_id = None;
                     // File-manager "copy image file" often only places a path/URI as text.
                     // Prefer decoding local image files into ClipboardImage.
                     if let Ok(Some(image)) = m590_clipboard::image_from_clipboard_text(&text) {
@@ -1718,7 +1898,18 @@ fn run_session_loop(
                             Ok((summary, transfer_id, file_name, bytes)) => {
                                 conn.send_all(session.take_outbox().iter())
                                     .map_err(|e| e.to_string())?;
-                                mark_file_sending(&shared, summary, transfer_id, file_name, bytes);
+                                latest_clipboard_file_offer_id = Some(transfer_id.clone());
+                                queue_or_mark_file_sending(
+                                    &shared,
+                                    session.outbound_file_progress().is_some(),
+                                    &mut queued_file_status,
+                                    QueuedFileStatus {
+                                        summary,
+                                        transfer_id,
+                                        file_name,
+                                        bytes,
+                                    },
+                                );
                                 clip.adopt_text_baseline();
                             }
                             Err(err) => {
@@ -1743,6 +1934,7 @@ fn run_session_loop(
                 }
                 match clip.poll_image_change() {
                     Ok(Some(image)) => {
+                        latest_clipboard_file_offer_id = None;
                         content_seq += 1;
                         let cid = format!("ui-clip-img-{}-{content_seq}", std::process::id());
                         match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
@@ -1827,21 +2019,83 @@ fn mark_file_sending(
     });
 }
 
+fn mark_queued_file_sending(shared: &SharedStatus, status: QueuedFileStatus) {
+    mark_file_sending(
+        shared,
+        status.summary,
+        status.transfer_id,
+        status.file_name,
+        status.bytes,
+    );
+}
+
+fn queue_or_mark_file_sending(
+    shared: &SharedStatus,
+    outbound_active: bool,
+    queued: &mut Option<QueuedFileStatus>,
+    status: QueuedFileStatus,
+) {
+    if outbound_active {
+        *queued = Some(status);
+    } else {
+        mark_queued_file_sending(shared, status);
+    }
+}
+
+fn promote_queued_file_status_after(
+    shared: &SharedStatus,
+    queued: &mut Option<QueuedFileStatus>,
+    finished_transfer_id: &str,
+) -> bool {
+    let current_finished = with_status(shared, |status| {
+        status.last_file_transfer_id.as_deref() == Some(finished_transfer_id)
+    });
+    if !current_finished {
+        return false;
+    }
+    if let Some(next) = queued.take() {
+        mark_queued_file_sending(shared, next);
+        true
+    } else {
+        false
+    }
+}
+
+fn discard_queued_file_status(
+    queued: &mut Option<QueuedFileStatus>,
+    failed_transfer_id: &str,
+) -> bool {
+    if queued
+        .as_ref()
+        .is_some_and(|status| status.transfer_id == failed_transfer_id)
+    {
+        queued.take();
+        true
+    } else {
+        false
+    }
+}
+
 /// Sender side: after FileRequest is answered, outbox contains FileComplete but status
 /// used to stay on `sending` / 0%. Mirror complete into hub status for UI progress.
-fn note_outbound_file_completes(shared: &SharedStatus, outbox: &[Message]) {
+fn note_outbound_file_completes(
+    shared: &SharedStatus,
+    outbox: &[Message],
+    queued: &mut Option<QueuedFileStatus>,
+) -> Vec<(String, bool)> {
+    let mut resolutions = Vec::new();
     for msg in outbox {
         let Message::FileComplete(payload) = msg else {
             continue;
         };
-        with_status(shared, |s| {
+        resolutions.push((payload.transfer_id.clone(), payload.ok));
+        let updated = with_status(shared, |s| {
             let matches_current = s
                 .last_file_transfer_id
                 .as_deref()
                 .is_some_and(|id| id == payload.transfer_id);
-            let sending = s.file_transfer_phase.as_deref() == Some("sending");
-            if !(matches_current || sending) {
-                return;
+            if !matches_current {
+                return false;
             }
             s.last_file_transfer_id = Some(payload.transfer_id.clone());
             if payload.ok {
@@ -1855,8 +2109,88 @@ fn note_outbound_file_completes(shared: &SharedStatus, outbox: &[Message]) {
                 s.file_transfer_phase = Some("failed".into());
                 s.last_error = Some(payload.message.clone());
             }
+            true
         });
+        if updated {
+            promote_queued_file_status_after(shared, queued, &payload.transfer_id);
+        }
     }
+    resolutions
+}
+
+fn rearm_completed_clipboard_offers(
+    clipboard: Option<&mut PlatformClipboard>,
+    latest_clipboard_offer_id: &mut Option<String>,
+    resolutions: &[(String, bool)],
+) {
+    let should_rearm = resolutions.iter().any(|(transfer_id, ok)| {
+        *ok && latest_clipboard_offer_id.as_deref() == Some(transfer_id.as_str())
+    });
+    if should_rearm {
+        *latest_clipboard_offer_id = None;
+        if let Some(clipboard) = clipboard {
+            clipboard.rearm_file_offer_poll();
+        }
+    }
+}
+
+fn file_failure_rearms_clipboard_offer(message: &str) -> bool {
+    matches!(
+        message,
+        "virtual file reader closed"
+            | "virtual file read timeout"
+            | "virtual file consumer stalled"
+    )
+}
+
+fn rearm_cancelled_clipboard_offer(
+    clipboard: Option<&mut PlatformClipboard>,
+    latest_clipboard_offer_id: &mut Option<String>,
+    transfer_id: &str,
+) {
+    if latest_clipboard_offer_id.as_deref() != Some(transfer_id) {
+        return;
+    }
+    *latest_clipboard_offer_id = None;
+    if let Some(clipboard) = clipboard {
+        clipboard.rearm_file_offer_poll();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn publish_windows_virtual_offer(
+    manager: &WindowsVirtualFileManager,
+    offer: &DeferredWindowsVirtualOffer,
+) -> Result<WindowsVirtualReceive, String> {
+    let (bridge, producer) = VirtualFileBridge::new();
+    let file = bridge
+        .virtual_file(offer.file_name.clone(), offer.size)
+        .map_err(|e| e.to_string())?;
+    manager.publish(file)?;
+    Ok(WindowsVirtualReceive {
+        transfer_id: offer.transfer_id.clone(),
+        bridge,
+        producer,
+        requested: false,
+        completed: false,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn mark_windows_virtual_offer(shared: &SharedStatus, offer: &DeferredWindowsVirtualOffer) {
+    with_status(shared, |s| {
+        s.file_transfer_phase = Some("offered".into());
+        s.last_file_transfer_id = Some(offer.transfer_id.clone());
+        s.last_file_name = Some(offer.file_name.clone());
+        s.last_file_bytes = Some(offer.size);
+        s.file_bytes_received = Some(0);
+        s.file_bytes_total = Some(offer.size);
+        s.last_sync_text = Some(format!(
+            "[file offer {} {}B; paste to transfer]",
+            offer.file_name, offer.size
+        ));
+        s.last_error = None;
+    });
 }
 
 fn mark_file_failed_if_current(status: &mut HubStatus, transfer_id: &str, message: &str) -> bool {
@@ -2145,6 +2479,98 @@ mod tests {
         );
         assert_eq!(session_loop_pause(true, true), SessionLoopPause::Yield);
         assert_eq!(session_loop_pause(false, true), SessionLoopPause::Yield);
+    }
+
+    #[test]
+    fn requested_virtual_receive_must_finish_before_replacement() {
+        assert!(!active_virtual_receive_must_finish(false, false));
+        assert!(active_virtual_receive_must_finish(true, false));
+        assert!(!active_virtual_receive_must_finish(true, true));
+    }
+
+    #[test]
+    fn completed_active_send_promotes_queued_offer_status() {
+        let shared = crate::status::new_shared_status();
+        with_status(&shared, |status| {
+            status.file_transfer_phase = Some("sending".into());
+            status.last_file_transfer_id = Some("active".into());
+            status.last_file_name = Some("active.bin".into());
+            status.last_file_bytes = Some(8);
+            status.file_bytes_total = Some(8);
+        });
+        let mut queued = Some(QueuedFileStatus {
+            summary: "queued summary".into(),
+            transfer_id: "queued".into(),
+            file_name: "queued.bin".into(),
+            bytes: 12,
+        });
+        let payload =
+            m590_core::FileCompletePayload::new(DeviceId::new("local"), "active", true, "ok")
+                .unwrap();
+        let resolutions =
+            note_outbound_file_completes(&shared, &[Message::file_complete(payload)], &mut queued);
+
+        assert_eq!(resolutions, vec![("active".into(), true)]);
+        assert!(queued.is_none());
+        let status = with_status(&shared, |status| status.clone());
+        assert_eq!(status.file_transfer_phase.as_deref(), Some("sending"));
+        assert_eq!(status.last_file_transfer_id.as_deref(), Some("queued"));
+        assert_eq!(status.last_file_name.as_deref(), Some("queued.bin"));
+        assert_eq!(status.file_bytes_total, Some(12));
+    }
+
+    #[test]
+    fn stale_outbound_completion_does_not_promote_or_replace_current_status() {
+        let shared = crate::status::new_shared_status();
+        with_status(&shared, |status| {
+            status.file_transfer_phase = Some("sending".into());
+            status.last_file_transfer_id = Some("current".into());
+            status.last_file_name = Some("current.bin".into());
+        });
+        let mut queued = Some(QueuedFileStatus {
+            summary: "queued summary".into(),
+            transfer_id: "queued".into(),
+            file_name: "queued.bin".into(),
+            bytes: 12,
+        });
+        let payload =
+            m590_core::FileCompletePayload::new(DeviceId::new("local"), "stale", true, "ok")
+                .unwrap();
+        note_outbound_file_completes(&shared, &[Message::file_complete(payload)], &mut queued);
+
+        assert_eq!(queued.as_ref().unwrap().transfer_id, "queued");
+        let status = with_status(&shared, |status| status.clone());
+        assert_eq!(status.last_file_transfer_id.as_deref(), Some("current"));
+        assert_eq!(status.last_file_name.as_deref(), Some("current.bin"));
+    }
+
+    #[test]
+    fn failed_deferred_offer_is_removed_from_status_queue() {
+        let mut queued = Some(QueuedFileStatus {
+            summary: "queued summary".into(),
+            transfer_id: "queued".into(),
+            file_name: "queued.bin".into(),
+            bytes: 12,
+        });
+
+        assert!(!discard_queued_file_status(&mut queued, "other"));
+        assert!(queued.is_some());
+        assert!(discard_queued_file_status(&mut queued, "queued"));
+        assert!(queued.is_none());
+    }
+
+    #[test]
+    fn only_virtual_reader_failures_rearm_clipboard_file_offer() {
+        assert!(file_failure_rearms_clipboard_offer(
+            "virtual file reader closed"
+        ));
+        assert!(file_failure_rearms_clipboard_offer(
+            "virtual file read timeout"
+        ));
+        assert!(!file_failure_rearms_clipboard_offer("clipboard replaced"));
+        assert!(!file_failure_rearms_clipboard_offer(
+            "replaced by a newer file offer"
+        ));
     }
 
     #[test]

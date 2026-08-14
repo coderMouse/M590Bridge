@@ -28,7 +28,9 @@ impl WindowsClipboard {
     pub fn open() -> Result<Self, ClipboardError> {
         let mut clipboard = open_clipboard()?;
         let last_seen = read_text_raw(&mut clipboard)?;
-        let last_image_fp = read_image_raw(&mut clipboard)?.as_ref().map(|img| img.fingerprint());
+        let last_image_fp = read_image_raw(&mut clipboard)?
+            .as_ref()
+            .map(|img| img.fingerprint());
         let last_files = read_file_list_raw(&mut clipboard).unwrap_or_default();
         Ok(Self {
             clipboard,
@@ -114,9 +116,7 @@ impl ClipboardService for WindowsClipboard {
         read_file_list_raw(&mut self.clipboard)
     }
 
-    fn poll_file_list_change(
-        &mut self,
-    ) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
+    fn poll_file_list_change(&mut self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
         let current = match read_file_list_raw(&mut self.clipboard) {
             Ok(v) => v,
             Err(_) => {
@@ -145,6 +145,11 @@ impl ClipboardService for WindowsClipboard {
     fn prime_poll_to_emit_current(&mut self) {
         self.last_seen = None;
         self.last_image_fp = None;
+        self.last_files.clear();
+    }
+
+    fn rearm_file_offer_poll(&mut self) {
+        self.last_seen = None;
         self.last_files.clear();
     }
 }
