@@ -95,6 +95,9 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 - 用户复测第六版发现：启动时标题栏不可见，托盘恢复后才出现，且仍无法拖动。原因是 setup
   替换 titlebar 时窗口已经首次映射，GTK 直到下一次 hide/show 才完成标题栏挂载；现改为 setup
   中先 hide、安装直接 `HeaderBar` 后立即 show/present，确保首次映射即带可拖动标题栏。
+- 用户确认完全退出旧进程并以 `npm run desktop:standalone` 运行第七版，标题栏仍无法拖动，排除
+  启动方式和多进程干扰。直接 `HeaderBar` 方案已删除：启动时保留 Tao 原始可拖动标题栏；仅在
+  隐藏窗口恢复前，同步重建 Tao 同结构的 `EventBox + HeaderBar`，清除上一次 hide 后的旧事件状态。
 - Linux `CloseRequested` 在 `prevent_close` 与 `skip_taskbar` 后改用真正的 `hide()`，
   避免最小化窗口仍出现在 Ubuntu Dock；Windows 等非 Linux 平台继续沿用已验证的
   `minimize()`，不改变现有关闭行为。
@@ -221,7 +224,20 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 - `cargo build -p m590-ui --release --features custom-protocol`：通过。
 - 临时可写 XDG 运行目录启动新 release 桌面壳 6 秒：内嵌 Hub 到达 `ready`，无 setup、GTK 标题栏
   或托盘 panic；到时主动结束进程。
-- 启动时标题栏可见、标题栏拖动、关闭到托盘与托盘恢复：待用户真机复测。
+- 用户确认完全退出旧进程后以 `npm run desktop:standalone` 复测：标题栏仍无法拖动，不通过。
+
+### 第八次返工验证（隐藏期间重建 Tao 标题栏事件层）
+
+- `rustfmt --edition 2021 --check ui/src-tauri/src/lib.rs`、`git diff --check`：通过。
+- `cargo check -p m590-ui --features custom-protocol`：通过。
+- `cargo test -p m590-ui --lib`：通过，8 项测试全部成功。
+- `cargo clippy -p m590-ui --lib --no-deps --features custom-protocol -- -D warnings`：通过。
+- `cd ui && npm run lint`：通过。
+- `cd ui && npm run build`：通过，Vite 构建 1804 个模块。
+- `cargo build -p m590-ui --release --features custom-protocol`：通过。
+- 临时可写 XDG 运行目录启动新 release 桌面壳 6 秒：内嵌 Hub 到达 `ready`，无 setup、托盘或标题栏
+  重建相关 panic；到时主动结束进程。
+- 启动时原始标题栏拖动、托盘恢复后的无闪烁/位置/首次关闭/继续拖动：待用户真机复测。
 
 ## 文档影响检查
 
@@ -233,9 +249,8 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 - GNOME/Wayland 的 Dock 图标依赖 `.desktop` 应用身份，纯 `set_icon` 不能替代该匹配；
   最终外观仍需当前 Linux 桌面真机确认。
-- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；本次在 Wayland 下改用不带 Tao `EventBox`
-  的直接 GTK `HeaderBar`，并在首次映射前完成一次 hide/show 挂载；标题栏外观、拖动与 hide/show
-  后的交互仍需 Linux 真机确认。
+- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；本次保留启动时的 Tao 标题栏，并在每次隐藏
+  窗口恢复前重建同结构标题栏事件层。拖动与重复 hide/show 后的交互仍需 Linux 真机确认。
 - standalone 生成的桌面身份为 `NoDisplay=true`，不会增加应用菜单入口；停用源码
   standalone 后可按 `ui/README.md` 删除这两个用户级文件。
 - 当前 Linux 环境不能运行 Windows 桌面壳，Windows 行为待与 task-046 一并真机验收。
@@ -245,5 +260,5 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 - 用户统一验收 task-046 的 3 组文件生命周期场景，以及本 task 的 Linux 3 步桌面
   交互和 Windows 关闭到托盘回归。
-- 第七次返工后复测：刚启动即确认带最小化/最大化/X 的系统标题栏可见且可拖动；再执行 X 隐藏
-  → 托盘恢复，确认恢复无闪烁、位置保持，且第一次点击 X 仍立即生效。
+- 第八次返工后复测：刚启动即确认系统标题栏可拖动；再执行 X 隐藏 → 托盘恢复，确认恢复无闪烁、
+  位置保持、第一次点击 X 生效，并再次确认标题栏仍可拖动；连续重复两轮。

@@ -280,8 +280,39 @@ fn set_windows_autostart(executable: &Path, enabled: bool) -> Result<bool, Strin
     }
 }
 
+#[cfg(target_os = "linux")]
+fn refresh_hidden_wayland_titlebar(window: &tauri::WebviewWindow) {
+    if window.is_visible().unwrap_or(false) {
+        return;
+    }
+    let Ok(gtk_win) = window.gtk_window() else {
+        return;
+    };
+    use gtk::prelude::*;
+
+    if gtk_win.display().type_().name() != "GdkWaylandDisplay" {
+        return;
+    }
+
+    // Recreate Tao's draggable CSD while the window is unmapped so stale
+    // EventBox pointer state cannot survive into the next tray restore.
+    let header = gtk::HeaderBar::builder()
+        .show_close_button(true)
+        .decoration_layout("menu:minimize,maximize,close")
+        .title("M590Bridge")
+        .build();
+    let event_box = gtk::EventBox::new();
+    event_box.set_above_child(true);
+    event_box.set_visible(true);
+    event_box.set_can_focus(false);
+    event_box.add(&header);
+    gtk_win.set_titlebar(Some(&event_box));
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        #[cfg(target_os = "linux")]
+        refresh_hidden_wayland_titlebar(&window);
         // Reverse close-to-tray state before asking the compositor to present the window.
         let _ = window.set_skip_taskbar(false);
         let _ = window.show();
@@ -517,31 +548,6 @@ pub fn run() {
                 .cloned()
                 .expect("default window icon");
             if let Some(window) = app.get_webview_window("main") {
-                #[cfg(target_os = "linux")]
-                {
-                    let gtk_win = window.gtk_window()?;
-                    use gtk::prelude::*;
-
-                    if gtk_win.display().type_().name() == "GdkWaylandDisplay" {
-                        // Tao wraps this header in an above-child EventBox whose
-                        // pointer state goes stale across hide/show on Wayland.
-                        let was_visible = gtk_win.is_visible();
-                        if was_visible {
-                            gtk_win.hide();
-                        }
-                        let header = gtk::HeaderBar::builder()
-                            .show_close_button(true)
-                            .decoration_layout("menu:minimize,maximize,close")
-                            .title("M590Bridge")
-                            .build();
-                        gtk_win.set_titlebar(Some(&header));
-                        gtk_win.set_decorated(true);
-                        if was_visible {
-                            gtk_win.show_all();
-                            gtk_win.present();
-                        }
-                    }
-                }
                 window.set_icon(icon.clone())?;
             }
 
