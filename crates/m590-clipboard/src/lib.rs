@@ -250,6 +250,12 @@ pub trait ClipboardService {
         Ok(Vec::new())
     }
 
+    /// Replace the clipboard with local file paths.
+    fn write_file_list(&mut self, paths: &[std::path::PathBuf]) -> Result<(), ClipboardError> {
+        let _ = paths;
+        Err(ClipboardError::UnsupportedPlatform)
+    }
+
     /// Poll for file-list change since open / last poll.
     ///
     /// Returns `Ok(Some(paths))` when the list changed (including to empty).
@@ -348,6 +354,12 @@ impl ClipboardService for NullClipboard {
 
     fn read_file_list(&mut self) -> Result<Vec<std::path::PathBuf>, ClipboardError> {
         Ok(self.files.clone())
+    }
+
+    fn write_file_list(&mut self, paths: &[std::path::PathBuf]) -> Result<(), ClipboardError> {
+        self.files = paths.to_vec();
+        self.last_files = self.files.clone();
+        Ok(())
     }
 
     fn poll_file_list_change(&mut self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
@@ -515,6 +527,18 @@ impl ClipboardService for PlatformClipboard {
         }
     }
 
+    fn write_file_list(&mut self, paths: &[std::path::PathBuf]) -> Result<(), ClipboardError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.write_file_list(paths)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = paths;
+            Err(ClipboardError::UnsupportedPlatform)
+        }
+    }
+
     fn poll_file_list_change(&mut self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
@@ -620,6 +644,11 @@ mod tests {
         let img2 = ImageClipboard::from_rgba(1, 1, vec![9, 8, 7, 255]).unwrap();
         clip.image = Some(img2.clone());
         assert_eq!(clip.poll_image_change().unwrap(), Some(img2));
+
+        let written_files = vec![std::path::PathBuf::from("/tmp/written.txt")];
+        clip.write_file_list(&written_files).unwrap();
+        assert_eq!(clip.read_file_list().unwrap(), written_files);
+        assert_eq!(clip.poll_file_list_change().unwrap(), None);
 
         clip.files = vec![std::path::PathBuf::from("/tmp/a.png")];
         assert_eq!(

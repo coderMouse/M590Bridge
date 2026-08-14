@@ -3,9 +3,7 @@
 use crate::{ClipboardError, ImageClipboard};
 use std::path::{Path, PathBuf};
 
-const IMAGE_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff",
-];
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
 
 /// If `text` refers to an existing local image file, decode it to RGBA.
 ///
@@ -14,7 +12,9 @@ const IMAGE_EXTS: &[&str] = &[
 /// - `file://` URIs (single or first line)
 /// - simple multi-line paste where one line is a path/URI
 /// Load the first existing local image among `paths`.
-pub fn image_from_paths(paths: &[std::path::PathBuf]) -> Result<Option<ImageClipboard>, ClipboardError> {
+pub fn image_from_paths(
+    paths: &[std::path::PathBuf],
+) -> Result<Option<ImageClipboard>, ClipboardError> {
     for path in paths {
         if !is_likely_image_path(path) {
             continue;
@@ -42,9 +42,8 @@ pub fn image_from_clipboard_text(text: &str) -> Result<Option<ImageClipboard>, C
 
 /// Decode an image file from disk into RGBA8 [`ImageClipboard`].
 pub fn load_image_file(path: &Path) -> Result<ImageClipboard, ClipboardError> {
-    let dyn_img = image::open(path).map_err(|e| {
-        ClipboardError::Backend(format!("decode image {}: {e}", path.display()))
-    })?;
+    let dyn_img = image::open(path)
+        .map_err(|e| ClipboardError::Backend(format!("decode image {}: {e}", path.display())))?;
     let rgba = dyn_img.to_rgba8();
     let width = rgba.width();
     let height = rgba.height();
@@ -90,9 +89,7 @@ pub(crate) fn normalize_path_token(token: &str) -> Option<PathBuf> {
 
     if let Some(rest) = token.strip_prefix("file://") {
         // file:///home/a -> /home/a ; file://localhost/home/a -> /home/a
-        let path_part = rest
-            .strip_prefix("localhost")
-            .unwrap_or(rest);
+        let path_part = rest.strip_prefix("localhost").unwrap_or(rest);
         let decoded = percent_decode(path_part);
         if decoded.is_empty() {
             return None;
@@ -162,7 +159,7 @@ fn from_hex(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn loads_png_from_plain_path() {
         let dir = std::env::temp_dir().join(format!("m590-img-{}", std::process::id()));

@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use m590_core::VERSION;
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 /// DNS-SD service type for M590Bridge peer discovery.
 pub const SERVICE_TYPE: &str = "_m590bridge._tcp.local.";
@@ -276,8 +276,7 @@ pub fn upsert_peer(map: &mut HashMap<String, DiscoveredPeer>, peer: DiscoveredPe
         let same_id = !peer.device_id.is_empty()
             && !existing.device_id.is_empty()
             && existing.device_id.eq_ignore_ascii_case(&peer.device_id);
-        let same_addr =
-            !peer.addr.is_empty() && existing.addr.eq_ignore_ascii_case(&peer.addr);
+        let same_addr = !peer.addr.is_empty() && existing.addr.eq_ignore_ascii_case(&peer.addr);
         let same_fullname = !peer.fullname.is_empty() && existing.fullname == peer.fullname;
         !(same_id || same_addr || same_fullname)
     });

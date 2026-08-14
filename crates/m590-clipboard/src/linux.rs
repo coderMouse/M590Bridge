@@ -103,6 +103,15 @@ impl ClipboardService for LinuxClipboard {
         read_file_list_raw(&mut self.clipboard)
     }
 
+    fn write_file_list(&mut self, paths: &[std::path::PathBuf]) -> Result<(), ClipboardError> {
+        self.clipboard
+            .set()
+            .file_list(paths)
+            .map_err(|err| ClipboardError::Backend(err.to_string()))?;
+        self.last_files = paths.to_vec();
+        Ok(())
+    }
+
     fn poll_file_list_change(&mut self) -> Result<Option<Vec<std::path::PathBuf>>, ClipboardError> {
         let current = read_file_list_raw(&mut self.clipboard)?;
         if current != self.last_files {

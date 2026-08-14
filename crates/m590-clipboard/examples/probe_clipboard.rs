@@ -11,7 +11,12 @@ fn dump(label: &str, clip: &mut PlatformClipboard) {
         Err(e) => println!("text_err={e}"),
     }
     match clip.read_image() {
-        Ok(Some(img)) => println!("image={}x{} bytes={}", img.width, img.height, img.rgba.len()),
+        Ok(Some(img)) => println!(
+            "image={}x{} bytes={}",
+            img.width,
+            img.height,
+            img.rgba.len()
+        ),
         Ok(None) => println!("image=None"),
         Err(e) => println!("image_err={e}"),
     }

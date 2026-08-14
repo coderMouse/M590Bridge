@@ -152,12 +152,10 @@ pub fn read_file_for_offer(
     path: &Path,
     max_bytes: usize,
 ) -> Result<(String, Vec<u8>), ClipboardError> {
-    let path = resolve_existing_file(path).ok_or_else(|| {
-        ClipboardError::Backend(format!("not a file: {}", path.display()))
-    })?;
-    let meta = fs::metadata(&path).map_err(|e| {
-        ClipboardError::Backend(format!("stat {}: {e}", path.display()))
-    })?;
+    let path = resolve_existing_file(path)
+        .ok_or_else(|| ClipboardError::Backend(format!("not a file: {}", path.display())))?;
+    let meta = fs::metadata(&path)
+        .map_err(|e| ClipboardError::Backend(format!("stat {}: {e}", path.display())))?;
     let len = meta.len() as usize;
     if len > max_bytes {
         return Err(ClipboardError::Backend(format!(
@@ -174,9 +172,8 @@ pub fn read_file_for_offer(
     if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
         return Err(ClipboardError::Backend("invalid file name".into()));
     }
-    let data = fs::read(&path).map_err(|e| {
-        ClipboardError::Backend(format!("read {}: {e}", path.display()))
-    })?;
+    let data = fs::read(&path)
+        .map_err(|e| ClipboardError::Backend(format!("read {}: {e}", path.display())))?;
     Ok((name, data))
 }
 

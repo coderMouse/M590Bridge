@@ -1,4 +1,4 @@
-//! Bounded byte pipes used to bridge network file chunks to Windows OLE streams.
+//! Bounded byte pipes used to bridge network file chunks to OS virtual files.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use m590_clipboard::{ClipboardError, VirtualFile};
 
+#[cfg(target_os = "linux")]
+use crate::linux_virtual_file::LinuxVirtualFile;
+
 const DEFAULT_CAPACITY: usize = 4 * 1024 * 1024;
 const WAIT_STEP: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -16,6 +19,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeEvent {
     Request,
+    Consumed,
+    Released,
     Cancel(String),
 }
 
@@ -26,6 +31,9 @@ struct PipeState {
     requested: bool,
     #[allow(dead_code)]
     reader_open: bool,
+    consumed: bool,
+    #[cfg(target_os = "linux")]
+    released: bool,
     finished: bool,
     cancelled: bool,
     error: Option<String>,
@@ -74,6 +82,9 @@ impl VirtualFileBridge {
                 bytes: VecDeque::new(),
                 requested: false,
                 reader_open: false,
+                consumed: false,
+                #[cfg(target_os = "linux")]
+                released: false,
                 finished: false,
                 cancelled: false,
                 error: None,
@@ -106,6 +117,22 @@ impl VirtualFileBridge {
             open_reader(&bridge, size).map_err(|err| ClipboardError::Backend(err.to_string()))
         })
     }
+
+    #[cfg(target_os = "linux")]
+    pub fn linux_virtual_file(
+        &self,
+        file_name: impl Into<String>,
+        size: u64,
+    ) -> io::Result<LinuxVirtualFile> {
+        let reader_bridge = Arc::clone(&self.inner);
+        let release_bridge = Arc::clone(&self.inner);
+        LinuxVirtualFile::new_with_release(
+            file_name,
+            size,
+            move || open_reader(&reader_bridge, size),
+            move || release_reader(&release_bridge, "virtual file reader closed"),
+        )
+    }
 }
 
 #[allow(dead_code)]
@@ -134,6 +161,28 @@ fn open_reader(inner: &Arc<PipeInner>, size: u64) -> io::Result<PipeReader> {
         position: 0,
         size,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn release_reader(inner: &Arc<PipeInner>, reason: &str) {
+    if let Ok(mut state) = inner.state.lock() {
+        if state.reader_open && !state.consumed && !state.cancelled {
+            state.cancelled = true;
+            let _ = inner.events.send(BridgeEvent::Cancel(reason.into()));
+        }
+        if state.reader_open && !state.released {
+            state.released = true;
+            let _ = inner.events.send(BridgeEvent::Released);
+        }
+        inner.changed.notify_all();
+    }
+}
+
+fn mark_consumed(inner: &PipeInner, state: &mut PipeState) {
+    if !state.consumed {
+        state.consumed = true;
+        let _ = inner.events.send(BridgeEvent::Consumed);
+    }
 }
 
 impl PipeProducer {
@@ -225,12 +274,18 @@ impl Read for PipeReader {
                     *slot = state.bytes.pop_front().expect("checked non-empty");
                 }
                 self.position = self.position.saturating_add(take as u64);
+                if self.position >= self.size {
+                    mark_consumed(&self.inner, &mut state);
+                }
                 self.inner.changed.notify_all();
                 return Ok(take);
             }
             if state.finished {
                 if let Some(error) = state.error.clone() {
                     return Err(io::Error::other(error));
+                }
+                if self.position >= self.size {
+                    mark_consumed(&self.inner, &mut state);
                 }
                 return Ok(0);
             }
@@ -280,7 +335,17 @@ impl Seek for PipeReader {
 impl Drop for PipeReader {
     fn drop(&mut self) {
         if let Ok(mut state) = self.inner.state.lock() {
-            if !state.finished && !state.cancelled {
+            if self.position >= self.size {
+                mark_consumed(&self.inner, &mut state);
+            } else {
+                #[cfg(target_os = "windows")]
+                let should_cancel = !state.finished;
+                #[cfg(not(target_os = "windows"))]
+                let should_cancel = true;
+                if !should_cancel || state.cancelled {
+                    self.inner.changed.notify_all();
+                    return;
+                }
                 state.cancelled = true;
                 let _ = self
                     .inner
@@ -324,6 +389,7 @@ mod tests {
         reader.read_to_end(&mut out).unwrap();
         producer_thread.join().unwrap();
         assert_eq!(out, b"abcdef");
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Consumed));
     }
 
     #[test]
@@ -353,5 +419,35 @@ mod tests {
             bridge.take_event(),
             Some(BridgeEvent::Cancel("virtual file consumer stalled".into()))
         );
+    }
+
+    #[test]
+    fn completed_pipe_still_cancels_when_reader_closes_early() {
+        let (bridge, producer) = VirtualFileBridge::new();
+        let mut reader = open_reader(&bridge.inner, 2).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        producer.push(b"ab").unwrap();
+        producer.finish();
+        let mut first = [0_u8; 1];
+        assert_eq!(reader.read(&mut first).unwrap(), 1);
+        drop(reader);
+        assert_eq!(
+            bridge.take_event(),
+            Some(BridgeEvent::Cancel("virtual file reader closed".into()))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn releasing_linux_content_notifies_the_hub() {
+        let (bridge, _producer) = VirtualFileBridge::new();
+        let _reader = open_reader(&bridge.inner, 1).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        release_reader(&bridge.inner, "virtual file reader closed");
+        assert_eq!(
+            bridge.take_event(),
+            Some(BridgeEvent::Cancel("virtual file reader closed".into()))
+        );
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Released));
     }
 }

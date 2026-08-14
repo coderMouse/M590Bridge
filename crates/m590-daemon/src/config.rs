@@ -299,7 +299,10 @@ fn parse_bool(v: &str, default: bool) -> bool {
 fn json_str(body: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\"");
     let idx = body.find(&pat)?;
-    let after = body[idx + pat.len()..].trim_start().trim_start_matches(':').trim_start();
+    let after = body[idx + pat.len()..]
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start();
     if after.starts_with("null") {
         return None;
     }
@@ -333,7 +336,10 @@ fn json_str(body: &str, key: &str) -> Option<String> {
 fn json_bool(body: &str, key: &str) -> Option<bool> {
     let pat = format!("\"{key}\"");
     let idx = body.find(&pat)?;
-    let after = body[idx + pat.len()..].trim_start().trim_start_matches(':').trim_start();
+    let after = body[idx + pat.len()..]
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start();
     if after.starts_with("true") {
         Some(true)
     } else if after.starts_with("false") {
