@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（代码与 Linux 启动验证完成，待 Linux/Windows 真机交互验收）
+`completed`（2026-08-14，Linux/Windows 真机交互验收通过）
 
 ## 背景
 
@@ -43,10 +43,10 @@ task-028 曾将 `hide()` 改为最小化，以规避托盘恢复后标题栏按�
 
 ## 完成标准
 
-- [ ] Linux 点击 X 后窗口与 Ubuntu Dock 项消失，只保留托盘。
-- [ ] 托盘“打开主面板”可恢复窗口，恢复后 X 第一次点击有效。
-- [ ] Linux standalone 主窗口任务栏图标与托盘 M590Bridge 图标一致。
-- [ ] Windows 原有关闭到托盘和图标行为不回归。
+- [x] Linux 点击 X 后窗口与 Ubuntu Dock 项消失，只保留托盘。
+- [x] 托盘“打开主面板”可恢复窗口，恢复后 X 第一次点击有效。
+- [x] Linux standalone 主窗口任务栏图标与托盘 M590Bridge 图标一致。
+- [x] Windows 原有关闭到托盘和图标行为不回归。
 - [x] Rust 测试/检查/Clippy、前端 lint/build 与 Linux release 构建通过。
 
 ## 验证命令
@@ -237,7 +237,9 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 - `cargo build -p m590-ui --release --features custom-protocol`：通过。
 - 临时可写 XDG 运行目录启动新 release 桌面壳 6 秒：内嵌 Hub 到达 `ready`，无 setup、托盘或标题栏
   重建相关 panic；到时主动结束进程。
-- 启动时原始标题栏拖动、托盘恢复后的无闪烁/位置/首次关闭/继续拖动：待用户真机复测。
+- 用户最终真机复测通过：启动时原始标题栏可拖动；点击 X 后窗口和 Dock 项消失；托盘恢复后
+  无最大化闪烁、保留原位置、第一次点击 X 生效，且标题栏仍可拖动；Windows 关闭到托盘与
+  图标行为无回归。
 
 ## 文档影响检查
 
@@ -247,18 +249,15 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 ## 风险 / blocker
 
-- GNOME/Wayland 的 Dock 图标依赖 `.desktop` 应用身份，纯 `set_icon` 不能替代该匹配；
-  最终外观仍需当前 Linux 桌面真机确认。
-- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；本次保留启动时的 Tao 标题栏，并在每次隐藏
-  窗口恢复前重建同结构标题栏事件层。拖动与重复 hide/show 后的交互仍需 Linux 真机确认。
+- GNOME/Wayland 的 Dock 图标依赖 `.desktop` 应用身份，纯 `set_icon` 不能替代该匹配；当前
+  standalone 身份已通过真机验收，后续如修改 app ID 需同步更新预处理脚本。
+- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；当前通过恢复前重建同结构标题栏事件层规避，
+  后续升级 Tao/Tauri 时需复查该兼容代码是否仍必要。
 - standalone 生成的桌面身份为 `NoDisplay=true`，不会增加应用菜单入口；停用源码
   standalone 后可按 `ui/README.md` 删除这两个用户级文件。
-- 当前 Linux 环境不能运行 Windows 桌面壳，Windows 行为待与 task-046 一并真机验收。
 - 当前环境缺少 MinGW `windres`，无法用 Windows GNU 交叉检查覆盖 Tauri 资源构建。
 
 ## 下一步
 
-- 用户统一验收 task-046 的 3 组文件生命周期场景，以及本 task 的 Linux 3 步桌面
-  交互和 Windows 关闭到托盘回归。
-- 第八次返工后复测：刚启动即确认系统标题栏可拖动；再执行 X 隐藏 → 托盘恢复，确认恢复无闪烁、
-  位置保持、第一次点击 X 生效，并再次确认标题栏仍可拖动；连续重复两轮。
+- task-047 已完成；收口已通过的 task-046 后，建立独立后续任务处理 Windows Explorer 已开始
+  粘贴时本机复制其它文件不应中断当前数据流的问题。

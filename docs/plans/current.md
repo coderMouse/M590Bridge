@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-14
-> 阶段：task-047 Linux 关闭到托盘与桌面图标统一代码完成；task-046/047 待一并真机验收；task-042 继续暂停
+> 阶段：task-047 Linux 关闭到托盘与桌面图标统一已完成真机验收；task-046 待状态收口；task-042 继续暂停
 
 ## 目标（近期）
 
@@ -35,10 +35,10 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-043** Windows 单文件 OLE 虚拟剪贴板原型（Explorer 按粘贴取流 + 系统复制进度，真机通过）
 - [x] **task-044** Windows 按粘贴请求 FileRequest、网络有界流与 FileCancel（Windows↔Linux 真机验收通过）
 - [x] **task-045** 新文件 offer 替换旧 offer 时不误报失败（代码验证与 Windows↔Linux 真机复测通过）
+- [x] **task-047** Linux 关闭到托盘与桌面图标统一（Linux/Windows 真机交互验收通过）
 
 ## 进行中 / 暂停
 
-- [ ] **task-047** Linux 关闭到托盘与桌面图标统一（代码与 Linux 启动验证完成，待 Linux/Windows 真机交互验收）
 - [ ] **task-046** 文件 offer/按需传输生命周期修复（代码与 Linux/Windows 交叉验证完成，待真机验收）
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
@@ -86,14 +86,14 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 用户一并做 task-046 文件生命周期和 task-047 Linux/Windows 桌面壳真机复测
-2. 根据真机结果关闭 task-046/047，或仅修复验收发现的问题
+1. 收口已通过的 task-046 文件生命周期真机验收
+2. 建立独立任务，处理 Windows Explorer 已开始粘贴时本机复制其它文件中断当前数据流的问题
 3. 等待用户决定是否恢复 task-042 剩余的登录自启与跨机回归验收（当前暂停）
 4. （可选）独立文件数据连接 / 更高吞吐调优
 5. （可选）设置页发现开关 / 本机显示名
 6. （可选）多文件并行 / 文件夹 / Linux FUSE
 
-> task-044、task-045 均已完成 Windows↔Linux 真机验收。task-046/047 已完成代码和本机可执行验证，等待统一真机验收。task-042 已确认 NSIS 可生成并安装，但剩余验收暂停且仍为 `in_progress`。
+> task-044、task-045、task-047 已完成 Windows↔Linux 真机验收。task-046 已由用户确认真机通过，待文档状态收口。task-042 已确认 NSIS 可生成并安装，但剩余验收暂停且仍为 `in_progress`。
 
 ## 用户怎么用
 
