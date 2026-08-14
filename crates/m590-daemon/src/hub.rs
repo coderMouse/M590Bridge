@@ -21,7 +21,7 @@ use crate::config;
 use crate::discovery::DiscoveryHandle;
 #[cfg(not(target_os = "windows"))]
 use crate::file_save;
-use crate::status::{persist_status_config, with_status, HubPhase, SharedStatus};
+use crate::status::{persist_status_config, with_status, HubPhase, HubStatus, SharedStatus};
 #[cfg(target_os = "windows")]
 use crate::virtual_file_bridge::{BridgeEvent, PipeProducer, VirtualFileBridge};
 #[cfg(target_os = "windows")]
@@ -1419,10 +1419,7 @@ fn run_session_loop(
                                         virtual_receive = None;
                                     }
                                     with_status(&shared, |s| {
-                                        s.file_transfer_phase = Some("failed".into());
-                                        s.last_file_transfer_id = Some(transfer_id.clone());
-                                        s.last_error =
-                                            Some(format!("file transfer failed: {message}"));
+                                        mark_file_failed_if_current(s, transfer_id, message);
                                     });
                                 }
                                 InboundFileResult::StreamCompleted {
@@ -1862,6 +1859,20 @@ fn note_outbound_file_completes(shared: &SharedStatus, outbox: &[Message]) {
     }
 }
 
+fn mark_file_failed_if_current(status: &mut HubStatus, transfer_id: &str, message: &str) -> bool {
+    if status
+        .last_file_transfer_id
+        .as_deref()
+        .is_some_and(|current| current != transfer_id)
+    {
+        return false;
+    }
+    status.file_transfer_phase = Some("failed".into());
+    status.last_file_transfer_id = Some(transfer_id.to_string());
+    status.last_error = Some(format!("file transfer failed: {message}"));
+    true
+}
+
 fn offer_local_file(
     session: &mut Session,
     content_seq: &mut u64,
@@ -2024,9 +2035,7 @@ fn handle_inbound_file(
             message,
         } => {
             with_status(shared, |s| {
-                s.file_transfer_phase = Some("failed".into());
-                s.last_file_transfer_id = Some(transfer_id);
-                s.last_error = Some(format!("file transfer failed: {message}"));
+                mark_file_failed_if_current(s, &transfer_id, &message);
             });
             Ok(())
         }
@@ -2136,6 +2145,48 @@ mod tests {
         );
         assert_eq!(session_loop_pause(true, true), SessionLoopPause::Yield);
         assert_eq!(session_loop_pause(false, true), SessionLoopPause::Yield);
+    }
+
+    #[test]
+    fn stale_file_failure_does_not_replace_newer_offer_status() {
+        let mut status = HubStatus {
+            file_transfer_phase: Some("sending".into()),
+            last_file_transfer_id: Some("new-offer".into()),
+            last_file_name: Some("new.bin".into()),
+            last_error: None,
+            ..HubStatus::default()
+        };
+
+        assert!(!mark_file_failed_if_current(
+            &mut status,
+            "old-offer",
+            "replaced by a newer file offer",
+        ));
+        assert_eq!(status.file_transfer_phase.as_deref(), Some("sending"));
+        assert_eq!(status.last_file_transfer_id.as_deref(), Some("new-offer"));
+        assert_eq!(status.last_file_name.as_deref(), Some("new.bin"));
+        assert_eq!(status.last_error, None);
+    }
+
+    #[test]
+    fn current_file_failure_is_still_reported() {
+        let mut status = HubStatus {
+            file_transfer_phase: Some("sending".into()),
+            last_file_transfer_id: Some("current-offer".into()),
+            last_error: None,
+            ..HubStatus::default()
+        };
+
+        assert!(mark_file_failed_if_current(
+            &mut status,
+            "current-offer",
+            "checksum mismatch",
+        ));
+        assert_eq!(status.file_transfer_phase.as_deref(), Some("failed"));
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("file transfer failed: checksum mismatch")
+        );
     }
 
     #[test]
