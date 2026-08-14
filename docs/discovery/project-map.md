@@ -1,7 +1,7 @@
 # 项目结构图 · M590Bridge
 
-> 更新日期：2026-08-12
-> 状态：文本+图片+流式文件+mDNS+Linux 发布；Windows 按粘贴网络流代码完成，待 Windows↔Linux 真机验收（task-020..044）
+> 更新日期：2026-08-14
+> 状态：文本+图片+流式文件+mDNS+Linux/Windows 发布；task-046/047 待统一真机验收
 
 ```text
 crates/
@@ -16,6 +16,8 @@ crates/
     src/windows_virtual_file_manager.rs # Windows STA/OLE guard 生命周期（Windows-only）
 ui/
   src/             # React：OperableApp 配对/发现/文件发送/登录自启；bridgeApi 自动鉴权
+  scripts/
+    prepare-standalone.mjs # Linux standalone 的隐藏 GNOME 应用身份与图标
   src-tauri/       # Tauri 2 m590-ui；托盘、Linux XDG / Windows HKCU autostart commands
     permissions/
       autostart.toml       # Linux/Windows 用户登录自启读写
@@ -24,6 +26,6 @@ ui/
       installer-hooks.nsh # NSIS 卸载清理当前用户 Run 值
 docs/
   plans/current.md
-  tasks/           # ..044
+  tasks/           # ..047
   domain/          # 协议草案
 ```

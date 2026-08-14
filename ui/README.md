@@ -14,6 +14,11 @@ npm run desktop:standalone
 不需要浏览器或 `127.0.0.1:5173`。Linux 登录自启写 XDG autostart；Windows 登录
 自启写当前用户 HKCU Run。两者都指向当前运行的 release/安装版程序。
 
+在 Linux 上，该命令还会在用户数据目录刷新隐藏的 `m590-ui.desktop` 应用身份与
+M590Bridge 图标，供 GNOME/Wayland 正确匹配 standalone 窗口。它不会显示新的应用
+菜单入口；不再使用仓库 standalone 时，可删除用户数据目录下的
+`applications/m590-ui.desktop` 与 `icons/hicolor/512x512/apps/m590-ui.png`。
+
 ### 2. 桌面开发壳
 
 ```bash

@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-12（task-044）
+> 更新日期：2026-08-14（task-047）
 
 ## 桌面（推荐）
 
@@ -13,6 +13,8 @@ cd ui && npm run build              # 仅前端
 内嵌 hub：`http://127.0.0.1:5910`。Tauri WebView 自动取得进程临时令牌，无需手工配置。
 `desktop:dev` 与 `cargo run -p m590-ui` 会加载 `127.0.0.1:5173`，不可作为登录自启目标；
 `desktop:standalone` 使用内嵌前端资源，适合不使用 Web 端的源码运行方式。
+Linux 上该命令还会刷新用户级隐藏 `m590-ui.desktop` 与应用图标，供 GNOME/Wayland
+按 `app_id=m590-ui` 显示正确的任务栏图标；具体清理路径见 `ui/README.md`。
 
 仅运行浏览器开发服务器并连接独立 Hub 时，两边需使用同一个临时令牌；不要放进 URL、共享文档或提交文件：
 

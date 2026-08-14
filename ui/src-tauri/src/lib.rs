@@ -282,10 +282,10 @@ fn set_windows_autostart(executable: &Path, enabled: bool) -> Result<bool, Strin
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        // Close-to-tray uses minimize+skip_taskbar; reverse that fully on restore.
+        // Reverse close-to-tray state before asking the compositor to present the window.
         let _ = window.set_skip_taskbar(false);
-        let _ = window.unminimize();
         let _ = window.show();
+        let _ = window.unminimize();
         // GNOME/Wayland often ignores set_focus alone after tray restore.
         #[cfg(target_os = "linux")]
         {
@@ -517,6 +517,9 @@ pub fn run() {
                 .default_window_icon()
                 .cloned()
                 .expect("default window icon");
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_icon(icon.clone())?;
+            }
 
             let tray = TrayIconBuilder::new()
                 .icon(icon)
@@ -555,11 +558,13 @@ pub fn run() {
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
-                // Close to tray: minimize + hide from taskbar.
-                // Full `hide()` on GNOME Wayland often leaves title-bar buttons unclickable
-                // until the webview is clicked first.
+                // A minimized GTK window can remain visible in Ubuntu Dock even with
+                // skip_taskbar set. Hide it fully and restore via show_main_window.
                 api.prevent_close();
                 let _ = window.set_skip_taskbar(true);
+                #[cfg(target_os = "linux")]
+                let _ = window.hide();
+                #[cfg(not(target_os = "linux"))]
                 let _ = window.minimize();
             }
             WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
