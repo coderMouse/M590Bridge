@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（代码与本机/交叉验证完成，待 Windows↔Linux 真机验收）
+`completed`（2026-08-14，Windows↔Linux 真机验收通过）
 
 ## 背景
 
@@ -33,11 +33,11 @@ Windows Explorer 的虚拟文件流只能消费一次。实机发现两个生命
 
 ## 完成标准
 
-- [ ] Windows 正在接收文件 A 时，Linux 复制文件 B 不会取消 A；A 完成后 B 成为可粘贴文件。
-- [ ] 活跃传输期间连续复制 B、C 时，只保留 C，未请求的 B 被取消。
-- [ ] 文件粘贴完成或 Explorer 取消后，当前本地文件获得新的 transfer，Windows 可再次粘贴同一文件。
+- [x] Windows 正在接收文件 A 时，Linux 复制文件 B 不会取消 A；A 完成后 B 成为可粘贴文件。
+- [x] 活跃传输期间连续复制 B、C 时，只保留 C，未请求的 B 被取消。
+- [x] 文件粘贴完成或 Explorer 取消后，当前本地文件获得新的 transfer，Windows 可再次粘贴同一文件。
 - [x] 活跃 transfer 的发送/接收状态不被排队 offer 或旧 transfer 的完成/取消覆盖。
-- [ ] Linux 测试、Clippy 与 Windows GNU 类型检查/Clippy 通过；Windows 运行行为给出明确真机复测步骤。
+- [x] Linux 测试、Clippy 与 Windows GNU 类型检查/Clippy 通过；Windows 运行行为给出明确真机复测步骤。
 
 ## 验证命令
 
@@ -81,7 +81,8 @@ Windows↔Linux 真机复测：
 - `CARGO_HOME=<临时可写缓存> cargo check -p m590-daemon --target x86_64-pc-windows-gnu`：通过。
 - `CARGO_HOME=<临时可写缓存> cargo clippy -p m590-daemon --target x86_64-pc-windows-gnu --lib --no-deps -- -D warnings`：通过。
 - `rustfmt --edition 2021 --check --config skip_children=true <本 task 的 4 个 Rust 文件>`：通过；避免递归检查本 task 外的既有子模块格式。
-- Windows↔Linux Explorer 运行行为：当前 Linux 环境无法执行，待用户真机验收。
+- Windows↔Linux Explorer 运行行为：用户按 3 组步骤完成真机验收；活跃传输不被 Linux 后续
+  文件 offer 中断、连续更新只保留最新文件，完成或取消后同一文件可再次粘贴，均通过。
 
 ## 文档影响检查
 
@@ -90,10 +91,11 @@ Windows↔Linux 真机复测：
 
 ## 风险 / blocker
 
-- 当前 Linux 环境不能运行 Windows OLE/Explorer；Windows GNU 交叉检查只能覆盖编译，最终行为仍需 Windows 10 真机验收。
+- Windows OLE/Explorer 最终行为已由 Windows 10 真机覆盖；当前 Linux 环境仍不能独立复现该平台交互。
 - deferred offer 仍受现有单会话总在途文件预留上限约束；本 task 未扩大文件上限或增加并行数据连接。
 - 同文件可再次粘贴通过传输结束后自动重新发布当前剪贴板文件实现；`clipboard replaced` 不自动抢回旧文件。
 
 ## 下一步
 
-- 用户按本 task 的 3 组步骤做 Windows↔Linux 真机验收；通过后关闭 task-046，并新建 task-047 处理 Linux 关闭到托盘与任务栏图标。
+- task-046 已完成；建立独立后续任务，使 Windows Explorer 已开始的远端文件粘贴与 Windows
+  本机随后复制其它文件的剪贴板替换解耦。
