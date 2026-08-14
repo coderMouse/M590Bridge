@@ -9,7 +9,8 @@ pub use frame::{
 };
 pub use pipe::{deliver, DeliverError, MemoryPipe};
 pub use tcp::{
-    accept_framed, connect_framed, listen_on, parse_socket_addr, TcpError, TcpFrameStream,
+    accept_framed, connect_framed, connect_framed_timeout, listen_on, parse_socket_addr, TcpError,
+    TcpFrameStream,
 };
 
 use m590_core::ConnectionState;

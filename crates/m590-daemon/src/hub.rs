@@ -15,7 +15,7 @@ use m590_core::{
     QueueClipboardResult, QueueFileResult, Session, SessionEvent, DEFAULT_HEARTBEAT_MISS_THRESHOLD,
     MAX_FILE_BYTES, MAX_MEMORY_FILE_BYTES,
 };
-use m590_net::{accept_framed, connect_framed, listen_on, TcpFrameStream};
+use m590_net::{accept_framed, connect_framed_timeout, listen_on, TcpFrameStream};
 
 use crate::config;
 use crate::discovery::DiscoveryHandle;
@@ -29,6 +29,8 @@ use crate::windows_virtual_file_manager::{ManagerEvent, WindowsVirtualFileManage
 
 static STOP_BRIDGE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_RUNNING: AtomicBool = AtomicBool::new(false);
+static BRIDGE_STOPPING: AtomicBool = AtomicBool::new(false);
+static BRIDGE_TRANSITION: Mutex<()> = Mutex::new(());
 
 type SharedDiscovery = Arc<Mutex<Option<Arc<DiscoveryHandle>>>>;
 
@@ -44,6 +46,9 @@ pub const MAX_HTTP_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HTTP_FILE_BODY_BYTES: usize = MAX_HTTP_FILE_BYTES.div_ceil(3) * 4 + 64 * 1024;
 const IDLE_SESSION_LOOP_DELAY: Duration = Duration::from_millis(50);
 const STALLED_FILE_LOOP_DELAY: Duration = Duration::from_millis(1);
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(target_os = "windows")]
 struct WindowsVirtualReceive {
@@ -368,33 +373,16 @@ fn handle_http(
                 Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
             }
         }
-        ("POST", "/api/disconnect") => {
-            STOP_BRIDGE.store(true, Ordering::SeqCst);
-            {
-                let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
-                with_status(&shared, |s| {
-                    s.phase = HubPhase::Idle;
-                    s.connection = Some(ConnectionState::Disconnected);
-                    s.peer_device = None;
-                    s.last_error = None;
-                    s.role = None;
-                    s.endpoint = None;
-                    // Keep pairing_code / connect_addr / listen_port for UI prefills.
-                    s.reconnect_attempt = 0;
-                });
-                pending.clear();
-            }
-            if let Some(d) = discovery_handle(&discovery).as_ref() {
-                d.stop_advertise();
-            }
-            write_response(
+        ("POST", "/api/disconnect") => match stop_bridge(&shared, &discovery) {
+            Ok(()) => write_response(
                 &mut stream,
                 200,
                 "application/json",
                 "{\"ok\":true}",
                 cors_origin,
-            )
-        }
+            ),
+            Err(err) => write_json_error(&mut stream, 500, &err, cors_origin),
+        },
         _ => write_response(
             &mut stream,
             404,
@@ -651,6 +639,65 @@ fn json_get(body: &str, key: &str) -> Option<String> {
     }
 }
 
+fn claim_bridge() -> Result<(), String> {
+    if BRIDGE_STOPPING.load(Ordering::SeqCst) {
+        return Err("bridge is still stopping; try again shortly".into());
+    }
+    if BRIDGE_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("bridge already running; disconnect first".into());
+    }
+    STOP_BRIDGE.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+fn stop_bridge(shared: &SharedStatus, discovery: &SharedDiscovery) -> Result<(), String> {
+    let _transition = BRIDGE_TRANSITION
+        .lock()
+        .map_err(|_| "bridge lifecycle lock poisoned".to_string())?;
+
+    if BRIDGE_RUNNING.load(Ordering::SeqCst) {
+        BRIDGE_STOPPING.store(true, Ordering::SeqCst);
+        STOP_BRIDGE.store(true, Ordering::SeqCst);
+    }
+    if !wait_until_stopped(&BRIDGE_RUNNING, &BRIDGE_STOPPING, BRIDGE_STOP_TIMEOUT) {
+        return Err(format!(
+            "bridge stop timeout ({}s): worker is still shutting down",
+            BRIDGE_STOP_TIMEOUT.as_secs()
+        ));
+    }
+
+    {
+        let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
+        with_status(shared, |s| {
+            s.phase = HubPhase::Idle;
+            s.connection = Some(ConnectionState::Disconnected);
+            s.peer_device = None;
+            s.last_error = None;
+            s.role = None;
+            s.endpoint = None;
+            // Keep pairing_code / connect_addr / listen_port for UI prefills.
+            s.reconnect_attempt = 0;
+        });
+        pending.clear();
+    }
+    if let Some(d) = discovery_handle(discovery).as_ref() {
+        d.stop_advertise();
+    }
+    Ok(())
+}
+
+fn wait_until_stopped(running: &AtomicBool, stopping: &AtomicBool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while running.load(Ordering::SeqCst) || stopping.load(Ordering::SeqCst) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    true
+}
+
 fn start_listen(
     shared: SharedStatus,
     mut code: String,
@@ -658,15 +705,15 @@ fn start_listen(
     device_id: Option<String>,
     discovery: SharedDiscovery,
 ) -> Result<(), String> {
+    let _transition = BRIDGE_TRANSITION
+        .lock()
+        .map_err(|_| "bridge lifecycle lock poisoned".to_string())?;
     code = normalize_pairing_code(&code);
     if code.is_empty() {
         // Last resort: generate a 6-digit code so host can still start.
         code = format!("{:06}", (std::process::id() % 900_000) + 100_000);
     }
-    if BRIDGE_RUNNING.swap(true, Ordering::SeqCst) {
-        return Err("bridge already running; disconnect first".into());
-    }
-    STOP_BRIDGE.store(false, Ordering::SeqCst);
+    claim_bridge()?;
     let device_id = device_id.unwrap_or_else(|| with_status(&shared, |s| s.device_id.clone()));
     with_status(&shared, |s| {
         s.phase = HubPhase::WaitingPeer;
@@ -710,6 +757,9 @@ fn start_connect(
     device_id: Option<String>,
     discovery: SharedDiscovery,
 ) -> Result<(), String> {
+    let _transition = BRIDGE_TRANSITION
+        .lock()
+        .map_err(|_| "bridge lifecycle lock poisoned".to_string())?;
     code = normalize_pairing_code(&code);
     let addr = addr.trim().to_string();
     if code.is_empty() {
@@ -718,10 +768,7 @@ fn start_connect(
     if addr.is_empty() {
         return Err("addr required".into());
     }
-    if BRIDGE_RUNNING.swap(true, Ordering::SeqCst) {
-        return Err("bridge already running; disconnect first".into());
-    }
-    STOP_BRIDGE.store(false, Ordering::SeqCst);
+    claim_bridge()?;
     let device_id = device_id.unwrap_or_else(|| with_status(&shared, |s| s.device_id.clone()));
     with_status(&shared, |s| {
         s.phase = HubPhase::Pairing;
@@ -771,11 +818,45 @@ enum BridgeJob {
 }
 
 fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDiscovery) {
+    run_with_reconnect_with_timeouts(
+        shared,
+        job,
+        discovery,
+        PAIRING_TIMEOUT,
+        CONNECT_ATTEMPT_TIMEOUT,
+    );
+}
+
+fn run_with_reconnect_with_timeouts(
+    shared: SharedStatus,
+    job: BridgeJob,
+    discovery: SharedDiscovery,
+    pairing_timeout: Duration,
+    connect_attempt_timeout: Duration,
+) {
     let mut attempt: u32 = 0;
+    let mut ever_connected = false;
+    let initial_join_deadline = match &job {
+        BridgeJob::Connect { .. } => Some(Instant::now() + pairing_timeout),
+        BridgeJob::Listen { .. } => None,
+    };
+    let mut terminal_error = None;
+
     loop {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             break;
         }
+
+        let pairing_deadline = match (&job, ever_connected) {
+            (BridgeJob::Connect { .. }, false) => initial_join_deadline,
+            (BridgeJob::Connect { .. }, true) => Some(Instant::now() + pairing_timeout),
+            (BridgeJob::Listen { .. }, _) => None,
+        };
+        if pairing_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            terminal_error = Some(pairing_timeout_error(pairing_timeout));
+            break;
+        }
+
         with_status(&shared, |s| {
             s.reconnect_attempt = attempt;
             s.last_error = if attempt == 0 {
@@ -802,7 +883,13 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
                 code,
                 port,
                 device_id,
-            } => listen_worker(shared.clone(), code.clone(), *port, device_id.clone()),
+            } => listen_worker(
+                shared.clone(),
+                code.clone(),
+                *port,
+                device_id.clone(),
+                pairing_timeout,
+            ),
             BridgeJob::Connect {
                 code,
                 addr,
@@ -812,68 +899,46 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
                 code.clone(),
                 addr.clone(),
                 device_id.clone(),
+                pairing_deadline.expect("connect jobs always have a pairing deadline"),
+                pairing_timeout,
+                connect_attempt_timeout,
             ),
         };
+        let connected_this_run = with_status(&shared, |s| s.phase == HubPhase::Connected);
+        ever_connected |= connected_this_run;
+        if connected_this_run {
+            attempt = 0;
+        }
         {
             let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
-            with_status(&shared, |s| {
-                if s.phase == HubPhase::Connected {
-                    s.phase = HubPhase::Idle;
-                    s.connection = Some(ConnectionState::Disconnected);
-                    s.peer_device = None;
-                }
-            });
             pending.clear();
         }
 
         if STOP_BRIDGE.load(Ordering::SeqCst) {
-            with_status(&shared, |s| {
-                s.phase = HubPhase::Idle;
-                s.connection = Some(ConnectionState::Disconnected);
-                s.peer_device = None;
-                s.role = None;
-                s.reconnect_attempt = 0;
-                s.last_error = None;
-            });
+            break;
+        }
+        if !ever_connected
+            && initial_join_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            terminal_error = Some(pairing_timeout_error(pairing_timeout));
             break;
         }
 
         match result {
             Ok(()) => {
                 // Clean stop from worker (e.g. accept loop saw STOP) or rare clean exit.
-                with_status(&shared, |s| {
-                    if s.phase != HubPhase::Idle {
-                        s.phase = HubPhase::Idle;
-                        s.connection = Some(ConnectionState::Disconnected);
-                        s.peer_device = None;
-                        s.role = None;
-                    }
-                    s.reconnect_attempt = 0;
-                });
                 break;
             }
             Err(err) => {
                 let friendly = humanize_bridge_error(&err);
                 // Version skew / bad pair code / timeout cannot self-heal by reconnecting.
-                if is_protocol_mismatch(&err) || is_non_retriable_pair_error(&err) {
-                    with_status(&shared, |s| {
-                        s.phase = HubPhase::Error;
-                        s.last_error = Some(friendly);
-                        s.connection = Some(ConnectionState::Disconnected);
-                        s.peer_device = None;
-                        s.reconnect_attempt = 0;
-                    });
+                if should_stop_reconnecting(&err, ever_connected) {
+                    terminal_error = Some(friendly);
                     break;
                 }
                 let auto = with_status(&shared, |s| s.auto_reconnect);
                 if !auto {
-                    with_status(&shared, |s| {
-                        s.phase = HubPhase::Error;
-                        s.last_error = Some(friendly);
-                        s.connection = Some(ConnectionState::Disconnected);
-                        s.peer_device = None;
-                        s.reconnect_attempt = 0;
-                    });
+                    terminal_error = Some(friendly);
                     break;
                 }
                 attempt = attempt.saturating_add(1);
@@ -887,24 +952,61 @@ fn run_with_reconnect(shared: SharedStatus, job: BridgeJob, discovery: SharedDis
                     s.peer_device = None;
                     s.reconnect_attempt = attempt;
                 });
-                if !sleep_interruptible(Duration::from_secs(delay_secs)) {
-                    with_status(&shared, |s| {
-                        s.phase = HubPhase::Idle;
-                        s.connection = Some(ConnectionState::Disconnected);
-                        s.peer_device = None;
-                        s.role = None;
-                        s.reconnect_attempt = 0;
-                        s.last_error = None;
-                    });
+                let mut retry_delay = Duration::from_secs(delay_secs);
+                if !ever_connected {
+                    if let Some(deadline) = initial_join_deadline {
+                        retry_delay =
+                            retry_delay.min(deadline.saturating_duration_since(Instant::now()));
+                    }
+                }
+                if retry_delay.is_zero() {
+                    terminal_error = Some(pairing_timeout_error(pairing_timeout));
+                    break;
+                }
+                if !sleep_interruptible(retry_delay) {
+                    break;
+                }
+                if !ever_connected
+                    && initial_join_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    terminal_error = Some(pairing_timeout_error(pairing_timeout));
                     break;
                 }
             }
         }
     }
+
+    BRIDGE_STOPPING.store(true, Ordering::SeqCst);
     if let Some(d) = discovery_handle(&discovery).as_ref() {
         d.stop_advertise();
     }
     BRIDGE_RUNNING.store(false, Ordering::SeqCst);
+    with_status(&shared, |s| {
+        s.phase = if terminal_error.is_some() {
+            HubPhase::Error
+        } else {
+            HubPhase::Idle
+        };
+        s.connection = Some(ConnectionState::Disconnected);
+        s.peer_device = None;
+        s.reconnect_attempt = 0;
+        s.last_error = terminal_error;
+        if s.phase == HubPhase::Idle {
+            s.role = None;
+        }
+    });
+    BRIDGE_STOPPING.store(false, Ordering::SeqCst);
+}
+
+fn pairing_timeout_error(timeout: Duration) -> String {
+    let timeout_label = if timeout.subsec_nanos() == 0 {
+        format!("{}s", timeout.as_secs())
+    } else {
+        format!("{}ms", timeout.as_millis())
+    };
+    format!(
+        "pairing timeout ({timeout_label}): 请确认对端已开始等待/连接、配对码一致、防火墙放行端口"
+    )
 }
 
 fn humanize_bridge_error(err: &str) -> String {
@@ -950,7 +1052,16 @@ fn is_protocol_mismatch(err: &str) -> bool {
     lower.contains("unknown message type") || lower.contains("unsupported protocol version")
 }
 
-/// Failures that will not heal by blind reconnect (wrong code, timeout, id clash).
+fn is_pairing_timeout(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("pairing timeout")
+}
+
+fn should_stop_reconnecting(err: &str, ever_connected: bool) -> bool {
+    is_protocol_mismatch(err)
+        || (is_non_retriable_pair_error(err) && !(ever_connected && is_pairing_timeout(err)))
+}
+
+/// Initial-pairing failures that will not heal by blind reconnect.
 fn is_non_retriable_pair_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("pairing rejected")
@@ -962,7 +1073,7 @@ fn is_non_retriable_pair_error(err: &str) -> bool {
 
 fn reconnect_delay_secs(attempt: u32) -> u64 {
     // 1,2,4,8,16,30,30...
-    let shift = attempt.saturating_sub(1).min(4);
+    let shift = attempt.saturating_sub(1).min(5);
     (1u64 << shift).min(30)
 }
 
@@ -1092,6 +1203,7 @@ fn listen_worker(
     code: String,
     port: u16,
     device_id: String,
+    pairing_timeout: Duration,
 ) -> Result<(), String> {
     let bind = format!("0.0.0.0:{port}");
     let listener = listen_on(&bind).map_err(|e| e.to_string())?;
@@ -1130,7 +1242,13 @@ fn listen_worker(
         s.phase = HubPhase::Pairing;
         s.connection = Some(ConnectionState::Pairing);
     });
-    run_session_loop(shared, &mut session, &mut conn)
+    run_session_loop(
+        shared,
+        &mut session,
+        &mut conn,
+        Instant::now() + pairing_timeout,
+        pairing_timeout,
+    )
 }
 
 fn connect_worker(
@@ -1138,8 +1256,16 @@ fn connect_worker(
     code: String,
     addr: String,
     device_id: String,
+    pairing_deadline: Instant,
+    pairing_timeout: Duration,
+    connect_attempt_timeout: Duration,
 ) -> Result<(), String> {
-    let mut conn = connect_framed(&addr).map_err(|e| e.to_string())?;
+    let remaining = pairing_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(pairing_timeout_error(pairing_timeout));
+    }
+    let mut conn = connect_framed_timeout(&addr, remaining.min(connect_attempt_timeout))
+        .map_err(|e| e.to_string())?;
     let mut session = Session::new(DeviceId::new(device_id)).map_err(|e| e.to_string())?;
     session
         .handle(SessionEvent::StartPairing {
@@ -1148,13 +1274,21 @@ fn connect_worker(
         .map_err(|e| e.to_string())?;
     conn.send_all(session.take_outbox().iter())
         .map_err(|e| e.to_string())?;
-    run_session_loop(shared, &mut session, &mut conn)
+    run_session_loop(
+        shared,
+        &mut session,
+        &mut conn,
+        pairing_deadline,
+        pairing_timeout,
+    )
 }
 
 fn run_session_loop(
     shared: SharedStatus,
     session: &mut Session,
     conn: &mut TcpFrameStream,
+    pairing_deadline: Instant,
+    pairing_timeout: Duration,
 ) -> Result<(), String> {
     let mut clipboard = PlatformClipboard::open().ok();
     let mut last_heartbeat = Instant::now();
@@ -1168,22 +1302,23 @@ fn run_session_loop(
     let mut virtual_receive: Option<WindowsVirtualReceive> = None;
     #[cfg(target_os = "windows")]
     let mut deferred_virtual_offer: Option<DeferredWindowsVirtualOffer> = None;
-    const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
-    let pairing_started = Instant::now();
-
     while session.state() != ConnectionState::Connected {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             let _ = session.handle(SessionEvent::Disconnect);
             return Ok(());
         }
-        if pairing_started.elapsed() > PAIRING_TIMEOUT {
+        if Instant::now() >= pairing_deadline {
             let _ = session.handle(SessionEvent::Disconnect);
-            return Err(format!(
-                "pairing timeout ({}s): 请确认对端已开始等待/连接、配对码一致、防火墙放行端口",
-                PAIRING_TIMEOUT.as_secs()
-            ));
+            return Err(pairing_timeout_error(pairing_timeout));
         }
-        conn.set_read_timeout(Some(Duration::from_millis(200)))
+        let read_timeout = pairing_deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(200));
+        if read_timeout.is_zero() {
+            let _ = session.handle(SessionEvent::Disconnect);
+            return Err(pairing_timeout_error(pairing_timeout));
+        }
+        conn.set_read_timeout(Some(read_timeout))
             .map_err(|e| e.to_string())?;
         conn.set_nonblocking(false).map_err(|e| e.to_string())?;
         match conn.recv() {
@@ -2463,6 +2598,7 @@ mod tests {
     use std::sync::Mutex;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    static BRIDGE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn http_exchange(request: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2819,5 +2955,130 @@ mod tests {
             Err("not connected".into())
         );
         assert!(PENDING_COMMANDS.lock().unwrap().file_bytes.is_none());
+    }
+
+    #[test]
+    fn initial_joiner_deadline_stops_reconnect_worker() {
+        let _test_lock = BRIDGE_TEST_LOCK.lock().unwrap();
+        let _transition = BRIDGE_TRANSITION.lock().unwrap();
+        STOP_BRIDGE.store(false, Ordering::SeqCst);
+        BRIDGE_STOPPING.store(false, Ordering::SeqCst);
+        assert!(!BRIDGE_RUNNING.swap(true, Ordering::SeqCst));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let shared = Arc::new(Mutex::new(HubStatus::default()));
+        with_status(&shared, |status| {
+            status.auto_reconnect = true;
+            status.phase = HubPhase::Pairing;
+        });
+        let discovery = Arc::new(Mutex::new(None));
+        let started = Instant::now();
+
+        run_with_reconnect_with_timeouts(
+            shared.clone(),
+            BridgeJob::Connect {
+                code: "123456".into(),
+                addr,
+                device_id: "deadline-test".into(),
+            },
+            discovery,
+            Duration::from_millis(250),
+            Duration::from_millis(50),
+        );
+
+        let elapsed = started.elapsed();
+        let status = with_status(&shared, |status| status.clone());
+        assert!(elapsed >= Duration::from_millis(200), "elapsed={elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "elapsed={elapsed:?}");
+        assert_eq!(status.phase, HubPhase::Error);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("pairing timeout (250ms)")),
+            "{:?}",
+            status.last_error
+        );
+        assert!(!BRIDGE_RUNNING.load(Ordering::SeqCst));
+        assert!(!BRIDGE_STOPPING.load(Ordering::SeqCst));
+        STOP_BRIDGE.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn wait_until_stopped_observes_async_worker_cleanup() {
+        let running = Arc::new(AtomicBool::new(true));
+        let stopping = Arc::new(AtomicBool::new(true));
+        let running_worker = Arc::clone(&running);
+        let stopping_worker = Arc::clone(&stopping);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            running_worker.store(false, Ordering::SeqCst);
+            stopping_worker.store(false, Ordering::SeqCst);
+        });
+
+        assert!(wait_until_stopped(
+            &running,
+            &stopping,
+            Duration::from_millis(500)
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn wait_until_stopped_reports_timeout() {
+        let running = AtomicBool::new(true);
+        let stopping = AtomicBool::new(false);
+        assert!(!wait_until_stopped(
+            &running,
+            &stopping,
+            Duration::from_millis(20)
+        ));
+    }
+
+    #[test]
+    fn disconnect_completion_allows_first_reconnect_attempt() {
+        let _test_lock = BRIDGE_TEST_LOCK.lock().unwrap();
+        {
+            let _transition = BRIDGE_TRANSITION.lock().unwrap();
+            assert!(!BRIDGE_RUNNING.swap(true, Ordering::SeqCst));
+            BRIDGE_STOPPING.store(false, Ordering::SeqCst);
+            STOP_BRIDGE.store(false, Ordering::SeqCst);
+        }
+        let worker = thread::spawn(|| {
+            while !STOP_BRIDGE.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(30));
+            BRIDGE_RUNNING.store(false, Ordering::SeqCst);
+            BRIDGE_STOPPING.store(false, Ordering::SeqCst);
+        });
+        let shared = Arc::new(Mutex::new(HubStatus::default()));
+        let discovery = Arc::new(Mutex::new(None));
+
+        stop_bridge(&shared, &discovery).unwrap();
+        worker.join().unwrap();
+        {
+            let _transition = BRIDGE_TRANSITION.lock().unwrap();
+            assert_eq!(claim_bridge(), Ok(()));
+            BRIDGE_RUNNING.store(false, Ordering::SeqCst);
+            STOP_BRIDGE.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_sequence_is_unchanged() {
+        let actual = (1..=7).map(reconnect_delay_secs).collect::<Vec<_>>();
+        assert_eq!(actual, vec![1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    #[test]
+    fn reconnect_decision_allows_post_connection_pairing_timeout() {
+        let timeout = "pairing timeout (30s): peer silent";
+        assert!(should_stop_reconnecting(timeout, false));
+        assert!(!should_stop_reconnecting(timeout, true));
+        assert!(should_stop_reconnecting("pairing code mismatch", true));
+        assert!(!should_stop_reconnecting("tcp connection refused", true));
     }
 }

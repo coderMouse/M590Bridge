@@ -2,7 +2,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use m590_core::Message;
 
@@ -217,6 +217,42 @@ pub fn connect_framed(addr: impl ToSocketAddrs) -> Result<TcpFrameStream, TcpErr
     Ok(TcpFrameStream::from_stream(stream)?)
 }
 
+/// Dial a remote framed peer without allowing one OS connect call to block forever.
+pub fn connect_framed_timeout(
+    addr: impl ToSocketAddrs,
+    timeout: Duration,
+) -> Result<TcpFrameStream, TcpError> {
+    if timeout.is_zero() {
+        return Err(TcpError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "tcp connect timeout",
+        )));
+    }
+    let addrs = addr
+        .to_socket_addrs()
+        .map_err(|e| TcpError::InvalidAddr(e.to_string()))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(TcpError::InvalidAddr("could not resolve address".into()));
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    for socket_addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&socket_addr, remaining) {
+            Ok(stream) => return Ok(TcpFrameStream::from_stream(stream)?),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(TcpError::Io(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::TimedOut, "tcp connect timeout")
+    })))
+}
+
 /// Parse `host:port` (IPv4/hostname). IPv6 with brackets not required for MVP.
 pub fn parse_socket_addr(input: &str) -> Result<std::net::SocketAddr, TcpError> {
     input
@@ -345,6 +381,26 @@ mod tests {
         );
         client.send(&msg).unwrap();
         assert_eq!(server.join().unwrap(), msg);
+    }
+
+    #[test]
+    fn tcp_connect_timeout_entry_connects_to_loopback() {
+        let listener = listen_on("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || accept_framed(&listener).unwrap().peer_addr().unwrap());
+
+        let client = connect_framed_timeout(addr, Duration::from_secs(1)).unwrap();
+        assert_eq!(client.peer_addr().unwrap(), addr);
+        assert_eq!(server.join().unwrap(), client.local_addr().unwrap());
+    }
+
+    #[test]
+    fn tcp_connect_timeout_rejects_zero_duration() {
+        let err = match connect_framed_timeout("127.0.0.1:9", Duration::ZERO) {
+            Ok(_) => panic!("zero timeout must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("connect timeout"), "{err}");
     }
 
     #[test]
