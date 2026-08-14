@@ -83,6 +83,18 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
   原因是上一版在 `show_all()` 后立即最大化，Wayland 尚未完成原几何位置的首次 remap configure，
   还原时 compositor 没有可恢复的位置。恢复流程现改为三阶段：先透明映射并等待 200ms，再执行
   最大化/还原 configure，最后显示窗口；不使用 Wayland 明确不可靠的手工 `set_position`。
+- 用户继续复测确认三阶段 configure 往返会显示最大化闪烁。该方案只是利用 compositor configure
+  重置 Tao 0.35.3 的过期 CSD 指针状态，无法保证 GNOME Shell 不显示最大化动画，因此已删除。
+  setup 阶段现仅在 Wayland 下替换 Tao 强制注入的自定义 titlebar；普通 `show()`/`present()`
+  恢复不再改变最大化状态，也不再引入约 500ms 延迟。X11 与 Windows 不变。
+- 用户确认先将 Tao titlebar 清空后，恢复无闪烁、窗口保留原位置且第一次点击 X 生效，但窗口
+  无法移动。随后尝试将应用顶部栏设为 Tauri WebView 拖动区域，真机仍无法拖动，已完整回退该
+  无效前端改动与额外权限。
+- Wayland setup 现改为直接安装 GTK `HeaderBar`。它保留 GTK 标题栏原生拖动和窗口按钮，但不再
+  使用 Tao 的 `set_above_child(true)` `EventBox` 覆盖层，从根因上避开 hide/show 后过期的指针状态。
+- 用户复测第六版发现：启动时标题栏不可见，托盘恢复后才出现，且仍无法拖动。原因是 setup
+  替换 titlebar 时窗口已经首次映射，GTK 直到下一次 hide/show 才完成标题栏挂载；现改为 setup
+  中先 hide、安装直接 `HeaderBar` 后立即 show/present，确保首次映射即带可拖动标题栏。
 - Linux `CloseRequested` 在 `prevent_close` 与 `skip_taskbar` 后改用真正的 `hide()`，
   避免最小化窗口仍出现在 Ubuntu Dock；Windows 等非 Linux 平台继续沿用已验证的
   `minimize()`，不改变现有关闭行为。
@@ -97,7 +109,7 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 ## 修改文件
 
-- `ui/src-tauri/src/lib.rs`：Linux 关闭真正隐藏、恢复顺序和主窗口显式图标。
+- `ui/src-tauri/src/lib.rs`：Linux 关闭真正隐藏、Wayland 原生窗口装饰、恢复顺序和主窗口显式图标。
 - `ui/scripts/prepare-standalone.mjs`：Linux standalone 的 GNOME 应用身份与图标准备。
 - `ui/package.json`：接入 `predesktop:standalone`。
 - `ui/README.md`：说明 Linux standalone 桌面身份和清理路径。
@@ -155,6 +167,62 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 - `cargo build -p m590-ui --release --features custom-protocol`：通过。
 - Linux Wayland 恢复位置与标题栏交互：待用户真机复测。
 
+### 第四次返工验证（移除 Tao Wayland 自定义标题栏）
+
+- 用户真机结果：三阶段透明 configure 往返仍能看到最大化闪烁，不通过无闪烁要求。
+- `rustfmt --edition 2021 --check ui/src-tauri/src/lib.rs`：通过。
+- `cargo check -p m590-ui --features custom-protocol`：通过。
+- `cargo test -p m590-ui --lib`：通过，8 项测试全部成功。
+- `cargo clippy -p m590-ui --lib --no-deps --features custom-protocol -- -D warnings`：通过。
+- `cd ui && npm run lint`：通过。
+- `cd ui && npm run build`：通过，Vite 构建 1804 个模块。
+- `cargo build -p m590-ui --release --features custom-protocol`：通过。
+- 临时可写 XDG 运行目录启动 release 桌面壳 8 秒：内嵌 Hub 到达 `ready`，setup、窗口装饰与
+  托盘初始化无 panic；到时主动结束进程。沙箱内 AMDGPU/EGL 无设备权限告警不影响启动结论。
+- Linux Wayland 隐藏/恢复后的无闪烁、位置和首次关闭交互：待用户真机复测。
+
+### 第五次返工验证（WebView 拖动区域，失败并回退）
+
+- 用户真机结果：第四次返工的无闪烁、位置保持和首次关闭均通过；窗口无法移动。
+- `rustfmt --edition 2021 --check ui/src-tauri/src/lib.rs`：通过。
+- `git diff --check`：通过。
+- `cargo check -p m590-ui --features custom-protocol`：通过，新增 capability 可正常解析。
+- `cargo test -p m590-ui --lib`：通过，8 项测试全部成功。
+- `cargo clippy -p m590-ui --lib --no-deps --features custom-protocol -- -D warnings`：通过。
+- `cd ui && npm run lint`：通过。
+- `cd ui && npm run build`：通过，Vite 构建 1804 个模块；产物中确认包含两个 `deep` 拖动区域。
+- `cargo build -p m590-ui --release --features custom-protocol`：通过。
+- 临时可写 XDG 运行目录启动新 release 桌面壳 6 秒：内嵌 Hub 到达 `ready`，无 setup、权限或托盘 panic；
+  到时主动结束进程。
+- 用户以 `npm run desktop:standalone` 真机复测：应用顶部栏仍无法拖动窗口；该方案不通过，代码
+  与 capability 已回退。
+
+### 第六次返工验证（直接 GTK HeaderBar）
+
+- `rustfmt --edition 2021 --check ui/src-tauri/src/lib.rs`：通过。
+- `git diff --check`：通过。
+- `cargo check -p m590-ui --features custom-protocol`：通过。
+- `cargo test -p m590-ui --lib`：通过，8 项测试全部成功。
+- `cargo clippy -p m590-ui --lib --no-deps --features custom-protocol -- -D warnings`：通过。
+- `cd ui && npm run lint`：通过。
+- `cd ui && npm run build`：通过，Vite 构建 1804 个模块；无效 WebView 拖动区域已不在产物中。
+- `cargo build -p m590-ui --release --features custom-protocol`：通过。
+- 临时可写 XDG 运行目录启动新 release 桌面壳 6 秒：内嵌 Hub 到达 `ready`，直接 GTK 标题栏、
+  setup 与托盘初始化无 panic；到时主动结束进程。
+- 移除 Tao `EventBox`、保留直接 GTK 标题栏后的窗口拖动、无闪烁、位置保持和首次关闭：待用户
+  真机复测。
+
+### 第七次返工验证（首次映射时安装 GTK HeaderBar）
+
+- `rustfmt --edition 2021 --check ui/src-tauri/src/lib.rs`、`git diff --check`：通过。
+- `cargo check -p m590-ui --features custom-protocol`：通过。
+- `cargo test -p m590-ui --lib`：通过，8 项测试全部成功。
+- `cargo clippy -p m590-ui --lib --no-deps --features custom-protocol -- -D warnings`：通过。
+- `cargo build -p m590-ui --release --features custom-protocol`：通过。
+- 临时可写 XDG 运行目录启动新 release 桌面壳 6 秒：内嵌 Hub 到达 `ready`，无 setup、GTK 标题栏
+  或托盘 panic；到时主动结束进程。
+- 启动时标题栏可见、标题栏拖动、关闭到托盘与托盘恢复：待用户真机复测。
+
 ## 文档影响检查
 
 - 已更新：本 task、当前计划、`AGENTS.md`、`ui/README.md`、项目结构图和命令索引。
@@ -165,8 +233,9 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 - GNOME/Wayland 的 Dock 图标依赖 `.desktop` 应用身份，纯 `set_icon` 不能替代该匹配；
   最终外观仍需当前 Linux 桌面真机确认。
-- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；当前三阶段 configure 往返会让托盘恢复
-  延迟约 500ms，并以透明窗口避免最大化闪烁，位置保持与最终效果仍需 Linux 真机确认。
+- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；本次在 Wayland 下改用不带 Tao `EventBox`
+  的直接 GTK `HeaderBar`，并在首次映射前完成一次 hide/show 挂载；标题栏外观、拖动与 hide/show
+  后的交互仍需 Linux 真机确认。
 - standalone 生成的桌面身份为 `NoDisplay=true`，不会增加应用菜单入口；停用源码
   standalone 后可按 `ui/README.md` 删除这两个用户级文件。
 - 当前 Linux 环境不能运行 Windows 桌面壳，Windows 行为待与 task-046 一并真机验收。
@@ -176,5 +245,5 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 - 用户统一验收 task-046 的 3 组文件生命周期场景，以及本 task 的 Linux 3 步桌面
   交互和 Windows 关闭到托盘回归。
-- 第三次返工后复测：先把窗口移动到明显不是左上角的位置 → 点击 X → 托盘打开主面板（允许约
-  500ms 恢复）→ 确认窗口仍在原位置且第一次点击右上角 X 立即生效；同时观察是否有最大化闪烁。
+- 第七次返工后复测：刚启动即确认带最小化/最大化/X 的系统标题栏可见且可拖动；再执行 X 隐藏
+  → 托盘恢复，确认恢复无闪烁、位置保持，且第一次点击 X 仍立即生效。

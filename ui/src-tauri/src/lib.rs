@@ -7,7 +7,6 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     sync::atomic::AtomicU64,
-    time::Duration,
 };
 
 use tauri::{
@@ -29,18 +28,6 @@ const AUTOSTART_DESKTOP_FILE: &str = "M590Bridge.desktop";
 
 #[cfg(target_os = "linux")]
 static AUTOSTART_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(target_os = "linux")]
-static WAYLAND_RESTORE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-
-#[cfg(target_os = "linux")]
-const WAYLAND_MAP_DELAY: Duration = Duration::from_millis(200);
-
-#[cfg(target_os = "linux")]
-const WAYLAND_CONFIGURE_DELAY: Duration = Duration::from_millis(200);
-
-#[cfg(target_os = "linux")]
-const WAYLAND_REVEAL_DELAY: Duration = Duration::from_millis(100);
 
 #[cfg(target_os = "windows")]
 const WINDOWS_AUTOSTART_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -293,98 +280,24 @@ fn set_windows_autostart(executable: &Path, enabled: bool) -> Result<bool, Strin
     }
 }
 
-#[cfg(target_os = "linux")]
-fn show_linux_main_window(window: tauri::WebviewWindow) {
-    if window.is_visible().unwrap_or(false) {
-        let _ = window.set_skip_taskbar(false);
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        return;
-    }
-
-    if WAYLAND_RESTORE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let gtk_window_handle = window.clone();
-    if window
-        .run_on_main_thread(move || {
-            let Ok(gtk_win) = gtk_window_handle.gtk_window() else {
-                WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
-                return;
-            };
-            use gtk::prelude::*;
-
-            gtk_win.set_skip_taskbar_hint(false);
-            gtk_win.deiconify();
-
-            let is_wayland = gtk_win.display().type_().name() == "GdkWaylandDisplay";
-            if !is_wayland {
-                gtk_win.show_all();
-                gtk_win.present();
-                WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
-                return;
-            }
-
-            // Tao 0.35.x can retain stale Wayland CSD pointer state after an
-            // unmap/remap. Let the compositor map the original geometry first,
-            // then use a transparent configure round-trip to clear that state.
-            let was_maximized = gtk_win.is_maximized();
-            gtk_win.set_opacity(0.0);
-            gtk_win.show_all();
-            gtk_win.present();
-
-            let configure_window = gtk_win.clone();
-            gtk::glib::timeout_add_local_once(WAYLAND_MAP_DELAY, move || {
-                if was_maximized {
-                    configure_window.unmaximize();
-                } else {
-                    configure_window.maximize();
-                }
-
-                let restore_window = configure_window.clone();
-                gtk::glib::timeout_add_local_once(WAYLAND_CONFIGURE_DELAY, move || {
-                    if was_maximized {
-                        restore_window.maximize();
-                    } else {
-                        restore_window.unmaximize();
-                    }
-
-                    let reveal_window = restore_window.clone();
-                    gtk::glib::timeout_add_local_once(WAYLAND_REVEAL_DELAY, move || {
-                        reveal_window.set_opacity(1.0);
-                        reveal_window.present();
-                        WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
-                    });
-                });
-            });
-        })
-        .is_err()
-    {
-        WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        // Reverse close-to-tray state before asking the compositor to present the window.
         let _ = window.set_skip_taskbar(false);
         let _ = window.show();
         let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
-}
-
-fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
         #[cfg(target_os = "linux")]
-        show_linux_main_window(window);
-        #[cfg(not(target_os = "linux"))]
         {
-            // Reverse close-to-tray state before asking the compositor to present the window.
-            let _ = window.set_skip_taskbar(false);
-            let _ = window.show();
-            let _ = window.unminimize();
-            let _ = window.set_always_on_top(true);
-            let _ = window.set_focus();
-            let _ = window.set_always_on_top(false);
-            let _ = window.set_focus();
-            let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+            if let Ok(gtk_win) = window.gtk_window() {
+                use gtk::prelude::GtkWindowExt;
+                gtk_win.present();
+            }
         }
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_focus();
+        let _ = window.set_always_on_top(false);
+        let _ = window.set_focus();
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
     }
 }
 
@@ -604,6 +517,31 @@ pub fn run() {
                 .cloned()
                 .expect("default window icon");
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "linux")]
+                {
+                    let gtk_win = window.gtk_window()?;
+                    use gtk::prelude::*;
+
+                    if gtk_win.display().type_().name() == "GdkWaylandDisplay" {
+                        // Tao wraps this header in an above-child EventBox whose
+                        // pointer state goes stale across hide/show on Wayland.
+                        let was_visible = gtk_win.is_visible();
+                        if was_visible {
+                            gtk_win.hide();
+                        }
+                        let header = gtk::HeaderBar::builder()
+                            .show_close_button(true)
+                            .decoration_layout("menu:minimize,maximize,close")
+                            .title("M590Bridge")
+                            .build();
+                        gtk_win.set_titlebar(Some(&header));
+                        gtk_win.set_decorated(true);
+                        if was_visible {
+                            gtk_win.show_all();
+                            gtk_win.present();
+                        }
+                    }
+                }
                 window.set_icon(icon.clone())?;
             }
 
