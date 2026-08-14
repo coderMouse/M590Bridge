@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-14
-> 阶段：task-045 代码完成，等待 Windows↔Linux 真机复测新 offer 替换误报；task-042 继续暂停
+> 阶段：task-045 新 offer 替换误报已修复并完成 Windows↔Linux 真机复测；task-042 继续暂停
 
 ## 目标（近期）
 
@@ -34,12 +34,9 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（避免 https WebView fetch http 被拦）
 - [x] **task-043** Windows 单文件 OLE 虚拟剪贴板原型（Explorer 按粘贴取流 + 系统复制进度，真机通过）
 - [x] **task-044** Windows 按粘贴请求 FileRequest、网络有界流与 FileCancel（Windows↔Linux 真机验收通过）
+- [x] **task-045** 新文件 offer 替换旧 offer 时不误报失败（代码验证与 Windows↔Linux 真机复测通过）
 
-## 进行中
-
-- [ ] **task-045** 新文件 offer 替换旧 offer 时不误报失败（代码与 Linux/Windows 目标检查通过，待真机复测）
-
-## 暂停 / 待验收
+## 进行中 / 暂停
 
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
@@ -87,13 +84,12 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 完成 task-045 并由用户复测偶发误报
-2. 等待用户决定是否恢复 task-042 剩余的登录自启与跨机回归验收（当前暂停）
-3. （可选）另建独立文件数据连接 / 更高吞吐调优 task
-4. （可选）设置页发现开关 / 本机显示名
-5. （可选）多文件并行 / 文件夹 / Linux FUSE
+1. 等待用户决定是否恢复 task-042 剩余的登录自启与跨机回归验收（当前暂停）
+2. 或另建独立文件数据连接 / 更高吞吐调优 task
+3. （可选）设置页发现开关 / 本机显示名
+4. （可选）多文件并行 / 文件夹 / Linux FUSE
 
-> task-044 已完成：未粘贴不传内容、按粘贴取流、系统进度、取消、剪贴板替换取消旧 offer 和空文件均经 Windows 真机确认。task-042 已确认 NSIS 可生成并安装，但剩余验收暂停且仍为 `in_progress`。
+> task-044、task-045 均已完成 Windows↔Linux 真机验收。task-042 已确认 NSIS 可生成并安装，但剩余验收暂停且仍为 `in_progress`。
 
 ## 用户怎么用
 
