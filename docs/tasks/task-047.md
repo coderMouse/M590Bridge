@@ -79,6 +79,10 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
   `present()`、聚焦和客户端 resize 均不能恢复，用户双击标题栏触发最大化后才恢复，是因为
   compositor configure 清除了该状态。Linux 恢复现仅在 Wayland 隐藏窗口上自动执行一次透明的
   最大化/还原 configure 往返，保留原最大化状态并在完成后显示；X11 与 Windows 恢复路径不变。
+- 用户确认自动 configure 往返后，恢复窗口的关闭按钮第一次点击已生效，但窗口会移动到左上角。
+  原因是上一版在 `show_all()` 后立即最大化，Wayland 尚未完成原几何位置的首次 remap configure，
+  还原时 compositor 没有可恢复的位置。恢复流程现改为三阶段：先透明映射并等待 200ms，再执行
+  最大化/还原 configure，最后显示窗口；不使用 Wayland 明确不可靠的手工 `set_position`。
 - Linux `CloseRequested` 在 `prevent_close` 与 `skip_taskbar` 后改用真正的 `hide()`，
   避免最小化窗口仍出现在 Ubuntu Dock；Windows 等非 Linux 平台继续沿用已验证的
   `minimize()`，不改变现有关闭行为。
@@ -140,6 +144,17 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 - `cargo build -p m590-ui --release --features custom-protocol`：通过。
 - Linux Wayland 隐藏/恢复后的标题栏交互：待用户真机复测；本机编译无法代替真实指针交互。
 
+### 第三次返工验证（保留 Wayland 窗口位置）
+
+- 用户真机结果：第二次返工后标题栏关闭第一次点击已生效；窗口位置移动到左上角，不通过位置保持。
+- `rustfmt --edition 2021 --check ui/src-tauri/src/lib.rs`：通过。
+- `cargo check -p m590-ui --features custom-protocol`：通过。
+- `cargo test -p m590-ui --lib`：通过，8 项测试全部成功。
+- `cargo clippy -p m590-ui --lib --no-deps --features custom-protocol -- -D warnings`：通过。
+- `cd ui && npm run lint && npm run build`：通过，Vite 构建 1804 个模块。
+- `cargo build -p m590-ui --release --features custom-protocol`：通过。
+- Linux Wayland 恢复位置与标题栏交互：待用户真机复测。
+
 ## 文档影响检查
 
 - 已更新：本 task、当前计划、`AGENTS.md`、`ui/README.md`、项目结构图和命令索引。
@@ -150,8 +165,8 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 - GNOME/Wayland 的 Dock 图标依赖 `.desktop` 应用身份，纯 `set_icon` 不能替代该匹配；
   最终外观仍需当前 Linux 桌面真机确认。
-- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；当前 configure 往返会让托盘恢复延迟约
-  400ms，并以透明窗口避免最大化闪烁，最终效果仍需 Linux 真机确认。
+- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；当前三阶段 configure 往返会让托盘恢复
+  延迟约 500ms，并以透明窗口避免最大化闪烁，位置保持与最终效果仍需 Linux 真机确认。
 - standalone 生成的桌面身份为 `NoDisplay=true`，不会增加应用菜单入口；停用源码
   standalone 后可按 `ui/README.md` 删除这两个用户级文件。
 - 当前 Linux 环境不能运行 Windows 桌面壳，Windows 行为待与 task-046 一并真机验收。
@@ -161,5 +176,5 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 - 用户统一验收 task-046 的 3 组文件生命周期场景，以及本 task 的 Linux 3 步桌面
   交互和 Windows 关闭到托盘回归。
-- 第二次返工后复测：托盘打开主面板（允许约 400ms 恢复）→ 第一次点击右上角 X，应立即
-  隐藏窗口并移除 Dock 项；同时观察恢复过程是否出现最大化闪烁。
+- 第三次返工后复测：先把窗口移动到明显不是左上角的位置 → 点击 X → 托盘打开主面板（允许约
+  500ms 恢复）→ 确认窗口仍在原位置且第一次点击右上角 X 立即生效；同时观察是否有最大化闪烁。

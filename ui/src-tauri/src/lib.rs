@@ -34,7 +34,10 @@ static AUTOSTART_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static WAYLAND_RESTORE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
-const WAYLAND_CONFIGURE_DELAY: Duration = Duration::from_millis(300);
+const WAYLAND_MAP_DELAY: Duration = Duration::from_millis(200);
+
+#[cfg(target_os = "linux")]
+const WAYLAND_CONFIGURE_DELAY: Duration = Duration::from_millis(200);
 
 #[cfg(target_os = "linux")]
 const WAYLAND_REVEAL_DELAY: Duration = Duration::from_millis(100);
@@ -324,31 +327,35 @@ fn show_linux_main_window(window: tauri::WebviewWindow) {
             }
 
             // Tao 0.35.x can retain stale Wayland CSD pointer state after an
-            // unmap/remap. A compositor configure round-trip clears it; keep the
-            // bounce transparent so the restored window does not visibly resize.
+            // unmap/remap. Let the compositor map the original geometry first,
+            // then use a transparent configure round-trip to clear that state.
             let was_maximized = gtk_win.is_maximized();
             gtk_win.set_opacity(0.0);
             gtk_win.show_all();
             gtk_win.present();
-            if was_maximized {
-                gtk_win.unmaximize();
-            } else {
-                gtk_win.maximize();
-            }
 
             let configure_window = gtk_win.clone();
-            gtk::glib::timeout_add_local_once(WAYLAND_CONFIGURE_DELAY, move || {
+            gtk::glib::timeout_add_local_once(WAYLAND_MAP_DELAY, move || {
                 if was_maximized {
-                    configure_window.maximize();
-                } else {
                     configure_window.unmaximize();
+                } else {
+                    configure_window.maximize();
                 }
 
-                let reveal_window = configure_window.clone();
-                gtk::glib::timeout_add_local_once(WAYLAND_REVEAL_DELAY, move || {
-                    reveal_window.set_opacity(1.0);
-                    reveal_window.present();
-                    WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                let restore_window = configure_window.clone();
+                gtk::glib::timeout_add_local_once(WAYLAND_CONFIGURE_DELAY, move || {
+                    if was_maximized {
+                        restore_window.maximize();
+                    } else {
+                        restore_window.unmaximize();
+                    }
+
+                    let reveal_window = restore_window.clone();
+                    gtk::glib::timeout_add_local_once(WAYLAND_REVEAL_DELAY, move || {
+                        reveal_window.set_opacity(1.0);
+                        reveal_window.present();
+                        WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                    });
                 });
             });
         })
