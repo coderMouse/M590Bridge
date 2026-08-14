@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`
+`completed`（2026-08-14，Windows↔Linux 真机验收通过）
 
 ## 背景
 
@@ -37,11 +37,11 @@ Windows Explorer 已经通过 OLE `IStream` 开始粘贴远端文件时，如果
 
 ## 完成标准
 
-- [ ] Explorer 正在粘贴远端文件 A 时，Windows 本机复制文件 B，A 不被中断并可完整落盘。
-- [ ] 上述场景不发送针对 A 的 `FileCancel("clipboard replaced")`，两端不显示该失败。
-- [ ] A 完成后 Windows 剪贴板仍是 B；开启自动同步时，B 随后按现有单文件流程同步到对端。
-- [ ] 本机替换剪贴板时，未请求的当前远端 offer 和 deferred offer 仍会取消，不重新覆盖 B。
-- [ ] Explorer 主动取消、读取超时和网络失败行为不回归。
+- [x] Explorer 正在粘贴远端文件 A 时，Windows 本机复制文件 B，A 不被中断并可完整落盘。
+- [x] 上述场景不发送针对 A 的 `FileCancel("clipboard replaced")`，两端不显示该失败。
+- [x] A 完成后 Windows 剪贴板仍是 B；开启自动同步时，B 随后按现有单文件流程同步到对端。
+- [x] 本机替换剪贴板时，未请求的当前远端 offer 和 deferred offer 仍会取消，不重新覆盖 B。
+- [x] Explorer 主动取消、读取超时和网络失败行为不回归。
 - [x] Rust 单测/Clippy 与 Windows GNU 类型检查/Clippy 通过；Windows 运行行为有明确真机步骤。
 
 ## 验证命令
@@ -92,7 +92,9 @@ Windows↔Linux 真机复测：
 - `git diff --check`：通过。
 - 首次 Linux Clippy 尝试在隔离克隆新建构建缓存时被 `/tmp` 磁盘配额阻塞；清理该隔离克隆自身
   可再生成的 `target` 后，复用项目既有构建缓存重新执行并通过，不是源码或 lint 失败。
-- Windows Explorer 运行行为：当前 Linux 环境无法执行，待用户按上述 4 步真机验收。
+- Windows Explorer 运行行为：用户按上述步骤完成 Windows↔Linux 真机验收；活动 A 传输继续
+  完成且无 `clipboard replaced` 失败，Windows 新复制的 B 保留并可继续同步，未请求 offer 与
+  Explorer 主动取消行为均无回归。
 
 ## 文档影响检查
 
@@ -102,12 +104,11 @@ Windows↔Linux 真机复测：
 
 ## 风险 / blocker
 
-- 当前 Linux 环境不能运行 Windows OLE/Explorer，最终剪贴板与已打开 `IStream` 的系统级生命周期
-  仍需 Windows 10 真机验收。
+- 当前 Linux 环境不能独立运行 Windows OLE/Explorer；最终系统级生命周期已由 Windows 10 真机覆盖。
 - OLE 条件发布使用 5 秒响应上限；正常路径只在线程内检查剪贴板所有权并发布对象。若 STA 线程
   异常卡住，会返回明确错误而不是无限阻塞会话循环。
 
 ## 下一步
 
-- 用户按本 task 的 4 组步骤做 Windows↔Linux 真机验收；通过后关闭 task-048，失败则只修复本
-  task 的流/剪贴板生命周期问题。
+- task-048 已完成；建立独立任务处理配对 30 秒超时无可见结果，以及断开/重置后立即重连仍提示
+  `bridge already running; disconnect first` 的 worker 清理竞态。
