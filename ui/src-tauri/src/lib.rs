@@ -7,6 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     sync::atomic::AtomicU64,
+    time::Duration,
 };
 
 use tauri::{
@@ -28,6 +29,15 @@ const AUTOSTART_DESKTOP_FILE: &str = "M590Bridge.desktop";
 
 #[cfg(target_os = "linux")]
 static AUTOSTART_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+static WAYLAND_RESTORE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+const WAYLAND_CONFIGURE_DELAY: Duration = Duration::from_millis(300);
+
+#[cfg(target_os = "linux")]
+const WAYLAND_REVEAL_DELAY: Duration = Duration::from_millis(100);
 
 #[cfg(target_os = "windows")]
 const WINDOWS_AUTOSTART_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -280,35 +290,88 @@ fn set_windows_autostart(executable: &Path, enabled: bool) -> Result<bool, Strin
     }
 }
 
-fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        // Reverse close-to-tray state before asking the compositor to present the window.
+#[cfg(target_os = "linux")]
+fn show_linux_main_window(window: tauri::WebviewWindow) {
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.set_skip_taskbar(false);
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return;
+    }
+
+    if WAYLAND_RESTORE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let gtk_window_handle = window.clone();
+    if window
+        .run_on_main_thread(move || {
+            let Ok(gtk_win) = gtk_window_handle.gtk_window() else {
+                WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                return;
+            };
+            use gtk::prelude::*;
+
+            gtk_win.set_skip_taskbar_hint(false);
+            gtk_win.deiconify();
+
+            let is_wayland = gtk_win.display().type_().name() == "GdkWaylandDisplay";
+            if !is_wayland {
+                gtk_win.show_all();
+                gtk_win.present();
+                WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            // Tao 0.35.x can retain stale Wayland CSD pointer state after an
+            // unmap/remap. A compositor configure round-trip clears it; keep the
+            // bounce transparent so the restored window does not visibly resize.
+            let was_maximized = gtk_win.is_maximized();
+            gtk_win.set_opacity(0.0);
+            gtk_win.show_all();
+            gtk_win.present();
+            if was_maximized {
+                gtk_win.unmaximize();
+            } else {
+                gtk_win.maximize();
+            }
+
+            let configure_window = gtk_win.clone();
+            gtk::glib::timeout_add_local_once(WAYLAND_CONFIGURE_DELAY, move || {
+                if was_maximized {
+                    configure_window.maximize();
+                } else {
+                    configure_window.unmaximize();
+                }
+
+                let reveal_window = configure_window.clone();
+                gtk::glib::timeout_add_local_once(WAYLAND_REVEAL_DELAY, move || {
+                    reveal_window.set_opacity(1.0);
+                    reveal_window.present();
+                    WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                });
+            });
+        })
+        .is_err()
+    {
+        WAYLAND_RESTORE_IN_PROGRESS.store(false, Ordering::SeqCst);
         let _ = window.set_skip_taskbar(false);
         let _ = window.show();
         let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
         #[cfg(target_os = "linux")]
-        {
-            // GTK/Wayland may map a hidden window after this callback returns. Defer
-            // activation until the next main-loop turn so the first title-bar click
-            // is delivered to the close button instead of only activating the window.
-            let deferred_window = window.clone();
-            let _ = window.run_on_main_thread(move || {
-                gtk::glib::idle_add_local_once(move || {
-                    if let Ok(gtk_win) = deferred_window.gtk_window() {
-                        use gtk::prelude::GtkWindowExt;
-                        gtk_win.present();
-                    }
-                    let _ = deferred_window.set_always_on_top(true);
-                    let _ = deferred_window.set_focus();
-                    let _ = deferred_window.set_always_on_top(false);
-                    let _ = deferred_window.set_focus();
-                    let _ = deferred_window
-                        .request_user_attention(Some(tauri::UserAttentionType::Informational));
-                });
-            });
-        }
+        show_linux_main_window(window);
         #[cfg(not(target_os = "linux"))]
         {
+            // Reverse close-to-tray state before asking the compositor to present the window.
+            let _ = window.set_skip_taskbar(false);
+            let _ = window.show();
+            let _ = window.unminimize();
             let _ = window.set_always_on_top(true);
             let _ = window.set_focus();
             let _ = window.set_always_on_top(false);

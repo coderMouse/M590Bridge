@@ -71,11 +71,14 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 ## 实施记录
 
-- Linux 真机验收发现：从托盘恢复后，第一次点击窗口右上角关闭按钮只激活窗口，未触发关闭。
-  原因是隐藏窗口在 `show()` 后同步调用 GTK `present()`/聚焦补偿过早，Wayland 映射窗口时序
-  会吞掉第一次标题栏点击。恢复流程现改为 `run_on_main_thread` +
-  `gtk::glib::idle_add_local_once`，等窗口完成恢复后再 `present()` 和执行聚焦脉冲；Windows
-  保持原有同步恢复路径。
+- Linux 真机验收发现：从托盘恢复后，第一次点击窗口右上角关闭按钮无效。首次返工将 GTK
+  `present()`/聚焦补偿延迟到下一次主循环，但用户复测仍失败，证明问题不是单纯的窗口映射或
+  激活时序。
+- 进一步诊断与 Tao 0.35.3 上游缺陷 `tauri-apps/tao#1299`、`tauri-apps/tauri#15460`
+  完全一致：Wayland 窗口 `hide()`/`show()` 后，Tao 的 CSD 标题栏保留过期指针状态；普通
+  `present()`、聚焦和客户端 resize 均不能恢复，用户双击标题栏触发最大化后才恢复，是因为
+  compositor configure 清除了该状态。Linux 恢复现仅在 Wayland 隐藏窗口上自动执行一次透明的
+  最大化/还原 configure 往返，保留原最大化状态并在完成后显示；X11 与 Windows 恢复路径不变。
 - Linux `CloseRequested` 在 `prevent_close` 与 `skip_taskbar` 后改用真正的 `hide()`，
   避免最小化窗口仍出现在 Ubuntu Dock；Windows 等非 Linux 平台继续沿用已验证的
   `minimize()`，不改变现有关闭行为。
@@ -127,6 +130,16 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 - `cargo build -p m590-ui --release --features custom-protocol`：通过。
 - Linux 托盘恢复后的首次关闭点击：待用户真机复测。
 
+### 第二次返工验证（Wayland CSD configure）
+
+- `rustfmt --edition 2021 --check ui/src-tauri/src/lib.rs`：通过。
+- `cargo check -p m590-ui --features custom-protocol`：通过。
+- `cargo test -p m590-ui --lib`：通过，8 项测试全部成功。
+- `cargo clippy -p m590-ui --lib --no-deps --features custom-protocol -- -D warnings`：通过。
+- `cd ui && npm run lint && npm run build`：通过，Vite 构建 1804 个模块。
+- `cargo build -p m590-ui --release --features custom-protocol`：通过。
+- Linux Wayland 隐藏/恢复后的标题栏交互：待用户真机复测；本机编译无法代替真实指针交互。
+
 ## 文档影响检查
 
 - 已更新：本 task、当前计划、`AGENTS.md`、`ui/README.md`、项目结构图和命令索引。
@@ -137,8 +150,8 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 - GNOME/Wayland 的 Dock 图标依赖 `.desktop` 应用身份，纯 `set_icon` 不能替代该匹配；
   最终外观仍需当前 Linux 桌面真机确认。
-- `idle_add_local_once` 依赖 GTK 主循环；若特定桌面环境仍有首次点击焦点问题，需要在
-  Linux 真机上继续调整恢复时序。
+- Tao 0.35.3 的 Wayland CSD 问题尚无直接上游修复；当前 configure 往返会让托盘恢复延迟约
+  400ms，并以透明窗口避免最大化闪烁，最终效果仍需 Linux 真机确认。
 - standalone 生成的桌面身份为 `NoDisplay=true`，不会增加应用菜单入口；停用源码
   standalone 后可按 `ui/README.md` 删除这两个用户级文件。
 - 当前 Linux 环境不能运行 Windows 桌面壳，Windows 行为待与 task-046 一并真机验收。
@@ -148,4 +161,5 @@ Windows 真机回归：运行 standalone 或安装版，重复关闭、托盘恢
 
 - 用户统一验收 task-046 的 3 组文件生命周期场景，以及本 task 的 Linux 3 步桌面
   交互和 Windows 关闭到托盘回归。
-- 本次返工后先复测：托盘打开主面板 → 第一次点击右上角 X，应立即隐藏窗口并移除 Dock 项。
+- 第二次返工后复测：托盘打开主面板（允许约 400ms 恢复）→ 第一次点击右上角 X，应立即
+  隐藏窗口并移除 Dock 项；同时观察恢复过程是否出现最大化闪烁。
