@@ -24,9 +24,9 @@ M590Bridge 是局域网双机剪贴板与文件桥：在 A 电脑复制，用罗
 ## 当前阶段
 
 文本 + 图片 + 文件流式已在 Linux↔Windows 实机可用（见 `docs/plans/current.md`）。
-**V2 图片/文件、mDNS、Linux `.deb`/登录自启已完成**；Windows NSIS 已成功打包安装，task-042 的自启/跨机回归待验收；task-044 至 task-051 已完成真机验收（无文件夹/断点续传），task-052 正在接入 Linux FUSE 网络按需流。
+**V2 图片/文件、mDNS、Linux `.deb`/登录自启已完成**；Windows NSIS 已成功打包安装，task-042 的自启/跨机回归待验收；task-044 至 task-053 已完成真机验收（无文件夹/断点续传）。
 原 task-019A（收图落盘捷径）已 **cancelled**。  
-用户已明确暂停 task-042 的剩余验收；task-043 至 task-051 已完成。task-051 已验证 Linux FUSE 单文件在 GNOME Wayland Nautilus 粘贴时惰性读取、显示系统进度且内容一致；task-052 正在把该内容源接入网络 `FileRequest`，不扩展多文件/文件夹，也不复活 019A 或 task-042。
+用户已明确暂停 task-042 的剩余验收；task-043 至 task-053 已完成。task-052 已验证 Linux FUSE 单文件在 GNOME Wayland Nautilus 粘贴时通过网络惰性读取、显示系统进度且内容一致；task-053 已修复 Linux 托盘菜单文字回归。下一步等待用户决定是否恢复 task-042，不扩展多文件/文件夹，也不复活 019A。
 
 ## 产品边界（默认）
 

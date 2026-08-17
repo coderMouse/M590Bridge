@@ -313,19 +313,16 @@ fn run_bridge(
     // Pairing phase: prefer blocking reads with short timeout loops.
     while session.state() != ConnectionState::Connected {
         check_timeout(cfg, started, "pairing")?;
-        match recv_with_idle(conn, Duration::from_millis(200))? {
-            Some(msg) => {
-                println!("{role} rx {}", msg.name());
-                session
-                    .handle(SessionEvent::Message(msg))
-                    .map_err(|e| e.to_string())?;
-                let out = session.take_outbox();
-                for m in &out {
-                    println!("{role} tx {}", m.name());
-                }
-                conn.send_all(out.iter()).map_err(|e| e.to_string())?;
+        if let Some(msg) = recv_with_idle(conn, Duration::from_millis(200))? {
+            println!("{role} rx {}", msg.name());
+            session
+                .handle(SessionEvent::Message(msg))
+                .map_err(|e| e.to_string())?;
+            let out = session.take_outbox();
+            for m in &out {
+                println!("{role} tx {}", m.name());
             }
-            None => {}
+            conn.send_all(out.iter()).map_err(|e| e.to_string())?;
         }
     }
     println!(

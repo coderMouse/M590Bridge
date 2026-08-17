@@ -5,12 +5,6 @@ use std::path::{Path, PathBuf};
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
 
-/// If `text` refers to an existing local image file, decode it to RGBA.
-///
-/// Accepts:
-/// - absolute/relative filesystem paths
-/// - `file://` URIs (single or first line)
-/// - simple multi-line paste where one line is a path/URI
 /// Load the first existing local image among `paths`.
 pub fn image_from_paths(
     paths: &[std::path::PathBuf],
@@ -27,6 +21,13 @@ pub fn image_from_paths(
     Ok(None)
 }
 
+/// If `text` refers to an existing local image file, decode it to RGBA.
+///
+/// Accepts:
+///
+/// - absolute/relative filesystem paths
+/// - `file://` URIs (single or first line)
+/// - simple multi-line paste where one line is a path/URI
 pub fn image_from_clipboard_text(text: &str) -> Result<Option<ImageClipboard>, ClipboardError> {
     for candidate in candidate_paths(text) {
         if !is_likely_image_path(&candidate) {
@@ -199,18 +200,5 @@ mod tests {
     #[test]
     fn ignores_plain_sentence() {
         assert!(image_from_clipboard_text("hello world").unwrap().is_none());
-    }
-
-    #[test]
-    fn loads_user_screenshot_if_present() {
-        let path = PathBuf::from("/home/huang/图片/截图/截图 2026-07-29 17-19-37.png");
-        if !path.is_file() {
-            return;
-        }
-        let img = image_from_clipboard_text(path.to_str().unwrap())
-            .unwrap()
-            .expect("screenshot should decode");
-        assert_eq!((img.width, img.height), (514, 1194));
-        assert_eq!(img.rgba.len(), 514 * 1194 * 4);
     }
 }

@@ -22,6 +22,8 @@ use winreg::{
 };
 
 const HUB_API: &str = "127.0.0.1:5910";
+const TRAY_SHOW_LABEL: &str = "打开主面板";
+const TRAY_QUIT_LABEL: &str = "退出";
 
 #[cfg(target_os = "linux")]
 const AUTOSTART_DESKTOP_FILE: &str = "M590Bridge.desktop";
@@ -538,9 +540,20 @@ pub fn run() {
                 )?;
             }
 
-            // Explicit labels; keep owned items so Linux AppIndicator menu text stays valid.
-            let show_i = MenuItem::with_id(app, "show", "打开主面板", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            // Linux gets an explicit post-attach update below so GNOME cannot cache the
+            // AppIndicator menu's initial empty labels during registration.
+            let initial_show_label = if cfg!(target_os = "linux") {
+                ""
+            } else {
+                TRAY_SHOW_LABEL
+            };
+            let initial_quit_label = if cfg!(target_os = "linux") {
+                ""
+            } else {
+                TRAY_QUIT_LABEL
+            };
+            let show_i = MenuItem::with_id(app, "show", initial_show_label, true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", initial_quit_label, true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
 
             let icon = app
@@ -576,6 +589,15 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            #[cfg(target_os = "linux")]
+            {
+                // AppIndicator registers the attached GTK menu during `build`. Updating
+                // labels afterwards emits DBusMenu property changes as well as leaving
+                // the final layout populated for late subscribers.
+                show_i.set_text(TRAY_SHOW_LABEL)?;
+                quit_i.set_text(TRAY_QUIT_LABEL)?;
+            }
 
             app.manage(TrayState {
                 _tray: tray,

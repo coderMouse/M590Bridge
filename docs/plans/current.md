@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
-> 更新：2026-08-14
-> 阶段：task-052 Linux FUSE 单文件网络按需粘贴开发中；task-042 继续暂停
+> 更新：2026-08-17
+> 阶段：task-053 Linux 托盘菜单文字回归已修复并真机通过；task-042 继续暂停
 
 ## 目标（近期）
 
@@ -41,7 +41,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-049** 配对总超时与断开后单次重连（Linux↔Windows 真机验收通过）
 - [x] **task-050** GNOME Wayland 单文件 URI 剪贴板可行性（`x11-fallback` → Nautilus 真机粘贴与内容校验通过）
 - [x] **task-051** Linux FUSE 单文件按需粘贴原型（惰性读取 + Nautilus 系统进度 + 内容校验，真机通过）
-- [ ] **task-052** Linux FUSE 单文件接入现有网络按需流（开发中）
+- [x] **task-052** Linux FUSE 单文件接入现有网络按需流（Linux↔Windows 真机验收通过）
+- [x] **task-053** Linux 托盘菜单文字回归（GNOME/Wayland 真机复测通过）
 
 ## 进行中 / 暂停
 
@@ -72,17 +73,17 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 文件 offer/request/chunk/complete | 有 |
 | hub 自动落盘 + send_file(_bytes) | 有 |
 | UI 选文件发送 + 进度 + 保存目录 | **有** |
-| 文件夹 / OS 文件剪贴板 | Windows 单文件 Explorer 按需粘贴**有**；Linux FUSE 单文件本机原型**真机通过**，网络接线开发中；无文件夹 |
+| 文件夹 / OS 文件剪贴板 | Windows Explorer 与 Linux FUSE 单文件按需粘贴均已跨机真机通过；无文件夹 |
 | 大文件流式（磁盘流+SHA-256，软上限 8GiB） | **有**（task-033；同连接串行；task-036 已移除固定批次节流和多帧累计误判） |
 | file_list 触发原文件 offer（非图片，路径流式） | **有** |
 | 路径文本（非图片）→ file offer | **有**（task-025） |
 | 发送方 FileComplete → UI done/满进度 | **有**（task-025） |
 | GNOME Wayland 文件管理器复制自动同步 | **受限**（用原生选文件/窗口拖放，task-026/027） |
 | GNOME Wayland 文件 URI 剪贴板发布 | **可行性通过**（task-050；`x11-fallback` 的 `text/uri-list` 可被 Nautilus 粘贴） |
-| Linux FUSE 单文件按需读取 | **本机原型真机通过**（task-051）；task-052 已接入网络有界流，跨机验收待用户执行 |
+| Linux FUSE 单文件按需读取 | **网络按需流真机通过**（task-052；`FileRequest` / 有界流 / `FileCancel`） |
 | UI 拖入/原生选文件发送 | **有**（task-026/027） |
 | UI 自适应桌面窗口 | **有**（task-034；窄屏底栏、宽屏侧栏/双列） |
-| 托盘菜单文案保活 | **有**（task-027） |
+| 托盘菜单文案保活 | **有**（task-053；AppIndicator 挂接后刷新标签，GNOME/Wayland 真机通过） |
 | mDNS 发现（`_m590bridge._tcp`） | **有**（task-029；仍需配对码） |
 | Linux `.deb` 安装包 | **有**（task-032；amd64、未签名） |
 | Linux 用户登录自启 | **有**（task-038/039；正式/standalone 桌面端显式启停，开发壳拒绝开启） |
@@ -93,15 +94,14 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 完成 task-052：Linux FUSE 单文件内容源接入现有网络 `FileRequest` / 有界流 / `FileCancel`
-2. 等待用户决定是否恢复 task-042 剩余的登录自启与跨机回归验收（当前暂停）
-3. （可选）独立文件数据连接 / 更高吞吐调优
-4. （可选）设置页发现开关 / 本机显示名
-5. （可选）多文件并行 / 文件夹
+1. 等待用户决定是否恢复 task-042 剩余的登录自启与跨机回归验收（当前暂停）
+2. （可选）独立文件数据连接 / 更高吞吐调优
+3. （可选）设置页发现开关 / 本机显示名
+4. （可选）多文件并行 / 文件夹
 
-> task-044 至 task-051 均已完成相应真机验收。task-051 证明 Linux FUSE 单文件可在
-> Nautilus 粘贴时惰性读取并显示系统进度；task-052 已完成代码接线，但 FUSE 按需网络流仍待跨机验收。task-042 已确认 NSIS 可生成并安装，
-> 但剩余验收暂停。
+> task-044 至 task-053 均已完成相应真机验收。task-052 已证明 Linux FUSE 单文件可在
+> Nautilus 粘贴时通过网络惰性读取并显示系统进度；task-053 已修复 Linux 托盘文字回归。
+> task-042 已确认 NSIS 可生成并安装，但剩余验收暂停。
 
 ## 用户怎么用
 

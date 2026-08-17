@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`
+`completed`（2026-08-17，Linux↔Windows 真机验收通过）
 
 ## 背景
 
@@ -62,12 +62,12 @@ Linux↔Windows 真机由用户完成：两端运行 `cd ui && npm run desktop:s
 
 ## 完成标准
 
-- [ ] Linux 收到 offer 后只发布 FUSE URI，首次读取前不发 `FileRequest`、不落中间文件。
-- [ ] 首次 FUSE 读取只产生一次请求，网络分片受有界管道背压并由 core 完成完整性校验。
-- [ ] 成功、取消、替换和断线均无挂死；挂载与活动状态可回收。
-- [ ] 自发布 FUSE URI 不回环成新的本机 `FileOffer`，同一远端文件后续可再次复制/粘贴。
-- [ ] Linux 测试、workspace check、严格 Clippy 和 Windows 交叉检查通过。
-- [ ] GNOME Wayland + Nautilus ↔ Windows 真机按需、系统进度、内容和取消验收通过。
+- [x] Linux 收到 offer 后只发布 FUSE URI，首次读取前不发 `FileRequest`、不落中间文件。
+- [x] 首次 FUSE 读取只产生一次请求，网络分片受有界管道背压并由 core 完成完整性校验。
+- [x] 成功、取消、替换和断线均无挂死；挂载与活动状态可回收。
+- [x] 自发布 FUSE URI 不回环成新的本机 `FileOffer`，同一远端文件后续可再次复制/粘贴。
+- [x] Linux 测试、workspace check、严格 Clippy 和 Windows 交叉检查通过。
+- [x] GNOME Wayland + Nautilus ↔ Windows 真机按需、系统进度、内容和取消验收通过。
 
 ## 实施记录
 
@@ -80,6 +80,7 @@ Linux↔Windows 真机由用户完成：两端运行 `cd ui && npm run desktop:s
 - 2026-08-14：Hub Linux 分支收到远端 offer 后仅发布 FUSE URI；首次 FUSE read 才调用
   `request_file_stream`，`FileChunk` 经有界管道进入 FUSE，失败/取消/剪贴板替换/延迟
   offer/断线路径复用 `FileCancel` 和生命周期清理。
+- 2026-08-17：用户确认 Linux↔Windows 真机测试通过，task-052 完成。
 
 ## 修改文件
 
@@ -108,24 +109,21 @@ Linux↔Windows 真机由用户完成：两端运行 `cd ui && npm run desktop:s
 - `cargo clippy -p m590-daemon --lib --examples --no-deps -- -D warnings`：通过。
 - `CARGO_HOME=<临时可写缓存> cargo check -p m590-daemon --target x86_64-pc-windows-gnu --examples`：
   通过；Linux-only manager/FUSE 未进入 Windows target。
-- GNOME Wayland + Nautilus ↔ Windows 真机：待用户执行，当前不能标记完成。
+- GNOME Wayland + Nautilus ↔ Windows 真机：用户于 2026-08-17 确认测试通过。
 
 ## 文档影响检查
 
 - 已更新：`docs/plans/current.md`、`AGENTS.md`、`docs/discovery/commands.md`、
-  `docs/discovery/project-map.md`、`项目说明.md`。
+  `docs/discovery/project-map.md`、`项目说明.md`；真机结果同步到本 task、当前计划、
+  命令文档、`AGENTS.md` 与`项目说明.md`。
 - 无需更新：协议草案、`m590-core`、`m590-net`、UI/Tauri API 和 Windows OLE 行为未改变。
-- 待补：真机通过后将本 task、计划能力表和命令文档的“待验收”改为完成事实。
 
 ## 风险 / blocker
 
-- Codex 执行沙箱没有 `/dev/fuse`，可完成单元/编译检查，但 GNOME Wayland + Nautilus
-  真实挂载与跨机行为必须由用户真机验收。
 - 网络流只支持顺序读取；如 Nautilus 对同一文件发出无法满足的回退 seek，本 task 需记录
   真实 offset 序列并在单文件边界内处理，不能假定与 task-051 本地可 seek 源完全一致。
-- 当前没有 `/dev/fuse` 的执行沙箱无法运行真实挂载；这不是代码检查失败，但不能替代用户
-  GNOME Wayland + Nautilus 跨机验收。
+- 当前执行沙箱仍没有 `/dev/fuse`，但用户真机验收已补足该覆盖，不再构成 task blocker。
 
 ## 下一步
 
-- 用户在 Linux↔Windows 真机按 task-052 步骤验收按需请求、系统进度、取消、替换、断线和同一文件再次复制。
+- task-052 已完成；转入 task-053，修复 Linux 托盘菜单文字回归。

@@ -361,15 +361,16 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("m590-cfg-{nanos}.cfg"));
-        let mut cfg = AppConfig::default();
-        cfg.device_id = "dev-stable".into();
-        cfg.last_role = Some("joiner".into());
-        cfg.pairing_code = Some("654321".into());
-        cfg.listen_port = 5902;
-        cfg.connect_addr = Some("192.168.1.10:5901".into());
-        cfg.auto_sync = false;
-        cfg.auto_reconnect = true;
-        cfg.file_save_dir = "/tmp/m590-inbox-test".into();
+        let cfg = AppConfig {
+            device_id: "dev-stable".into(),
+            last_role: Some("joiner".into()),
+            pairing_code: Some("654321".into()),
+            listen_port: 5902,
+            connect_addr: Some("192.168.1.10:5901".into()),
+            auto_sync: false,
+            auto_reconnect: true,
+            file_save_dir: "/tmp/m590-inbox-test".into(),
+        };
         save_config_to(&path, &cfg).expect("save");
         let loaded = load_config_from(&path);
         let _ = fs::remove_file(&path);

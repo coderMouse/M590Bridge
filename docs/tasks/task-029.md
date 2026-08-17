@@ -97,7 +97,7 @@ cd ui && npm run build
 双 hub 实机（本机 2026-08-05）：
   host :15910 listen port 15901 device_id=smoke-host
   joiner :15911 GET /api/discover ~1.5s 后：
-    peers=[{device_id:smoke-host, addr:192.168.100.108:15901, ...}]
+    peers=[{device_id:smoke-host, addr:192.168.x.x:15901, ...}]
   host advertising true → disconnect 后 advertising false
 ```
 

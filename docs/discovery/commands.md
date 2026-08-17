@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-14（task-052 开发中）
+> 更新日期：2026-08-17（task-052、task-053 真机完成）
 
 ## 桌面（推荐）
 
@@ -136,9 +136,10 @@ cargo run -p m590-daemon --example linux_virtual_file -- 67108864 4 ~/M590Bridge
 开始读取并显示系统原生进度框，64 MiB 模式文件最终内容校验一致。当前机器的 `/tmp` 有独立
 配额限制，粘贴测试目标应放在用户主目录。
 
-### Linux FUSE 网络按需粘贴（task-052，开发中）
+### Linux FUSE 网络按需粘贴（task-052，真机已通过）
 
-task-052 将 Linux 单文件 FUSE 内容源接入现有 `FileRequest` / 有界管道 / `FileCancel`；
+task-052 将 Linux 单文件 FUSE 内容源接入现有 `FileRequest` / 有界管道 / `FileCancel`，
+Linux↔Windows 真机已通过；
 本机可运行以下检查：
 
 ```bash
@@ -184,8 +185,8 @@ cargo run -p m590-clipboard --example set_file_and_read -- /path/to/test-file
 输出的 `publisher_backend` 是 `wayland-data-control`、`x11-fallback` 或 `x11`；
 `readback_matches=true` 只代表发布后自读成功，不代替 Nautilus 真机粘贴。
 当前 GNOME Wayland 真机已验证：`publisher_backend=x11-fallback` 时 Nautilus 可粘贴，
-且源/目标文件 `cmp` 一致。task-051 已进一步完成 FUSE 本机惰性读取真机验收；task-052
-已开始接入网络桥接，跨机真机仍待验收。
+且源/目标文件 `cmp` 一致。task-051 已完成 FUSE 本机惰性读取真机验收；task-052
+进一步完成网络按需桥接与跨机真机验收。
 
 ## 已验证能力
 
@@ -194,7 +195,8 @@ cargo run -p m590-clipboard --example set_file_and_read -- /path/to/test-file
 - 复制图片**文件**：可提升为图片同步（非传原文件字节流）  
 - 发大图：TCP 写满帧，避免 EAGAIN 误判断线  
 - 文件：`FileOffer/Request/Chunk/Complete` + 路径流式 + SHA-256 + hub 落盘 + UI 发送/进度（软上限 8GiB；`send_file_bytes` 仍限内存）
-- Linux FUSE：单文件本机惰性读取、Nautilus 系统进度和内容校验已真机通过（task-051）；task-052 网络 `FileRequest` 接线开发中，尚未完成跨机验收
+- Linux FUSE：单文件网络惰性读取、Nautilus 系统进度、内容和取消已跨机真机通过（task-052）
+- Linux 托盘：AppIndicator 菜单挂接后刷新标签，GNOME/Wayland“打开主面板 / 退出”真机通过（task-053）
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
 - **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart；正式/standalone 桌面端可用，开发壳拒绝开启（task-038/039）
@@ -246,7 +248,6 @@ UI 加入页「局域网设备」旁有刷新图标。
 ## 未做
 
 - 文件夹 / 端到端 OS 文件剪贴板 / 断点续传 / 独立数据连接
-- Linux FUSE 网络按需粘贴（task-052 开发中，GNOME Wayland + Windows 真机待验收）
 - Windows 登录自启、卸载清理与跨机回归真机验收（task-042）
 - 设置页「发现方式」开关  
 - （已取消）019A  

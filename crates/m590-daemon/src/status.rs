@@ -247,14 +247,16 @@ mod tests {
 
     #[test]
     fn status_json_includes_file_fields() {
-        let mut s = HubStatus::default();
-        s.file_save_dir = "/tmp/inbox".into();
-        s.file_transfer_phase = Some("done".into());
-        s.last_file_name = Some("a.txt".into());
-        s.last_file_bytes = Some(3);
-        s.last_file_saved_path = Some("/tmp/inbox/a.txt".into());
-        s.file_bytes_received = Some(3);
-        s.file_bytes_total = Some(3);
+        let s = HubStatus {
+            file_save_dir: "/tmp/inbox".into(),
+            file_transfer_phase: Some("done".into()),
+            last_file_name: Some("a.txt".into()),
+            last_file_bytes: Some(3),
+            last_file_saved_path: Some("/tmp/inbox/a.txt".into()),
+            file_bytes_received: Some(3),
+            file_bytes_total: Some(3),
+            ..HubStatus::default()
+        };
         let json = s.to_json();
         assert!(json.contains("file_save_dir"), "{json}");
         assert!(json.contains("/tmp/inbox"), "{json}");
