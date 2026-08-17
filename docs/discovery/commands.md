@@ -45,7 +45,8 @@ sudo apt-get install -y \
 ```
 
 脚本会检查 Linux 基础命令与 GTK/WebKitGTK/AppIndicator 开发库，执行 `npm ci` 和 Tauri
-`.deb` 构建，成功后打印实际产物路径。检查与安装仍按需执行：
+`.deb` 构建，成功后打印实际产物路径。打包不需要 root 权限；若误用 `sudo`，脚本会
+切回发起用户环境，避免 `secure_path` 隐藏用户级 Node.js。检查与安装仍按需执行：
 
 ```bash
 dpkg-deb --info target/release/bundle/deb/M590Bridge_*_amd64.deb
@@ -75,8 +76,9 @@ Windows 构建机需要 Node.js 22 LTS、Rust stable MSVC、Visual Studio Build 
 ```
 
 脚本会检查 Node.js、Cargo 与 Windows MSVC Rust host，执行 `npm ci` 和 Tauri NSIS 构建，
-成功后打印实际 `.exe` 路径。`npm run build` 已由 Tauri 的 `beforeBuildCommand` 自动执行；
-Rust 测试、注册表检查和跨机回归属于完整验收，不需要每次打包手工重复输入。
+成功后打印实际 `.exe` 路径；成功或异常时均等待按键后退出。`npm run build` 已由 Tauri 的
+`beforeBuildCommand` 自动执行；Rust 测试、注册表检查和跨机回归属于完整验收，不需要
+每次打包手工重复输入。
 
 - NSIS 为当前用户安装，不要求管理员权限；产物未签名，SmartScreen 可能提示未知发布者。
 - 设置页开关读写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `M590Bridge` 值。

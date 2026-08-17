@@ -54,8 +54,8 @@ Get-ChildItem .\target\release\bundle\nsis\*.exe
 ## 完成标准
 
 - [x] Linux 脚本能在当前受支持的 Linux 构建机生成 `.deb`，失败时返回非零状态。
-- [x] Windows 脚本使用仓库相对位置、失败时返回非零状态；Windows 产物生成待构建机执行确认。
-- [x] 两个脚本均实现成功后打印实际安装包路径、未找到产物时明确失败；Linux 已实测输出。
+- [x] Windows 脚本使用仓库相对位置、失败时返回非零状态；用户已确认 Windows 构建机正常生成产物。
+- [x] 两个脚本均实现成功后打印实际安装包路径、未找到产物时明确失败；两端均已有对应构建机确认。
 - [x] 命令文档与 UI README 把日常打包入口缩减为每个平台一条命令。
 - [x] 当前环境无法覆盖的 Windows 执行验证已如实记录。
 
@@ -64,11 +64,13 @@ Get-ChildItem .\target\release\bundle\nsis\*.exe
 - 2026-08-17：建立独立任务；确认 Tauri `beforeBuildCommand` 已包含 `npm run build`，一键脚本无需重复执行前端构建命令。
 - 2026-08-17：新增 `package-linux.sh` 和 `package-windows.ps1`。脚本均按自身位置解析仓库路径，执行锁定依赖安装、现有 Tauri 打包入口，并在找不到产物时以非零状态失败。
 - 2026-08-17：Linux 脚本增加 GTK、WebKitGTK、Ayatana AppIndicator 的 `pkg-config` 预检；缺少开发库时直接打印 Ubuntu 安装提示，不自动修改系统环境。
+- 2026-08-17：修复 Linux 通过 `sudo` 启动时因 `secure_path` 隐藏用户级 Node.js 的误报；脚本会切回 `SUDO_USER` 的登录环境执行，避免 root 所有的构建产物。
+- 2026-08-17：Windows 脚本成功打印 NSIS 产物或捕获异常后，均等待任意按键再退出，便于双击脚本时查看路径和错误。
 
 ## 修改文件
 
-- `ui/scripts/package-linux.sh`：Linux 环境预检、`npm ci`、`.deb` 构建和产物输出。
-- `ui/scripts/package-windows.ps1`：Windows/MSVC 环境预检、`npm ci`、NSIS 构建和产物输出。
+- `ui/scripts/package-linux.sh`：Linux 环境预检、`sudo` 原始用户切回、`npm ci`、`.deb` 构建和产物输出。
+- `ui/scripts/package-windows.ps1`：Windows/MSVC 环境预检、`npm ci`、NSIS 构建、产物输出及成功/异常按键暂停。
 - `ui/README.md`：增加两端脚本入口及脚本职责说明。
 - `docs/discovery/commands.md`：将日常打包命令收敛为每个平台一条，并保留可选检查/安装命令。
 - `docs/discovery/project-map.md`：登记两个打包脚本。
@@ -77,24 +79,28 @@ Get-ChildItem .\target\release\bundle\nsis\*.exe
 
 ## 验证结果
 
-- `bash -n ui/scripts/package-linux.sh`：通过。
+- `bash -n ui/scripts/package-linux.sh`：通过（含 `sudo` 用户切回逻辑的 shell 语法检查）。
 - `./ui/scripts/package-linux.sh`：通过；脚本完成 `npm ci`（50 个包，0 vulnerabilities）、Tauri 前端 production build、Rust release 构建和 `.deb` bundle，生成 `target/release/bundle/deb/M590Bridge_0.1.0_amd64.deb` 并打印绝对路径。
+- `(cd ui/scripts && ./package-linux.sh)`：通过；从用户反馈中的脚本目录直接执行同样生成上述 `.deb`，无需 `sudo`。
 - `dpkg-deb --info target/release/bundle/deb/M590Bridge_0.1.0_amd64.deb`：通过；包名 `m590-bridge`、版本 `0.1.0`、架构 `amd64`、section `utils`，运行时依赖可见。
 - `dpkg-deb --contents target/release/bundle/deb/M590Bridge_0.1.0_amd64.deb`：通过；包含 `/usr/bin/m590-ui`、`M590Bridge.desktop` 和多尺寸图标。
 - `npm run lint`：通过。
 - `git diff --check`：通过。
-- `package-windows.ps1`：当前 Linux 环境未执行；没有 PowerShell、Windows MSVC 或 NSIS，不能替代 Windows 真机验证。
+- `.\ui\scripts\package-windows.ps1`：用户确认在 Windows 构建机打包正常，窗口能显示 NSIS 产物路径；本次新增的成功/异常暂停逻辑需在 Windows PowerShell 双击或终端执行确认。
+- `sudo -n true`：当前受限环境因 no-new-privileges 被拒绝，无法在本机模拟真实 `sudo` 用户切回；普通用户路径已通过完整 Linux 打包验证。
 
 ## 文档影响检查
 
-- 已更新：`ui/README.md`、`docs/discovery/commands.md`、`docs/discovery/project-map.md`、`docs/plans/current.md`、`AGENTS.md`。
+- 已更新：`ui/README.md`、`docs/discovery/commands.md`、`docs/plans/current.md`、`AGENTS.md`、`docs/tasks/task-054.md`。
+- 无需更新：`docs/discovery/project-map.md` 的脚本位置和职责未改变。
 - 无需更新：协议、Hub API、UI 规格、Tauri bundle 配置和 `项目说明.md` 均未改变。
 - 待补：在 Windows 构建机执行脚本后补充实际 NSIS 文件名与退出结果。
 
 ## 风险 / blocker
 
-- 当前环境为 Linux，不能将 Windows PowerShell / MSVC / NSIS 构建记为真机通过；需记录可复现命令和实际未覆盖项。
+- 当前环境为 Linux，不能在本机复验 Windows PowerShell 的新增按键暂停；Windows NSIS 构建本身已有用户真机确认。
+- 当前执行环境禁止提权，Linux 的 `sudo` → `SUDO_USER` 切回分支需由用户在真实 Ubuntu 终端复测；普通用户一键打包已真实通过。
 
 ## 下一步
 
-- 在 Windows 10 构建机从仓库根目录执行 `.\ui\scripts\package-windows.ps1`，确认 NSIS `.exe` 路径输出；在此之前保持 task-042 的自启/卸载/跨机验收暂停状态。
+- 在 Windows 10 构建机从仓库根目录执行 `.\ui\scripts\package-windows.ps1`，确认 NSIS `.exe` 路径输出和成功/异常后的按键暂停；在此之前保持 task-042 的自启/卸载/跨机验收暂停状态。

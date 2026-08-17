@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-17
-> 阶段：task-054 Linux 一键打包已生成实包；Windows 一键脚本待 Windows 构建机验证；task-042 继续暂停
+> 阶段：task-054 Linux / Windows 一键打包均已生成实包；Windows 按键暂停交互待复测；task-042 继续暂停
 
 ## 目标（近期）
 
@@ -50,7 +50,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
 - [ ] **task-042** Windows NSIS 安装包 / 用户登录自启（NSIS 已成功打包安装；登录自启、卸载清理与跨机回归待验收）
-- [ ] **task-054** Linux / Windows 一键打包脚本（Linux `.deb` 已真实通过；Windows PowerShell 脚本待 Windows 构建机执行）
+- [ ] **task-054** Linux / Windows 一键打包脚本（两端均已真实生成安装包；Windows 成功/异常后的按键暂停待复测）
 
 ## 产品分期对照
 
@@ -90,13 +90,13 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | Linux 用户登录自启 | **有**（task-038/039；正式/standalone 桌面端显式启停，开发壳拒绝开启） |
 | Windows NSIS 安装包 | **已成功打包安装**（task-042；当前用户安装、未签名；功能回归待验收） |
 | Windows 用户登录自启 | **待真机验收**（task-042；HKCU Run、开发壳拒绝开启、卸载清理） |
-| 一键本地打包 | **Linux 已验证，Windows 脚本待执行**（task-054；脚本负责环境检查、`npm ci`、Tauri 打包和产物路径输出） |
+| 一键本地打包 | **Linux / Windows 均已验证生成实包**（task-054；脚本负责环境检查、`npm ci`、Tauri 打包和产物路径输出；Windows 按键暂停待复测） |
 | localhost Hub API 鉴权 | **有**（task-035；进程临时令牌 + 限定 CORS） |
 | 设置「发现方式」开关 | 无（默认开启 browse） |
 
 ## 下一步（有序）
 
-1. 在 Windows 构建机执行 task-054 一键脚本，确认 NSIS `.exe` 产物路径输出
+1. 在 Windows 构建机复测 task-054 一键脚本，确认成功和异常时均等待按键后退出
 2. 等待用户决定是否恢复 task-042 剩余的登录自启与跨机回归验收（当前暂停）
 3. （可选）独立文件数据连接 / 更高吞吐调优
 4. （可选）设置页发现开关 / 本机显示名

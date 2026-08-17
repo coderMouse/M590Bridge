@@ -73,8 +73,10 @@ sudo apt-get install -y \
 ./ui/scripts/package-linux.sh
 ```
 
-脚本会检查基础命令和 Linux Tauri/AppIndicator 开发库、执行 `npm ci` 与 Tauri 打包，并在
-成功后打印实际 `.deb` 路径。
+打包本身不需要 root 权限，推荐使用普通用户执行。脚本会检查基础命令和 Linux
+Tauri/AppIndicator 开发库、执行 `npm ci` 与 Tauri 打包，并在成功后打印实际 `.deb` 路径。
+如果误用 `sudo ./ui/scripts/package-linux.sh`，脚本会切回发起 `sudo` 的用户环境，避免
+`sudo` 的 `secure_path` 隐藏 nvm 中的 `node`，也避免生成 root 所有的构建文件。
 
 产物位于仓库根目录的
 `target/release/bundle/deb/M590Bridge_<version>_amd64.deb`。可先检查，再安装或卸载：
@@ -98,8 +100,9 @@ sudo apt remove m590-bridge
 ```
 
 脚本会检查 Node.js、Cargo 与 Windows MSVC Rust host、执行 `npm ci` 与 Tauri NSIS 打包，
-并在成功后打印实际 `.exe` 路径。Tauri 会通过 `beforeBuildCommand` 自动完成前端构建；
-完整 Rust 测试和 Windows 运行验收见 `docs/tasks/task-042.md`。
+并在成功后打印实际 `.exe` 路径；成功或异常时都会等待按键后退出，便于从新窗口运行时
+查看结果。Tauri 会通过 `beforeBuildCommand` 自动完成前端构建；完整 Rust 测试和 Windows
+运行验收见 `docs/tasks/task-042.md`。
 
 安装包采用当前用户模式，不要求管理员权限。设置页「登录时自动启动」写入 HKCU Run；
 关闭开关或卸载会删除 `M590Bridge` 值。安装包当前未签名，SmartScreen 可能提示未知

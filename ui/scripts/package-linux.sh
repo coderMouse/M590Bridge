@@ -11,11 +11,29 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "缺少命令 '$1'。请先安装 Ubuntu 打包依赖，详见 ui/README.md。"
 }
 
+script_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+
+# 构建过程不需要 root 权限。使用 `sudo ./package-linux.sh` 时，sudo 的
+# secure_path 往往会隐藏 nvm/rustup 中的用户级 node、npm 和 cargo，导致
+# 预检误报缺少 node。切回发起 sudo 的用户，并让其登录 shell 恢复完整 PATH，
+# 同时避免在仓库里生成 root 所有的 node_modules/target 文件。
+if (( EUID == 0 )); then
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    command -v sudo >/dev/null 2>&1 || fail "检测到 root 且找不到 sudo，请切换普通用户运行打包脚本。"
+    printf '检测到 sudo，改用用户 %s 执行打包（构建无需 root 权限）……\n' "$SUDO_USER"
+    if ! exec sudo -u "$SUDO_USER" -H bash -lc 'exec "$0" "$@"' "$script_path" "$@"; then
+      fail "无法切换回用户 '$SUDO_USER' 执行打包。"
+    fi
+  fi
+
+  fail "打包不需要 root 权限，请使用普通用户直接运行 ./ui/scripts/package-linux.sh。"
+fi
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   fail "package-linux.sh 只能在 Linux 构建机上运行。"
 fi
 
-script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+script_directory="$(dirname -- "$script_path")"
 ui_directory="$(cd -- "$script_directory/.." && pwd)"
 repository_directory="$(cd -- "$ui_directory/.." && pwd)"
 
