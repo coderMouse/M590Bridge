@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（Windows 10 已成功打包并安装；用户暂缓登录自启与跨机回归验收）
+`completed`
 
 ## 目标
 
@@ -65,9 +65,9 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge
 - [x] NSIS 配置为当前用户安装，卸载 hook 清理 Run 值。
 - [x] Linux 可执行的 Rust/前端/release 验证通过。
 - [x] Windows 10 真机成功生成并安装 NSIS `.exe`（用户于 2026-08-11 确认）。
-- [ ] 开启后注销/重新登录只启动一个 M590Bridge，托盘和内嵌 Hub 正常。
-- [ ] 关闭后 Run 值消失，重新登录不启动；卸载后 Run 值也不存在。
-- [ ] Windows 安装版与 Linux 完成文本、图片、文件回归。
+- [x] 开启后注销/重新登录只启动一个 M590Bridge，托盘和内嵌 Hub 正常。
+- [x] 关闭后 Run 值消失，重新登录不启动；卸载后 Run 值也不存在。
+- [x] Windows 安装版与 Linux 完成文本、图片、文件回归。
 
 ## 实施记录
 
@@ -75,6 +75,7 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge
 - 读取开关时同时校验注册表命令是否仍指向当前 EXE，旧安装路径不会被误报为已开启。
 - NSIS 使用 WebView2 download bootstrapper 和当前用户安装模式。
 - 未添加 GitHub Actions；Windows 真机按文档本地构建。
+- 2026-08-17：用户确认 Windows 10 真机完成登录自启、关闭后清理、卸载清理与 Linux↔Windows 文本/图片/文件回归，未发现问题。
 
 ## 修改文件
 
@@ -97,7 +98,7 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge
 - `cargo build -p m590-ui --release --features custom-protocol`：通过。
 - `cargo check -p m590-ui --target x86_64-pc-windows-gnu --features custom-protocol`：首次因全局 Cargo cache 只读失败；改用 `/tmp` 独立 cache 后已编译 Windows 依赖和 `winreg`，最终被缺少 `x86_64-w64-mingw32-windres` 的 Tauri 资源构建步骤阻塞。未将其记为 Windows 构建通过。
 - Windows NSIS 打包与安装：用户于 2026-08-11 确认通过。
-- Windows 登录自启、卸载清理与跨机回归：尚未反馈，保持待验收。
+- Windows 登录自启、卸载清理与跨机回归：用户于 2026-08-17 确认真机通过，无问题反馈。
 
 ## 文档影响检查
 
@@ -106,7 +107,6 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge
 
 ## 风险 / blocker
 
-- 当前 Linux 环境没有 Windows MSVC、Visual Studio Build Tools、NSIS 与可交互 Windows 会话，不能在本机声明 Windows 安装/自启通过。
 - Windows GNU 静态检查被缺少 `x86_64-w64-mingw32-windres` 阻塞；正式目标仍应在 Windows 上使用 MSVC 构建。
 - 安装包未签名，Windows SmartScreen 可能提示未知发布者；签名明确不在本 task。
 - WebView2 使用下载引导器；缺少 WebView2 的机器安装时需要网络。
@@ -123,4 +123,4 @@ reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge
 
 ## 下一步
 
-- 用户已明确暂缓本 task；后续恢复时从登录自启、卸载清理与跨机回归继续。
+- task-042 已完成；若要扩展文件能力，应另建多文件/文件夹语义与协议设计 task，不直接在本 task 上扩展。

@@ -66,7 +66,7 @@ sudo apt remove m590-bridge
 - 若旧入口已指向 `target/debug/m590-ui`，先关闭开关（或删除该入口），再从正式/standalone 桌面端重新开启。
 - 关闭开关会删除入口。`apt remove` 不会也不应遍历各用户主目录；卸载前先关闭开关，或卸载后手工删除上述文件。
 
-### Windows NSIS / 用户登录自启（task-042，NSIS 已打包安装、自启待验收）
+### Windows NSIS / 用户登录自启（task-042，真机验收通过）
 
 Windows 构建机需要 Node.js 22 LTS、Rust stable MSVC、Visual Studio Build Tools 2022
 （Desktop development with C++ + Windows SDK）。从仓库根目录执行：
@@ -84,7 +84,7 @@ Windows 构建机需要 Node.js 22 LTS、Rust stable MSVC、Visual Studio Build 
 - 设置页开关读写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `M590Bridge` 值。
 - 开启后可用 `reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v M590Bridge` 检查；关闭或卸载后该值应不存在。
 - 依赖 Vite 的开发壳拒绝开启自启；必须用安装版或 release/standalone。
-- 用户已确认 Windows `.exe` 可生成并安装；当前 Linux 环境不能复验。注销登录自启、关闭/卸载清理和跨机回归仍需 Windows 真机确认。
+- 用户已在 Windows 真机确认 `.exe` 生成、安装、登录自启、关闭/卸载清理和与 Linux 跨机回归通过。安装包仍未签名，SmartScreen 可能提示未知发布者。
 
 ### Windows OLE 虚拟文件原型（task-043，Explorer 真机已通过）
 
@@ -204,8 +204,8 @@ cargo run -p m590-clipboard --example set_file_and_read -- /path/to/test-file
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
 - **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart；正式/standalone 桌面端可用，开发壳拒绝开启（task-038/039）
-- **Windows NSIS/登录自启**：当前用户 NSIS 已成功打包安装；HKCU Run + 卸载清理代码已实现，运行行为待 Windows 10 真机验证（task-042）
-- **Windows OLE 虚拟文件**：单文件 `FILEDESCRIPTORW` + 延迟 `IStream` 已接入 `FileRequest`，由网络有界管道供给；task-044 的 Windows↔Linux 端到端仍待用户真机验收
+- **Windows NSIS/登录自启**：当前用户 NSIS、HKCU Run、卸载清理和 Windows↔Linux 回归均已真机验收通过（task-042）
+- **Windows OLE 虚拟文件**：单文件 `FILEDESCRIPTORW` + 延迟 `IStream` 已接入 `FileRequest`，由网络有界管道供给；task-044 的 Windows↔Linux 端到端已真机验收通过
 
 ## 文件 API（task-021+）
 
@@ -252,7 +252,7 @@ UI 加入页「局域网设备」旁有刷新图标。
 ## 未做
 
 - 文件夹 / 端到端 OS 文件剪贴板 / 断点续传 / 独立数据连接
-- Windows 登录自启、卸载清理与跨机回归真机验收（task-042）
+- 多文件/文件夹和断点续传仍不在当前能力范围；需另建设计任务
 - 设置页「发现方式」开关  
 - （已取消）019A  
 
