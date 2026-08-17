@@ -1,7 +1,7 @@
 # 项目结构图 · M590Bridge
 
 > 更新日期：2026-08-17
-> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-054 正在补齐两端一键打包入口
+> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-054 两端一键打包已完成验收
 
 ```text
 crates/

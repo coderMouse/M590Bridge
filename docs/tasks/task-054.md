@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`
+`completed`
 
 ## 背景
 
@@ -21,6 +21,7 @@
 
 - `ui/scripts/package-linux.sh`
 - `ui/scripts/package-windows.ps1`
+- `ui/package-lock.json`
 - `ui/README.md`
 - `docs/discovery/commands.md`
 - `docs/discovery/project-map.md`
@@ -66,11 +67,14 @@ Get-ChildItem .\target\release\bundle\nsis\*.exe
 - 2026-08-17：Linux 脚本增加 GTK、WebKitGTK、Ayatana AppIndicator 的 `pkg-config` 预检；缺少开发库时直接打印 Ubuntu 安装提示，不自动修改系统环境。
 - 2026-08-17：修复 Linux 通过 `sudo` 启动时因 `secure_path` 隐藏用户级 Node.js 的误报；脚本会切回 `SUDO_USER` 的登录环境执行，避免 root 所有的构建产物。
 - 2026-08-17：Windows 脚本成功打印 NSIS 产物或捕获异常后，均等待任意按键再退出，便于双击脚本时查看路径和错误。
+- 2026-08-17：用户在 Windows 10 构建机完成成功与异常两条路径复测；产物路径可见，两种结果都会等待按键后按原退出码结束。
+- 2026-08-17：提交前在远端 lockfile 复现出 `nanoid <3.3.18` 导致的 5 个 high audit 告警；仅将传递依赖 `nanoid` 由 3.3.17 升到 3.3.18，不改 `package.json`，复验归零。
 
 ## 修改文件
 
 - `ui/scripts/package-linux.sh`：Linux 环境预检、`sudo` 原始用户切回、`npm ci`、`.deb` 构建和产物输出。
 - `ui/scripts/package-windows.ps1`：Windows/MSVC 环境预检、`npm ci`、NSIS 构建、产物输出及成功/异常按键暂停。
+- `ui/package-lock.json`：锁定已修复 high audit 告警的 `nanoid 3.3.18` 传递依赖。
 - `ui/README.md`：增加两端脚本入口及脚本职责说明。
 - `docs/discovery/commands.md`：将日常打包命令收敛为每个平台一条，并保留可选检查/安装命令。
 - `docs/discovery/project-map.md`：登记两个打包脚本。
@@ -85,22 +89,24 @@ Get-ChildItem .\target\release\bundle\nsis\*.exe
 - `dpkg-deb --info target/release/bundle/deb/M590Bridge_0.1.0_amd64.deb`：通过；包名 `m590-bridge`、版本 `0.1.0`、架构 `amd64`、section `utils`，运行时依赖可见。
 - `dpkg-deb --contents target/release/bundle/deb/M590Bridge_0.1.0_amd64.deb`：通过；包含 `/usr/bin/m590-ui`、`M590Bridge.desktop` 和多尺寸图标。
 - `npm run lint`：通过。
+- `npm run build`：通过；TypeScript 与 Vite production build 成功，输出 `dist/` 产物。
+- `npm audit --json`：通过；`info/low/moderate/high/critical/total` 均为 0。
+- `cargo test --workspace`：通过；130 个单元测试全部通过，doc-tests 无失败。
+- `cargo clippy --workspace --all-targets --no-deps -- -D warnings`：通过，无 warning。
+- `cargo fmt --all -- --check`：通过。
 - `git diff --check`：通过。
-- `.\ui\scripts\package-windows.ps1`：用户确认在 Windows 构建机打包正常，窗口能显示 NSIS 产物路径；本次新增的成功/异常暂停逻辑需在 Windows PowerShell 双击或终端执行确认。
+- `.\ui\scripts\package-windows.ps1`：通过；用户在 Windows 10 构建机确认 NSIS 产物路径正常显示，成功和异常后均等待按键，并分别保留成功/失败退出状态。
 - `sudo -n true`：当前受限环境因 no-new-privileges 被拒绝，无法在本机模拟真实 `sudo` 用户切回；普通用户路径已通过完整 Linux 打包验证。
 
 ## 文档影响检查
 
-- 已更新：`ui/README.md`、`docs/discovery/commands.md`、`docs/plans/current.md`、`AGENTS.md`、`docs/tasks/task-054.md`。
-- 无需更新：`docs/discovery/project-map.md` 的脚本位置和职责未改变。
+- 已更新：`ui/README.md`、`docs/discovery/commands.md`、`docs/discovery/project-map.md`、`docs/plans/current.md`、`AGENTS.md`、`docs/tasks/task-054.md`。
 - 无需更新：协议、Hub API、UI 规格、Tauri bundle 配置和 `项目说明.md` 均未改变。
-- 待补：在 Windows 构建机执行脚本后补充实际 NSIS 文件名与退出结果。
 
 ## 风险 / blocker
 
-- 当前环境为 Linux，不能在本机复验 Windows PowerShell 的新增按键暂停；Windows NSIS 构建本身已有用户真机确认。
 - 当前执行环境禁止提权，Linux 的 `sudo` → `SUDO_USER` 切回分支需由用户在真实 Ubuntu 终端复测；普通用户一键打包已真实通过。
 
 ## 下一步
 
-- 在 Windows 10 构建机从仓库根目录执行 `.\ui\scripts\package-windows.ps1`，确认 NSIS `.exe` 路径输出和成功/异常后的按键暂停；在此之前保持 task-042 的自启/卸载/跨机验收暂停状态。
+- task-054 已完成。task-042 继续按用户决定暂停；若不恢复该验收，下一个独立任务建议先对文件数据与控制消息共用单连接的性能影响做定量基线，再决定是否实现独立文件数据连接。
