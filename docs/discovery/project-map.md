@@ -1,17 +1,17 @@
 # 项目结构图 · M590Bridge
 
 > 更新日期：2026-08-17
-> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-054 两端一键打包已完成验收
+> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-055 批次协议基础已完成
 
 ```text
 crates/
-  m590-core/       # 协议 v3、Message File*、FileCancel、Session 磁盘/流式收发/SHA-256
+  m590-core/       # 协议 v3、Message File*/FileBatchOffer、批次路径校验、Session 单文件收发/SHA-256
   m590-clipboard/  # 文本/图片/file_list；Linux URI 探针；Windows 单文件 OLE 虚拟剪贴板
     examples/set_file_and_read.rs   # Linux text/uri-list 发布与 Nautilus 真机探针
     src/virtual_file.rs          # 安全文件名、大小、惰性且可重复打开的内容工厂
     src/windows_virtual_file.rs  # IDataObject / FILEDESCRIPTORW / 延迟 IStream / STA guard
     examples/windows_virtual_file.rs # Windows Explorer 真机原型
-  m590-net/        # 帧 1..15、版本拒绝、TCP
+  m590-net/        # 帧 1..16、版本拒绝、批次清单字段校验、TCP
   m590-daemon/     # hub：临时令牌/CORS、send_file、无覆盖落盘、status、mDNS
     src/linux_virtual_file.rs             # Linux-only 单文件 FUSE 元数据/惰性读取与句柄回收
     src/linux_virtual_file_manager.rs     # Linux FUSE 挂载、文件 URI 发布与生命周期
@@ -32,6 +32,6 @@ ui/
       installer-hooks.nsh # NSIS 卸载清理当前用户 Run 值
 docs/
   plans/current.md
-  tasks/           # ..054
+  tasks/           # ..058
   domain/          # 协议草案
 ```

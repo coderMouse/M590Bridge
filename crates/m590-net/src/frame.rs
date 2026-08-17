@@ -9,9 +9,11 @@
 //! - payload: type-specific fields (strings = u32 BE len + UTF-8 bytes; u64 = BE)
 
 use m590_core::{
-    ClipboardImagePayload, ClipboardTextPayload, DeviceId, FileCancelPayload, FileChunkPayload,
-    FileCompletePayload, FileOfferPayload, FileRequestPayload, ImageEncoding, Message,
-    MAX_FILE_CHUNK_BYTES, MAX_INLINE_IMAGE_BYTES, PROTOCOL_VERSION,
+    BatchEntry, BatchEntryKind, ClipboardImagePayload, ClipboardTextPayload, DeviceId,
+    FileBatchOfferPayload, FileCancelPayload, FileChunkPayload, FileCompletePayload,
+    FileOfferPayload, FileRequestPayload, ImageEncoding, Message, MAX_BATCH_DISPLAY_NAME_BYTES,
+    MAX_BATCH_ENTRIES, MAX_BATCH_ENTRY_ID_BYTES, MAX_BATCH_ID_BYTES, MAX_BATCH_MANIFEST_BYTES,
+    MAX_BATCH_PATH_BYTES, MAX_FILE_CHUNK_BYTES, MAX_INLINE_IMAGE_BYTES, PROTOCOL_VERSION,
 };
 
 /// Wire magic bytes.
@@ -71,6 +73,7 @@ const TYPE_FILE_REQUEST: u8 = 12;
 const TYPE_FILE_CHUNK: u8 = 13;
 const TYPE_FILE_COMPLETE: u8 = 14;
 const TYPE_FILE_CANCEL: u8 = 15;
+const TYPE_FILE_BATCH_OFFER: u8 = 16;
 
 /// Encode one message into a single frame buffer.
 pub fn encode_frame(message: &Message) -> Result<Vec<u8>, FrameError> {
@@ -208,6 +211,22 @@ fn encode_payload(message: &Message) -> Result<(u8, Vec<u8>), FrameError> {
             write_string(&mut payload, &body.transfer_id)?;
             write_string(&mut payload, &body.message)?;
             TYPE_FILE_CANCEL
+        }
+        Message::FileBatchOffer(body) => {
+            body.validate()
+                .map_err(|_| FrameError::InvalidField("file_batch_offer"))?;
+            write_string(&mut payload, body.device_id.as_str())?;
+            write_string(&mut payload, &body.batch_id)?;
+            write_string(&mut payload, &body.display_name)?;
+            payload.extend_from_slice(&(body.entries.len() as u32).to_be_bytes());
+            for entry in &body.entries {
+                write_string(&mut payload, &entry.entry_id)?;
+                write_string(&mut payload, &entry.relative_path)?;
+                payload.push(entry.kind.as_u8());
+                payload.extend_from_slice(&entry.size.to_be_bytes());
+                write_string(&mut payload, &entry.sha256_hex)?;
+            }
+            TYPE_FILE_BATCH_OFFER
         }
         Message::Goodbye { device_id, reason } => {
             write_string(&mut payload, device_id.as_str())?;
@@ -397,6 +416,38 @@ fn decode_payload(msg_type: u8, mut payload: &[u8]) -> Result<Message, FrameErro
             })?;
             Ok(Message::FileCancel(body))
         }
+        TYPE_FILE_BATCH_OFFER => {
+            if payload.len() > MAX_BATCH_MANIFEST_BYTES {
+                return Err(FrameError::PayloadTooLarge(payload.len()));
+            }
+            let device_id = DeviceId::new(read_string(&mut payload)?);
+            let batch_id = read_string_limited(&mut payload, MAX_BATCH_ID_BYTES)?;
+            let display_name = read_string_limited(&mut payload, MAX_BATCH_DISPLAY_NAME_BYTES)?;
+            let entry_count = read_u32(&mut payload)? as usize;
+            if entry_count > MAX_BATCH_ENTRIES {
+                return Err(FrameError::PayloadTooLarge(entry_count));
+            }
+            let mut entries = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                let entry_id = read_string_limited(&mut payload, MAX_BATCH_ENTRY_ID_BYTES)?;
+                let relative_path = read_string_limited(&mut payload, MAX_BATCH_PATH_BYTES)?;
+                if payload.is_empty() {
+                    return Err(FrameError::TruncatedPayload);
+                }
+                let kind = BatchEntryKind::from_u8(payload[0])
+                    .map_err(|_| FrameError::InvalidField("file_batch_offer"))?;
+                payload = &payload[1..];
+                let size = read_u64(&mut payload)?;
+                let sha256_hex = read_string_limited(&mut payload, 64)?;
+                let entry = BatchEntry::new(entry_id, relative_path, kind, size, sha256_hex)
+                    .map_err(|_| FrameError::InvalidField("file_batch_offer"))?;
+                entries.push(entry);
+            }
+            ensure_empty(payload)?;
+            let body = FileBatchOfferPayload::new(device_id, batch_id, display_name, entries)
+                .map_err(|_| FrameError::InvalidField("file_batch_offer"))?;
+            Ok(Message::FileBatchOffer(body))
+        }
         TYPE_GOODBYE => {
             let device_id = DeviceId::new(read_string(&mut payload)?);
             let reason = read_string(&mut payload)?;
@@ -423,6 +474,24 @@ fn read_string(input: &mut &[u8]) -> Result<String, FrameError> {
     }
     let len = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
     *input = &input[4..];
+    if input.len() < len {
+        return Err(FrameError::TruncatedPayload);
+    }
+    let slice = &input[..len];
+    *input = &input[len..];
+    let s = std::str::from_utf8(slice).map_err(|_| FrameError::InvalidUtf8)?;
+    Ok(s.to_string())
+}
+
+fn read_string_limited(input: &mut &[u8], max_len: usize) -> Result<String, FrameError> {
+    if input.len() < 4 {
+        return Err(FrameError::TruncatedPayload);
+    }
+    let len = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    *input = &input[4..];
+    if len > max_len {
+        return Err(FrameError::PayloadTooLarge(len));
+    }
     if input.len() < len {
         return Err(FrameError::TruncatedPayload);
     }
@@ -592,6 +661,18 @@ mod tests {
             Message::file_cancel(
                 FileCancelPayload::new(DeviceId::new("b"), "t1", "user cancelled").unwrap(),
             ),
+            Message::file_batch_offer(
+                FileBatchOfferPayload::new(
+                    DeviceId::new("a"),
+                    "batch-1",
+                    "photos",
+                    vec![
+                        BatchEntry::directory("dir-1", "photos").unwrap(),
+                        BatchEntry::file("file-1", "photos/a.txt", 3, "").unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
         ];
         for msg in samples {
             let decoded = decode_frame(&encode_frame(&msg).unwrap()).unwrap();
@@ -625,6 +706,55 @@ mod tests {
         assert_eq!(
             decode_frame(&encode_frame(&msg).unwrap()).unwrap_err(),
             FrameError::PayloadTooLarge(MAX_FILE_CHUNK_BYTES + 1)
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_batch_path_during_decode() {
+        fn put_string(payload: &mut Vec<u8>, value: &str) {
+            payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            payload.extend_from_slice(value.as_bytes());
+        }
+
+        let mut payload = Vec::new();
+        put_string(&mut payload, "sender");
+        put_string(&mut payload, "batch-1");
+        put_string(&mut payload, "files");
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        put_string(&mut payload, "entry-1");
+        put_string(&mut payload, "../escape.txt");
+        payload.push(BatchEntryKind::File.as_u8());
+        payload.extend_from_slice(&1u64.to_be_bytes());
+        put_string(&mut payload, "");
+
+        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+        frame.extend_from_slice(FRAME_MAGIC);
+        frame.push(PROTOCOL_VERSION);
+        frame.push(TYPE_FILE_BATCH_OFFER);
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+
+        assert_eq!(
+            decode_frame(&frame).unwrap_err(),
+            FrameError::InvalidField("file_batch_offer")
+        );
+    }
+
+    #[test]
+    fn rejects_batch_manifest_over_size_limit_before_decode() {
+        let payload = vec![0u8; MAX_BATCH_MANIFEST_BYTES + 1];
+        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+        frame.extend_from_slice(FRAME_MAGIC);
+        frame.push(PROTOCOL_VERSION);
+        frame.push(TYPE_FILE_BATCH_OFFER);
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+
+        assert_eq!(
+            decode_frame(&frame).unwrap_err(),
+            FrameError::PayloadTooLarge(MAX_BATCH_MANIFEST_BYTES + 1)
         );
     }
 }

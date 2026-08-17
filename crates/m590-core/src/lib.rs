@@ -6,10 +6,13 @@ mod session;
 
 pub use error::{ProtocolError, SessionError};
 pub use protocol::{
-    bytes_to_hex, validate_sha256_hex, validate_transfer_id, ClipboardImagePayload,
-    ClipboardTextPayload, FileCancelPayload, FileChunkPayload, FileCompletePayload,
-    FileOfferPayload, FileRequestPayload, ImageEncoding, Message, MAX_FILE_CHUNK_BYTES,
-    MAX_IMAGE_PIXELS, MAX_INLINE_IMAGE_BYTES, PROTOCOL_VERSION,
+    bytes_to_hex, validate_batch_entry_id, validate_batch_id, validate_batch_relative_path,
+    validate_sha256_hex, validate_transfer_id, BatchEntry, BatchEntryKind, ClipboardImagePayload,
+    ClipboardTextPayload, FileBatchOfferPayload, FileCancelPayload, FileChunkPayload,
+    FileCompletePayload, FileOfferPayload, FileRequestPayload, ImageEncoding, Message,
+    MAX_BATCH_DISPLAY_NAME_BYTES, MAX_BATCH_ENTRIES, MAX_BATCH_ENTRY_ID_BYTES, MAX_BATCH_ID_BYTES,
+    MAX_BATCH_MANIFEST_BYTES, MAX_BATCH_PATH_BYTES, MAX_BATCH_PATH_DEPTH, MAX_BATCH_TOTAL_BYTES,
+    MAX_FILE_CHUNK_BYTES, MAX_IMAGE_PIXELS, MAX_INLINE_IMAGE_BYTES, PROTOCOL_VERSION,
 };
 pub use session::{
     InboundClipboardResult, InboundFileResult, QueueClipboardResult, QueueFileResult, Session,

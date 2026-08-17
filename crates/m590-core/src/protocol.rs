@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::{DeviceId, ProtocolError};
 
 /// Draft wire protocol version (frame header also carries this value).
@@ -14,6 +16,23 @@ pub const MAX_FILE_CHUNK_BYTES: usize = 256 * 1024;
 
 const MAX_TRANSFER_ID_BYTES: usize = 128;
 const MAX_FILE_STATUS_MESSAGE_BYTES: usize = 1024;
+
+/// Maximum number of entries (files plus directories) in one batch manifest.
+pub const MAX_BATCH_ENTRIES: usize = 4096;
+/// Maximum number of slash-separated components in one batch relative path.
+pub const MAX_BATCH_PATH_DEPTH: usize = 64;
+/// Maximum encoded payload bytes for one batch manifest.
+pub const MAX_BATCH_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum sum of file sizes announced by one batch manifest.
+pub const MAX_BATCH_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Maximum display name bytes in a batch manifest.
+pub const MAX_BATCH_DISPLAY_NAME_BYTES: usize = 255;
+/// Maximum batch id bytes.
+pub const MAX_BATCH_ID_BYTES: usize = 128;
+/// Maximum relative path bytes in a batch entry.
+pub const MAX_BATCH_PATH_BYTES: usize = 4096;
+/// Maximum entry id bytes in a batch entry.
+pub const MAX_BATCH_ENTRY_ID_BYTES: usize = 128;
 
 /// Text clipboard payload carried on the wire after pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +218,94 @@ pub fn validate_transfer_id(transfer_id: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+fn validate_safe_component(
+    value: &str,
+    max_bytes: usize,
+    empty_error: ProtocolError,
+    reason: &'static str,
+) -> Result<(), ProtocolError> {
+    if value.is_empty() {
+        return Err(empty_error);
+    }
+    if value.len() > max_bytes
+        || value == "."
+        || value == ".."
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ProtocolError::InvalidFile(reason));
+    }
+    Ok(())
+}
+
+/// Validate the stable id used to identify a batch manifest.
+pub fn validate_batch_id(batch_id: &str) -> Result<(), ProtocolError> {
+    validate_safe_component(
+        batch_id,
+        MAX_BATCH_ID_BYTES,
+        ProtocolError::EmptyBatchId,
+        "batch id must be a safe single path component",
+    )
+}
+
+/// Validate the stable id used to identify one entry in a batch manifest.
+pub fn validate_batch_entry_id(entry_id: &str) -> Result<(), ProtocolError> {
+    validate_safe_component(
+        entry_id,
+        MAX_BATCH_ENTRY_ID_BYTES,
+        ProtocolError::EmptyBatchEntryId,
+        "batch entry id must be a safe single path component",
+    )
+}
+
+/// Validate a slash-separated, platform-neutral relative path from a batch manifest.
+///
+/// Wire paths deliberately use `/` on both platforms. Backslashes, drive prefixes,
+/// UNC prefixes, empty components, `.` and `..` are rejected instead of relying on
+/// the host platform's `Path` parser.
+pub fn validate_batch_relative_path(path: &str) -> Result<(), ProtocolError> {
+    if path.is_empty() {
+        return Err(ProtocolError::InvalidFile(
+            "batch relative path must not be empty",
+        ));
+    }
+    if path.len() > MAX_BATCH_PATH_BYTES || path.contains('\0') || path.contains('\\') {
+        return Err(ProtocolError::InvalidFile(
+            "batch relative path contains unsafe bytes",
+        ));
+    }
+    if path.starts_with('/') {
+        return Err(ProtocolError::InvalidFile(
+            "batch relative path must not be absolute",
+        ));
+    }
+
+    let mut components = path.split('/');
+    let first = components.next().unwrap_or_default();
+    if first.contains(':') {
+        return Err(ProtocolError::InvalidFile(
+            "batch relative path must not contain a Windows drive prefix",
+        ));
+    }
+
+    let mut depth = 0usize;
+    for component in std::iter::once(first).chain(components) {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(ProtocolError::InvalidFile(
+                "batch relative path contains an unsafe component",
+            ));
+        }
+        depth = depth.saturating_add(1);
+    }
+    if depth == 0 || depth > MAX_BATCH_PATH_DEPTH {
+        return Err(ProtocolError::InvalidFile(
+            "batch relative path exceeds depth limit",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate lowercase/uppercase hex SHA-256 (empty allowed = not provided).
 pub fn validate_sha256_hex(value: &str) -> Result<(), ProtocolError> {
     if value.is_empty() {
@@ -221,6 +328,228 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0xf) as usize] as char);
     }
     out
+}
+
+/// Whether a batch entry is a regular file or a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BatchEntryKind {
+    File = 0,
+    Directory = 1,
+}
+
+impl BatchEntryKind {
+    pub fn from_u8(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            0 => Ok(Self::File),
+            1 => Ok(Self::Directory),
+            _ => Err(ProtocolError::InvalidFile("unknown batch entry kind")),
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// One file or directory in a batch manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchEntry {
+    pub entry_id: String,
+    /// Platform-neutral path using `/` separators, relative to the batch root.
+    pub relative_path: String,
+    pub kind: BatchEntryKind,
+    /// Regular-file byte length; always zero for directories.
+    pub size: u64,
+    /// Optional lowercase hex SHA-256; always empty for directories.
+    pub sha256_hex: String,
+}
+
+impl BatchEntry {
+    pub fn new(
+        entry_id: impl Into<String>,
+        relative_path: impl Into<String>,
+        kind: BatchEntryKind,
+        size: u64,
+        sha256_hex: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        let entry = Self {
+            entry_id: entry_id.into(),
+            relative_path: relative_path.into(),
+            kind,
+            size,
+            sha256_hex: sha256_hex.into().to_ascii_lowercase(),
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    pub fn file(
+        entry_id: impl Into<String>,
+        relative_path: impl Into<String>,
+        size: u64,
+        sha256_hex: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        Self::new(
+            entry_id,
+            relative_path,
+            BatchEntryKind::File,
+            size,
+            sha256_hex,
+        )
+    }
+
+    pub fn directory(
+        entry_id: impl Into<String>,
+        relative_path: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        Self::new(entry_id, relative_path, BatchEntryKind::Directory, 0, "")
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_batch_entry_id(&self.entry_id)?;
+        validate_batch_relative_path(&self.relative_path)?;
+        match self.kind {
+            BatchEntryKind::File => validate_sha256_hex(&self.sha256_hex),
+            BatchEntryKind::Directory => {
+                if self.size != 0 || !self.sha256_hex.is_empty() {
+                    return Err(ProtocolError::InvalidFile(
+                        "directory entry must not carry file size or sha256",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Peer announces a directory tree or a group of files for on-demand retrieval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBatchOfferPayload {
+    pub device_id: DeviceId,
+    pub batch_id: String,
+    pub display_name: String,
+    pub entries: Vec<BatchEntry>,
+}
+
+impl FileBatchOfferPayload {
+    pub fn new(
+        device_id: DeviceId,
+        batch_id: impl Into<String>,
+        display_name: impl Into<String>,
+        mut entries: Vec<BatchEntry>,
+    ) -> Result<Self, ProtocolError> {
+        for entry in &mut entries {
+            entry.sha256_hex.make_ascii_lowercase();
+        }
+        let payload = Self {
+            device_id,
+            batch_id: batch_id.into(),
+            display_name: display_name.into(),
+            entries,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    /// Validate all identifiers, paths, limits and the encoded manifest size.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.device_id.as_str().is_empty() {
+            return Err(ProtocolError::EmptyDeviceId);
+        }
+        validate_batch_id(&self.batch_id)?;
+        if self.display_name.is_empty()
+            || self.display_name.len() > MAX_BATCH_DISPLAY_NAME_BYTES
+            || self.display_name.contains('\0')
+        {
+            return Err(ProtocolError::InvalidFile(
+                "batch display name is empty or too long",
+            ));
+        }
+        if self.entries.is_empty() {
+            return Err(ProtocolError::InvalidFile(
+                "batch manifest must contain at least one entry",
+            ));
+        }
+        if self.entries.len() > MAX_BATCH_ENTRIES {
+            return Err(ProtocolError::InvalidFile(
+                "batch manifest contains too many entries",
+            ));
+        }
+
+        let mut entry_ids = HashSet::with_capacity(self.entries.len());
+        let mut paths = HashSet::with_capacity(self.entries.len());
+        let mut total_bytes = 0u64;
+        for entry in &self.entries {
+            entry.validate()?;
+            if !entry_ids.insert(&entry.entry_id) {
+                return Err(ProtocolError::InvalidFile(
+                    "batch manifest contains duplicate entry ids",
+                ));
+            }
+            if !paths.insert(&entry.relative_path) {
+                return Err(ProtocolError::InvalidFile(
+                    "batch manifest contains duplicate relative paths",
+                ));
+            }
+            if entry.kind == BatchEntryKind::File {
+                total_bytes =
+                    total_bytes
+                        .checked_add(entry.size)
+                        .ok_or(ProtocolError::InvalidFile(
+                            "batch manifest total size overflow",
+                        ))?;
+                if total_bytes > MAX_BATCH_TOTAL_BYTES {
+                    return Err(ProtocolError::InvalidFile(
+                        "batch manifest total file size exceeds limit",
+                    ));
+                }
+            }
+        }
+        if self.encoded_len()? > MAX_BATCH_MANIFEST_BYTES {
+            return Err(ProtocolError::InvalidFile(
+                "batch manifest exceeds encoded size limit",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Encoded payload length excluding the 12-byte frame header.
+    pub fn encoded_len(&self) -> Result<usize, ProtocolError> {
+        fn string_len(value: &str) -> Result<usize, ProtocolError> {
+            if value.len() > u32::MAX as usize {
+                return Err(ProtocolError::InvalidFile(
+                    "batch manifest string is too long",
+                ));
+            }
+            4usize
+                .checked_add(value.len())
+                .ok_or(ProtocolError::InvalidFile("batch manifest size overflow"))
+        }
+
+        let mut len = string_len(self.device_id.as_str())?;
+        len = len
+            .checked_add(string_len(&self.batch_id)?)
+            .ok_or(ProtocolError::InvalidFile("batch manifest size overflow"))?;
+        len = len
+            .checked_add(string_len(&self.display_name)?)
+            .and_then(|n| n.checked_add(4))
+            .ok_or(ProtocolError::InvalidFile("batch manifest size overflow"))?;
+        for entry in &self.entries {
+            let mut entry_len = string_len(&entry.entry_id)?;
+            entry_len = entry_len
+                .checked_add(string_len(&entry.relative_path)?)
+                .and_then(|n| n.checked_add(1 + 8))
+                .ok_or(ProtocolError::InvalidFile("batch manifest size overflow"))?;
+            entry_len = entry_len
+                .checked_add(string_len(&entry.sha256_hex)?)
+                .ok_or(ProtocolError::InvalidFile("batch manifest size overflow"))?;
+            len = len
+                .checked_add(entry_len)
+                .ok_or(ProtocolError::InvalidFile("batch manifest size overflow"))?;
+        }
+        Ok(len)
+    }
 }
 
 /// Peer announces a file is available for on-demand pull.
@@ -445,6 +774,8 @@ pub enum Message {
     FileComplete(FileCompletePayload),
     /// Transfer was cancelled by either peer.
     FileCancel(FileCancelPayload),
+    /// A directory tree or group of files is available for on-demand retrieval.
+    FileBatchOffer(FileBatchOfferPayload),
     /// Graceful teardown.
     Goodbye { device_id: DeviceId, reason: String },
 }
@@ -539,6 +870,10 @@ impl Message {
         Self::FileCancel(payload)
     }
 
+    pub fn file_batch_offer(payload: FileBatchOfferPayload) -> Self {
+        Self::FileBatchOffer(payload)
+    }
+
     pub fn goodbye(device_id: DeviceId, reason: impl Into<String>) -> Result<Self, ProtocolError> {
         validate_device(&device_id)?;
         Ok(Self::Goodbye {
@@ -563,6 +898,7 @@ impl Message {
             Self::FileChunk(_) => "file_chunk",
             Self::FileComplete(_) => "file_complete",
             Self::FileCancel(_) => "file_cancel",
+            Self::FileBatchOffer(_) => "file_batch_offer",
             Self::Goodbye { .. } => "goodbye",
         }
     }
@@ -671,6 +1007,104 @@ mod tests {
         assert_eq!(
             err,
             ProtocolError::InvalidFile("file cancel message exceeds maximum size")
+        );
+    }
+
+    #[test]
+    fn batch_manifest_accepts_nested_files_and_directories() {
+        let entries = vec![
+            BatchEntry::directory("dir-1", "photos").unwrap(),
+            BatchEntry::file(
+                "file-1",
+                "photos/2026/image.png",
+                42,
+                "AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899",
+            )
+            .unwrap(),
+        ];
+        let manifest =
+            FileBatchOfferPayload::new(DeviceId::new("sender"), "batch-1", "photos", entries)
+                .unwrap();
+        assert_eq!(
+            manifest.entries[1].sha256_hex,
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        );
+        assert!(manifest.encoded_len().unwrap() < MAX_BATCH_MANIFEST_BYTES);
+    }
+
+    #[test]
+    fn batch_manifest_rejects_unsafe_paths() {
+        for path in [
+            "/tmp/file.txt",
+            "../file.txt",
+            "folder/../file.txt",
+            "folder//file.txt",
+            "folder/./file.txt",
+            "C:/file.txt",
+            "C:file.txt",
+            "//server/share/file.txt",
+            r"\\server\share\file.txt",
+            "folder\\file.txt",
+            "folder/\0file.txt",
+        ] {
+            assert!(
+                validate_batch_relative_path(path).is_err(),
+                "path should be rejected: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_manifest_rejects_directory_file_metadata_and_limits() {
+        let err = BatchEntry::new("dir-1", "folder", BatchEntryKind::Directory, 1, "").unwrap_err();
+        assert_eq!(
+            err,
+            ProtocolError::InvalidFile("directory entry must not carry file size or sha256")
+        );
+
+        let err = FileBatchOfferPayload::new(
+            DeviceId::new("sender"),
+            "batch-1",
+            "files",
+            vec![BatchEntry::file("file-1", "file.bin", MAX_BATCH_TOTAL_BYTES + 1, "").unwrap()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ProtocolError::InvalidFile("batch manifest total file size exceeds limit")
+        );
+    }
+
+    #[test]
+    fn batch_manifest_enforces_depth_count_and_encoded_size_limits() {
+        let deep_path = std::iter::repeat("d")
+            .take(MAX_BATCH_PATH_DEPTH + 1)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(BatchEntry::file("deep-1", deep_path, 0, "").is_err());
+
+        let too_many = (0..=MAX_BATCH_ENTRIES)
+            .map(|index| BatchEntry::file(format!("entry-{index}"), format!("file-{index}"), 0, ""))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            FileBatchOfferPayload::new(DeviceId::new("sender"), "batch-1", "files", too_many)
+                .is_err()
+        );
+
+        let prefix = "a".repeat(4000);
+        let oversized = (0..1100)
+            .map(|index| {
+                BatchEntry::file(format!("entry-{index}"), format!("{prefix}/{index}"), 0, "")
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let err =
+            FileBatchOfferPayload::new(DeviceId::new("sender"), "batch-1", "files", oversized)
+                .unwrap_err();
+        assert_eq!(
+            err,
+            ProtocolError::InvalidFile("batch manifest exceeds encoded size limit")
         );
     }
 }

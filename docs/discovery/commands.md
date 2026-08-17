@@ -198,7 +198,7 @@ cargo run -p m590-clipboard --example set_file_and_read -- /path/to/test-file
 - 图片位图：Linux ↔ Windows 双向（线载优先 PNG；Word 等可粘贴）  
 - 复制图片**文件**：可提升为图片同步（非传原文件字节流）  
 - 发大图：TCP 写满帧，避免 EAGAIN 误判断线  
-- 文件：`FileOffer/Request/Chunk/Complete` + 路径流式 + SHA-256 + hub 落盘 + UI 发送/进度（软上限 8GiB；`send_file_bytes` 仍限内存）
+- 文件：单文件 `FileOffer/Request/Chunk/Complete` + 路径流式 + SHA-256 + hub 落盘 + UI 发送/进度（软上限 8GiB；`send_file_bytes` 仍限内存）；task-055 已增加 `FileBatchOffer` 清单模型与路径安全 frame 基础，但尚未接入多文件运行时
 - Linux FUSE：单文件网络惰性读取、Nautilus 系统进度、内容和取消已跨机真机通过（task-052）
 - Linux 托盘：AppIndicator 菜单挂接后刷新标签，GNOME/Wayland“打开主面板 / 退出”真机通过（task-053）
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  

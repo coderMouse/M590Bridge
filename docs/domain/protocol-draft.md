@@ -1,14 +1,16 @@
 # 协议草案 · M590Bridge
 
-> 状态：draft（至 **task-044** Windows 按粘贴取流与取消语义）
-> 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；**文件 offer/request/chunk/complete（磁盘流 + SHA-256）**
+> 状态：draft（至 **task-055** 批次清单与路径安全基础）
+> 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；**单文件 offer/request/chunk/complete（磁盘流 + SHA-256）**；批次清单协议基础
 
 ## 版本
 
 - 应用协议版本：`PROTOCOL_VERSION = 3`
 - 帧魔数：ASCII `M590`
 
-版本 3 在版本 2 的 SHA-256 文件字段基础上增加 `FileCancel`；版本 1/2 帧会在帧头解码阶段返回 `UnsupportedVersion`，不进入 payload 解码。
+版本 3 在版本 2 的 SHA-256 文件字段基础上增加 `FileCancel`；task-055 在不改变既有消息
+字段的前提下增加 type 16 `FileBatchOffer`。版本 1/2 帧会在帧头解码阶段返回
+`UnsupportedVersion`，未知消息类型会返回 `UnknownMessageType`。
 
 ## 帧布局
 
@@ -33,6 +35,8 @@
 分片：`FILE_CHUNK_SIZE = 256 KiB`；每轮泵送最多 `OUTBOUND_CHUNKS_PER_PUMP = 4` 片；单个 `FileChunk` 不得超过 256 KiB。
 `transfer_id`：最多 128 字节，只允许 ASCII 字母、数字、`.`、`_`、`-`，且不能为 `.` / `..`；它只能作为接收临时目录下的单路径组件。
 
+批次清单限制：`batch_id` 和 `entry_id` 均为安全单路径组件；相对路径统一使用 `/`，拒绝绝对路径、Windows 盘符/UNC、反斜杠、空组件、`.`、`..` 和 NUL。单批次最多 4096 个条目、路径最多 64 层、编码清单最多 4 MiB、文件总字节最多 8 GiB。条目类型为 `file` 或 `directory`；目录的 `size` 固定为 0 且 `sha256_hex` 必须为空。清单还拒绝重复 entry id 和相对路径。后续 task-056 会把文件条目的 `entry_id` 作为现有单文件请求链路的安全传输 id；生成方必须保证活动会话内唯一。
+
 ## 消息类型（msg_type）
 
 | 值 | 名称 | 用途 |
@@ -52,6 +56,7 @@
 | 13 | FileChunk | device_id, transfer_id, offset u64, data bytes |
 | 14 | FileComplete | device_id, transfer_id, ok u8 (0/1), message string, **sha256_hex string** |
 | 15 | FileCancel | device_id, transfer_id, message string |
+| 16 | FileBatchOffer | device_id, batch_id, display_name, entry_count u32, entries (`entry_id`, `relative_path`, `kind` u8: 0=file/1=directory, `size` u64, `sha256_hex`) |
 
 `ClipboardImage`：`encoding=0` 时 data 为 row-major **RGBA8**（长度 `width*height*4`）；`encoding=1` 时 data 为 **PNG**（推荐，截图更小）。
 
@@ -73,7 +78,11 @@
 **本刀取舍**：仍走**同一 TCP 控制/数据连接**串行帧（未开独立数据连接）；靠分批 pump 避免一次把整文件 chunk 堆进 outbox，心跳/剪贴板可在 pump 间隙处理。
 Windows 单文件 OS 文件剪贴板现已接入：OLE STA 仅持有虚拟 `IDataObject`，网络 Session 线程负责分片和校验，有界管道提供背压。读取端关闭、剪贴板被替换或已开始读取后 30 秒无进展时发送 `FileCancel`；尚未粘贴的 offer 保留到剪贴板被替换或会话断开。`IStream` 只支持当前位置 no-op seek；向前/向后移动均明确失败。
 
-**仍未做**：文件夹、断点续传、多文件并行、独立数据连接、Linux FUSE。
+**仍未做**：批次运行时、文件夹虚拟目录、断点续传、多文件并行、独立数据连接；Linux
+FUSE 当前只完成单文件网络按需读取。
+
+`FileBatchOffer` 目前只完成协议模型、路径安全校验和 frame round-trip；单文件 `Session`
+会明确拒绝该消息，尚未接入 UI、Hub、Windows OLE 或 Linux FUSE 的批次行为（task-055）。
 
 **hub**：自动 request + `.partial` → 保存目录；`POST /api/send_file`（路径流式）；`send_file_bytes` 仍限内存 cap。
 

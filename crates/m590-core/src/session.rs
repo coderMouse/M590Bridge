@@ -844,6 +844,10 @@ impl Session {
             Message::FileChunk(payload) => self.on_file_chunk(payload),
             Message::FileComplete(payload) => self.on_file_complete(payload),
             Message::FileCancel(payload) => self.on_file_cancel(payload),
+            Message::FileBatchOffer(_) => Err(ProtocolError::InvalidMessage(
+                "file batch offers are not enabled in the single-file session",
+            )
+            .into()),
             Message::Goodbye { .. } => {
                 self.reset_to_disconnected(true);
                 Ok(())
@@ -1747,7 +1751,7 @@ fn cleanup_stale_part_files(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ClipboardTextPayload;
+    use crate::{BatchEntry, ClipboardTextPayload, FileBatchOfferPayload};
 
     fn exchange(a: &mut Session, b: &mut Session) {
         use std::collections::VecDeque;
@@ -1788,6 +1792,28 @@ mod tests {
         assert_eq!(host.state(), ConnectionState::Connected);
         assert_eq!(joiner.state(), ConnectionState::Connected);
         (host, joiner)
+    }
+
+    #[test]
+    fn single_file_session_rejects_batch_offer_until_batch_runtime_is_enabled() {
+        let (mut host, _joiner) = pair_host_joiner();
+        let offer = FileBatchOfferPayload::new(
+            DeviceId::new("joiner"),
+            "batch-1",
+            "files",
+            vec![BatchEntry::file("file-1", "a.txt", 1, "").unwrap()],
+        )
+        .unwrap();
+        let err = host
+            .handle(SessionEvent::Message(Message::file_batch_offer(offer)))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SessionError::Protocol(ProtocolError::InvalidMessage(
+                "file batch offers are not enabled in the single-file session"
+            ))
+        );
+        assert_eq!(host.state(), ConnectionState::Connected);
     }
 
     #[test]

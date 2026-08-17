@@ -23,10 +23,10 @@ M590Bridge 是局域网双机剪贴板与文件桥：在 A 电脑复制，用罗
 
 ## 当前阶段
 
-文本 + 图片 + 文件流式已在 Linux↔Windows 实机可用（见 `docs/plans/current.md`）。
+文本 + 图片 + 单文件流式已在 Linux↔Windows 实机可用（见 `docs/plans/current.md`）。
 **V2 图片/文件、mDNS、Linux `.deb`/登录自启已完成**；Windows NSIS、登录自启、卸载清理与跨机回归已在真机通过（task-042）；task-043 至 task-054 已完成真机验收（无文件夹/断点续传）。
 原 task-019A（收图落盘捷径）已 **cancelled**。  
-用户已确认 task-042 的登录自启、卸载清理与跨机回归通过；task-043 至 task-054 已完成。task-052 已验证 Linux FUSE 单文件在 GNOME Wayland Nautilus 粘贴时通过网络惰性读取、显示系统进度且内容一致；task-053 已修复 Linux 托盘菜单文字回归；task-054 的 Linux `.deb`、Windows NSIS 一键打包与 Windows 成功/异常按键暂停均已验收。不扩展多文件/文件夹，也不复活 019A。
+用户已确认 task-042 的登录自启、卸载清理与跨机回归通过；task-043 至 task-054 已完成。task-052 已验证 Linux FUSE 单文件在 GNOME Wayland Nautilus 粘贴时通过网络惰性读取、显示系统进度且内容一致；task-053 已修复 Linux 托盘菜单文字回归；task-054 的 Linux `.deb`、Windows NSIS 一键打包与 Windows 成功/异常按键暂停均已验收。task-055 已完成多文件批次清单与路径安全协议基础；运行时、UI 与系统粘贴尚未接入，下一步是 task-056。不要宣称多文件/文件夹已可用，也不复活 019A。
 
 ## 产品边界（默认）
 

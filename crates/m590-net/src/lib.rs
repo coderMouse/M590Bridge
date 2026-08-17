@@ -111,6 +111,18 @@ mod tests {
             Message::file_cancel(
                 m590_core::FileCancelPayload::new(DeviceId::new("b"), "t1", "cancelled").unwrap(),
             ),
+            Message::file_batch_offer(
+                m590_core::FileBatchOfferPayload::new(
+                    DeviceId::new("a"),
+                    "batch-1",
+                    "folder",
+                    vec![
+                        m590_core::BatchEntry::directory("dir-1", "folder").unwrap(),
+                        m590_core::BatchEntry::file("file-1", "folder/a.txt", 2, "").unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
             Message::goodbye(DeviceId::new("a"), "bye").unwrap(),
         ];
 
