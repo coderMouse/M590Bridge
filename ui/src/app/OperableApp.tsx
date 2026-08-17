@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Copy, Link2, RefreshCw, Settings, WifiOff, Monitor, Info, FileUp } from 'lucide-react'
+import {
+  Copy,
+  Link2,
+  RefreshCw,
+  Settings,
+  WifiOff,
+  Monitor,
+  Info,
+  FileUp,
+  FolderOpen,
+  X,
+} from 'lucide-react'
 import { AppIcon } from '@/components/AppIcon'
 import { PrimaryButton } from '@/components/PrimaryButton'
 import { StatusPill } from '@/components/StatusPill'
@@ -9,6 +20,7 @@ import { Toggle } from '@/components/Toggle'
 import { cn } from '@/lib/cn'
 import {
   bytesToBase64,
+  batchProgressPercent,
   fetchAutostartEnabled,
   fetchConfig,
   fetchDiscover,
@@ -22,13 +34,15 @@ import {
   MAX_SEND_FILE_BYTES,
   phaseToStatusLabel,
   postConfig,
+  postCancelBatch,
   postConnect,
   postDisconnect,
   postListen,
   postPush,
-  postSendFile,
+  postSendBatch,
   postSendFileBytes,
-  pickSendFileNative,
+  pickSendFilesNative,
+  pickSendFolderNative,
   resolveHubOfflineReason,
   setAutostartEnabled,
   isDesktopAutostartShell,
@@ -195,6 +209,10 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
   const connLabel: ConnectionStatus = status
     ? (phaseToStatusLabel(status.phase, status.connection) as ConnectionStatus)
     : '未连接'
+  const batchActive = Boolean(
+    status?.file_batch_id &&
+      ['offered', 'sending', 'receiving'].includes(status.file_transfer_phase ?? ''),
+  )
 
   async function onStart() {
     setBusy(true)
@@ -283,8 +301,13 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
     }
   }
 
-  async function onPickAndSendFile(file: File | null) {
-    if (!file) return
+  async function onPickAndSendBrowserFiles(files: File[]) {
+    if (files.length === 0) return
+    if (files.length > 1) {
+      setError('浏览器模式不支持批次路径传输；请使用桌面版原生多选或拖放')
+      return
+    }
+    const file = files[0]
     setError(null)
     setPickedFileLabel(`${file.name} (${file.size}B)`)
     if (file.size > MAX_SEND_FILE_BYTES) {
@@ -310,20 +333,55 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
     }
   }
 
-  async function onNativePickAndSend() {
+  async function onNativePickAndSendFiles() {
     setError(null)
     setFileBusy(true)
     try {
       if (isTauriShell()) {
-        const path = await pickSendFileNative()
-        if (!path) return
-        const baseName = path.split(/[/\\]/).pop() || path
-        setPickedFileLabel(baseName)
-        await postSendFile(path)
+        const paths = await pickSendFilesNative()
+        if (paths.length === 0) return
+        setPickedFileLabel(
+          paths.length === 1
+            ? paths[0].split(/[/\\]/).pop() || paths[0]
+            : `${paths.length} 个文件`,
+        )
+        await postSendBatch(paths)
         await refresh()
         return
       }
       fileInputRef.current?.click()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setFileBusy(false)
+    }
+  }
+
+  async function onNativePickAndSendFolder() {
+    setError(null)
+    setFileBusy(true)
+    try {
+      if (!isTauriShell()) {
+        throw new Error('文件夹批次发送需要桌面版')
+      }
+      const path = await pickSendFolderNative()
+      if (!path) return
+      setPickedFileLabel(path.split(/[/\\]/).pop() || path)
+      await postSendBatch([path])
+      await refresh()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setFileBusy(false)
+    }
+  }
+
+  async function onCancelBatch() {
+    setError(null)
+    setFileBusy(true)
+    try {
+      await postCancelBatch()
+      await refresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -774,8 +832,8 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                       e.stopPropagation()
                       setFileDragOver(false)
                       if (!hubOnline || status?.phase !== 'connected' || fileBusy || busy) return
-                      const f = e.dataTransfer.files?.[0] ?? null
-                      void onPickAndSendFile(f)
+                      if (tauriShell) return
+                      void onPickAndSendBrowserFiles(Array.from(e.dataTransfer.files ?? []))
                     }}
                   >
                     <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold text-[#6B7589]">
@@ -785,12 +843,12 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                       </span>
                     </div>
                     <div className="mb-2 text-[11px] leading-4 text-[#6B7589]">
-                      桌面版原生选择/拖放支持路径流式发送，单文件软上限 8GiB；浏览器模式上限 4MiB。
-                      对端自动接收并写入其保存目录。
+                      桌面版支持多选文件、选择文件夹和多路径拖放；目录不会跟随符号链接，批次总上限 8GiB。
+                      对端按清单顺序逐个接收，全部成功后发布到保存目录。
                       <br />
-                      可「选择并发送」（原生对话框，默认桌面）或把文件拖到窗口。GNOME 下文件管理器 Ctrl+C 常不可用。
+                      当前条目仍复用单文件流式通道，不会把整个目录读入内存；浏览器模式仅保留单文件 4MiB 发送。
                       <br />
-                      两端必须同一版本（含文件通道）。若对端报 unknown message type 11，请升级对端后重连。
+                      两端必须同一版本（含批次通道）。若对端报 unknown message type 16，请升级对端后重连。
                     </div>
                     {status?.file_clipboard_watch_likely === false ? (
                       <div className="mb-2 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-4 text-amber-900">
@@ -800,41 +858,77 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                     <input
                       ref={fileInputRef}
                       type="file"
+                      multiple
                       className="hidden"
                       disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
                       onChange={(e) => {
-                        const f = e.target.files?.[0] ?? null
-                        void onPickAndSendFile(f)
+                        void onPickAndSendBrowserFiles(Array.from(e.target.files ?? []))
                         e.target.value = ''
                       }}
                     />
-                    <PrimaryButton
-                      className="mb-2"
-                      loading={fileBusy}
-                      disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
-                      onClick={() => void onNativePickAndSend()}
-                    >
-                      <FileUp size={14} /> 选择并发送文件
-                    </PrimaryButton>
+                    <div className="mb-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <PrimaryButton
+                        loading={fileBusy}
+                        disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
+                        onClick={() => void onNativePickAndSendFiles()}
+                      >
+                        <FileUp size={14} /> 选择文件（可多选）
+                      </PrimaryButton>
+                      <PrimaryButton
+                        variant="secondary"
+                        disabled={!hubOnline || status?.phase !== 'connected' || fileBusy || busy}
+                        onClick={() => void onNativePickAndSendFolder()}
+                      >
+                        <FolderOpen size={14} /> 选择文件夹
+                      </PrimaryButton>
+                    </div>
                     {pickedFileLabel ? (
                       <div className="mb-2 truncate text-[11px] text-[#6B7589]">已选：{pickedFileLabel}</div>
                     ) : null}
                     <div className="mb-1 flex items-center justify-between text-[11px] text-[#6B7589]">
                       <span className="truncate pr-2">
-                        {status?.last_file_name || '尚无文件传输'}
+                        {status?.file_batch_name || status?.last_file_name || '尚无文件传输'}
                       </span>
-                      <span className="shrink-0 tabular-nums">{fileProgressPercent(status)}%</span>
+                      <span className="shrink-0 tabular-nums">{batchProgressPercent(status)}%</span>
                     </div>
                     <div className="mb-2 h-2 overflow-hidden rounded-full bg-[#EEF2F8]">
                       <div
                         className="h-full rounded-full bg-primary transition-[width] duration-300"
-                        style={{ width: `${fileProgressPercent(status)}%` }}
+                        style={{ width: `${batchProgressPercent(status)}%` }}
                       />
                     </div>
                     <div className="space-y-1 text-[11px] leading-4 text-[#6B7589]">
-                      <div>
-                        进度字节：{status?.file_bytes_received ?? 0} / {status?.file_bytes_total ?? 0}
-                      </div>
+                      {status?.file_batch_id ? (
+                        <>
+                          <div>
+                            整体：{status.file_batch_files_completed ?? 0} /{' '}
+                            {status.file_batch_files_total ?? 0} 个文件 ·{' '}
+                            {(status.file_batch_bytes_completed ?? 0) +
+                              (status.file_batch_current_path
+                                ? (status.file_bytes_received ?? 0)
+                                : 0)}{' '}
+                            / {status.file_batch_bytes_total ?? 0} 字节
+                          </div>
+                          <div className="truncate text-[#1A2030]">
+                            当前：{status.file_batch_current_path || '—'}
+                          </div>
+                          <div className="h-1.5 overflow-hidden rounded-full bg-[#EEF2F8]">
+                            <div
+                              className="h-full rounded-full bg-emerald-500 transition-[width] duration-300"
+                              style={{ width: `${fileProgressPercent(status)}%` }}
+                            />
+                          </div>
+                          <div>
+                            当前条目：{status.file_bytes_received ?? 0} /{' '}
+                            {status.file_bytes_total ?? 0} 字节
+                          </div>
+                        </>
+                      ) : (
+                        <div>
+                          进度字节：{status?.file_bytes_received ?? 0} /{' '}
+                          {status?.file_bytes_total ?? 0}
+                        </div>
+                      )}
                       {status?.last_file_saved_path ? (
                         <div className="break-all text-[#1A2030]">
                           已保存：{status.last_file_saved_path}
@@ -844,8 +938,18 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                         <div className="break-all">本机保存目录：{status.file_save_dir}</div>
                       ) : null}
                     </div>
+                    {batchActive ? (
+                      <PrimaryButton
+                        className="mt-2"
+                        variant="danger"
+                        disabled={fileBusy || busy}
+                        onClick={() => void onCancelBatch()}
+                      >
+                        <X size={14} /> 取消整个批次
+                      </PrimaryButton>
+                    ) : null}
                     {fileBusy ? (
-                      <div className="mt-2 text-[11px] font-medium text-primary">正在发送报价…</div>
+                      <div className="mt-2 text-[11px] font-medium text-primary">正在提交批次…</div>
                     ) : null}
                   </div>
                 </div>

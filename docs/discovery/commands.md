@@ -198,7 +198,9 @@ cargo run -p m590-clipboard --example set_file_and_read -- /path/to/test-file
 - 图片位图：Linux ↔ Windows 双向（线载优先 PNG；Word 等可粘贴）  
 - 复制图片**文件**：可提升为图片同步（非传原文件字节流）  
 - 发大图：TCP 写满帧，避免 EAGAIN 误判断线  
-- 文件：单文件 `FileOffer/Request/Chunk/Complete` + 路径流式 + SHA-256 + hub 落盘 + UI 发送/进度（软上限 8GiB；`send_file_bytes` 仍限内存）；task-055 已增加 `FileBatchOffer` 清单模型与路径安全 frame 基础，但尚未接入多文件运行时
+- 文件：单文件 `FileOffer/Request/Chunk/Complete` + 路径流式 + SHA-256；task-056 已接入
+  `FileBatchOffer`、安全目录扫描、按 manifest 串行请求、整批暂存/发布与整体/当前条目进度
+  （批次总上限 8GiB；`send_file_bytes` 仍限内存）
 - Linux FUSE：单文件网络惰性读取、Nautilus 系统进度、内容和取消已跨机真机通过（task-052）
 - Linux 托盘：AppIndicator 菜单挂接后刷新标签，GNOME/Wayland“打开主面板 / 退出”真机通过（task-053）
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
@@ -224,6 +226,14 @@ curl -s -X POST http://127.0.0.1:5910/api/send_file_bytes \
   -H "X-M590-Token: $M590_HUB_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"name":"a.txt","data_base64":"aGVsbG8="}'
+curl -s -X POST http://127.0.0.1:5910/api/send_batch \
+  -H "X-M590-Token: $M590_HUB_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"paths":["/path/to/folder","/path/to/other.bin"]}'
+curl -s -X POST http://127.0.0.1:5910/api/cancel_batch \
+  -H "X-M590-Token: $M590_HUB_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{}'
 curl -s -H "X-M590-Token: $M590_HUB_TOKEN" http://127.0.0.1:5910/api/status
 ```
 
@@ -251,8 +261,9 @@ UI 加入页「局域网设备」旁有刷新图标。
 
 ## 未做
 
-- 文件夹 / 端到端 OS 文件剪贴板 / 断点续传 / 独立数据连接
-- 多文件/文件夹和断点续传仍不在当前能力范围；需另建设计任务
+- Windows Explorer 多文件/文件夹虚拟剪贴板（task-057）
+- Linux FUSE 虚拟目录树与 Nautilus 多文件/文件夹粘贴（task-058）
+- 断点续传 / 多文件并行 / 独立数据连接
 - 设置页「发现方式」开关  
 - （已取消）019A  
 

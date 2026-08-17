@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,9 +7,10 @@ use fs2::available_space;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    bytes_to_hex, validate_transfer_id, ConnectionState, DeviceId, FileCancelPayload,
-    FileChunkPayload, FileCompletePayload, FileOfferPayload, FileRequestPayload, Message,
-    ProtocolError, SessionError, SyncState, MAX_FILE_CHUNK_BYTES, PROTOCOL_VERSION,
+    bytes_to_hex, validate_transfer_id, BatchEntry, BatchEntryKind, ConnectionState, DeviceId,
+    FileBatchOfferPayload, FileCancelPayload, FileChunkPayload, FileCompletePayload,
+    FileOfferPayload, FileRequestPayload, Message, ProtocolError, SessionError, SyncState,
+    MAX_FILE_CHUNK_BYTES, PROTOCOL_VERSION,
 };
 
 /// Max remembered clipboard content IDs for dedup (send + receive).
@@ -95,6 +96,22 @@ pub enum QueueFileResult {
     UnknownTransferId,
 }
 
+/// Local path backing one regular-file entry in an outbound batch manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchFileSource {
+    pub entry_id: String,
+    pub path: PathBuf,
+}
+
+impl BatchFileSource {
+    pub fn new(entry_id: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            entry_id: entry_id.into(),
+            path: path.into(),
+        }
+    }
+}
+
 /// Result of handling inbound file-channel messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundFileResult {
@@ -103,6 +120,13 @@ pub enum InboundFileResult {
         transfer_id: String,
         file_name: String,
         size: u64,
+    },
+    /// Peer announced a validated file/directory manifest. File entries can be requested by
+    /// `entry_id` through the existing single-file request/chunk/complete chain.
+    BatchOffered {
+        batch_id: String,
+        display_name: String,
+        entries: Vec<BatchEntry>,
     },
     /// Verified bytes from a stream-target transfer. The daemon should feed them to its pipe.
     Chunk { transfer_id: String, data: Vec<u8> },
@@ -654,6 +678,110 @@ impl Session {
         Ok(QueueFileResult::Queued)
     }
 
+    /// Stage a validated batch manifest and its regular-file paths.
+    ///
+    /// The manifest is announced once. Each regular-file entry is then served through the
+    /// existing `FileRequest → FileChunk → FileComplete` lifecycle, so the peer can request
+    /// entries one at a time and the session keeps only one active byte stream.
+    pub fn offer_file_batch_paths(
+        &mut self,
+        batch_id: impl Into<String>,
+        display_name: impl Into<String>,
+        entries: Vec<BatchEntry>,
+        sources: Vec<BatchFileSource>,
+    ) -> Result<QueueFileResult, SessionError> {
+        self.pending_outbox.clear();
+        self.last_inbound_clipboard = None;
+        self.last_inbound_file = None;
+        if self.state != ConnectionState::Connected {
+            return Err(SessionError::InvalidTransition {
+                from: self.state,
+                event: "offer_file_batch_paths",
+            });
+        }
+
+        let payload =
+            FileBatchOfferPayload::new(self.local_device.clone(), batch_id, display_name, entries)?;
+        let mut source_by_id = HashMap::with_capacity(sources.len());
+        for source in sources {
+            validate_transfer_id(&source.entry_id)?;
+            if source_by_id
+                .insert(source.entry_id.clone(), source)
+                .is_some()
+            {
+                return Err(ProtocolError::InvalidFile("duplicate batch file source").into());
+            }
+        }
+
+        let file_entries: Vec<&BatchEntry> = payload
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == BatchEntryKind::File)
+            .collect();
+        if file_entries.len() != source_by_id.len() {
+            return Err(ProtocolError::InvalidFile(
+                "batch file source count does not match manifest",
+            )
+            .into());
+        }
+        let total_bytes = file_entries.iter().map(|entry| entry.size).sum::<u64>();
+
+        let mut staged = Vec::with_capacity(file_entries.len());
+        let mut seen_ids = HashSet::with_capacity(file_entries.len());
+        for entry in file_entries {
+            if !seen_ids.insert(entry.entry_id.as_str()) {
+                return Err(ProtocolError::InvalidFile("duplicate batch entry id").into());
+            }
+            if self.staged_outbound_files.contains_key(&entry.entry_id)
+                || self
+                    .active_outbound
+                    .as_ref()
+                    .is_some_and(|active| active.transfer_id == entry.entry_id)
+            {
+                return Ok(QueueFileResult::DuplicateTransferId);
+            }
+            let Some(source) = source_by_id.remove(&entry.entry_id) else {
+                return Err(ProtocolError::InvalidFile("missing batch file source").into());
+            };
+            let meta = fs::symlink_metadata(&source.path).map_err(|_| {
+                SessionError::Protocol(ProtocolError::InvalidFile("failed to stat batch file"))
+            })?;
+            if !meta.is_file() {
+                return Err(
+                    ProtocolError::InvalidFile("batch source is not a regular file").into(),
+                );
+            }
+            if meta.len() != entry.size {
+                return Err(
+                    ProtocolError::InvalidFile("batch source changed after manifest scan").into(),
+                );
+            }
+            staged.push((
+                entry.entry_id.clone(),
+                StagedOutboundFile {
+                    file_name: entry.relative_path.clone(),
+                    size: entry.size,
+                    body: OutboundBody::Path(source.path),
+                    sha256_hex: (!entry.sha256_hex.is_empty()).then(|| entry.sha256_hex.clone()),
+                },
+            ));
+        }
+        if !source_by_id.is_empty() {
+            return Err(ProtocolError::InvalidFile("unknown batch file source").into());
+        }
+
+        for (entry_id, staged_file) in staged {
+            self.staged_outbound_files.insert(entry_id, staged_file);
+        }
+        self.sync_state = SyncState::Syncing;
+        self.last_file_transfer_id = Some(payload.batch_id.clone());
+        self.last_file_name = Some(payload.display_name.clone());
+        self.last_file_bytes = Some(total_bytes);
+        self.pending_outbox.push(Message::file_batch_offer(payload));
+        self.sync_state = SyncState::Idle;
+        Ok(QueueFileResult::Queued)
+    }
+
     /// Request bytes for a peer offer previously observed via [`InboundFileResult::Offered`].
     pub fn request_file(
         &mut self,
@@ -844,10 +972,7 @@ impl Session {
             Message::FileChunk(payload) => self.on_file_chunk(payload),
             Message::FileComplete(payload) => self.on_file_complete(payload),
             Message::FileCancel(payload) => self.on_file_cancel(payload),
-            Message::FileBatchOffer(_) => Err(ProtocolError::InvalidMessage(
-                "file batch offers are not enabled in the single-file session",
-            )
-            .into()),
+            Message::FileBatchOffer(payload) => self.on_file_batch_offer(payload),
             Message::Goodbye { .. } => {
                 self.reset_to_disconnected(true);
                 Ok(())
@@ -1117,6 +1242,67 @@ impl Session {
             transfer_id: payload.transfer_id,
             file_name: payload.file_name,
             size: payload.size,
+        });
+        Ok(())
+    }
+
+    fn on_file_batch_offer(&mut self, payload: FileBatchOfferPayload) -> Result<(), SessionError> {
+        self.ensure_connected_file_peer(&payload.device_id, "file_batch_offer")?;
+        if let Err(err) = payload.validate() {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.batch_id,
+                message: err.to_string(),
+            });
+            return Ok(());
+        }
+
+        let file_entries: Vec<&BatchEntry> = payload
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == BatchEntryKind::File)
+            .collect();
+        let batch_bytes = file_entries.iter().map(|entry| entry.size).sum::<u64>();
+        let reserved = self.inbound_reserved_bytes();
+        if batch_bytes > MAX_IN_FLIGHT_FILE_BYTES.saturating_sub(reserved) {
+            self.last_inbound_file = Some(InboundFileResult::Failed {
+                transfer_id: payload.batch_id,
+                message: format!(
+                    "inbound batch reservation exceeds limit: {reserved} + {batch_bytes} > {MAX_IN_FLIGHT_FILE_BYTES}"
+                ),
+            });
+            return Ok(());
+        }
+
+        for entry in &file_entries {
+            if self.inbound_offers.contains_key(&entry.entry_id)
+                || self.incoming_files.contains_key(&entry.entry_id)
+            {
+                self.last_inbound_file = Some(InboundFileResult::Failed {
+                    transfer_id: payload.batch_id,
+                    message: format!("duplicate inbound batch entry id: {}", entry.entry_id),
+                });
+                return Ok(());
+            }
+        }
+
+        for entry in file_entries {
+            self.inbound_offers.insert(
+                entry.entry_id.clone(),
+                InboundOffer {
+                    file_name: entry.relative_path.clone(),
+                    size: entry.size,
+                    sha256_hex: entry.sha256_hex.clone(),
+                    from: payload.device_id.clone(),
+                },
+            );
+        }
+        self.last_file_transfer_id = Some(payload.batch_id.clone());
+        self.last_file_name = Some(payload.display_name.clone());
+        self.last_file_bytes = Some(batch_bytes);
+        self.last_inbound_file = Some(InboundFileResult::BatchOffered {
+            batch_id: payload.batch_id,
+            display_name: payload.display_name,
+            entries: payload.entries,
         });
         Ok(())
     }
@@ -1751,7 +1937,7 @@ fn cleanup_stale_part_files(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BatchEntry, ClipboardTextPayload, FileBatchOfferPayload};
+    use crate::{BatchEntry, ClipboardTextPayload};
 
     fn exchange(a: &mut Session, b: &mut Session) {
         use std::collections::VecDeque;
@@ -1795,25 +1981,75 @@ mod tests {
     }
 
     #[test]
-    fn single_file_session_rejects_batch_offer_until_batch_runtime_is_enabled() {
-        let (mut host, _joiner) = pair_host_joiner();
-        let offer = FileBatchOfferPayload::new(
-            DeviceId::new("joiner"),
-            "batch-1",
-            "files",
-            vec![BatchEntry::file("file-1", "a.txt", 1, "").unwrap()],
-        )
-        .unwrap();
-        let err = host
-            .handle(SessionEvent::Message(Message::file_batch_offer(offer)))
-            .unwrap_err();
+    fn batch_offer_stages_paths_and_transfers_files_sequentially() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        let dir = std::env::temp_dir().join(format!(
+            "m590-batch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        host.set_file_receive_dir(dir.join("parts"));
+        let first = dir.join("first.txt");
+        let second = dir.join("second.bin");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second-file").unwrap();
+        let entries = vec![
+            BatchEntry::directory("dir-1", "folder").unwrap(),
+            BatchEntry::file("file-1", "folder/first.txt", 5, "").unwrap(),
+            BatchEntry::file("file-2", "second.bin", 11, "").unwrap(),
+        ];
+        let sources = vec![
+            BatchFileSource::new("file-1", &first),
+            BatchFileSource::new("file-2", &second),
+        ];
+
         assert_eq!(
-            err,
-            SessionError::Protocol(ProtocolError::InvalidMessage(
-                "file batch offers are not enabled in the single-file session"
-            ))
+            joiner
+                .offer_file_batch_paths("batch-1", "files", entries.clone(), sources)
+                .unwrap(),
+            QueueFileResult::Queued
         );
-        assert_eq!(host.state(), ConnectionState::Connected);
+        let offer = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer)).unwrap();
+        assert_eq!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::BatchOffered {
+                batch_id: "batch-1".into(),
+                display_name: "files".into(),
+                entries,
+            })
+        );
+
+        for (entry_id, relative_path, expected) in [
+            ("file-1", "folder/first.txt", b"first".as_slice()),
+            ("file-2", "second.bin", b"second-file".as_slice()),
+        ] {
+            assert_eq!(
+                host.request_file(entry_id).unwrap(),
+                QueueFileResult::Queued
+            );
+            joiner
+                .handle(SessionEvent::Message(host.take_outbox().pop().unwrap()))
+                .unwrap();
+            drain_file_send(&mut joiner, &mut host);
+            let Some(InboundFileResult::Applied {
+                transfer_id,
+                file_name,
+                path,
+                ..
+            }) = host.take_inbound_file()
+            else {
+                panic!("expected applied batch entry");
+            };
+            assert_eq!(transfer_id, entry_id);
+            assert_eq!(file_name, relative_path);
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            fs::remove_file(path).unwrap();
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

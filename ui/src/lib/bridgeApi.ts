@@ -26,6 +26,13 @@ export type HubStatus = {
   last_file_saved_path?: string | null
   file_bytes_received?: number | null
   file_bytes_total?: number | null
+  file_batch_id?: string | null
+  file_batch_name?: string | null
+  file_batch_files_completed?: number | null
+  file_batch_files_total?: number | null
+  file_batch_bytes_completed?: number | null
+  file_batch_bytes_total?: number | null
+  file_batch_current_path?: string | null
   /** false: OS file-manager copy may not be visible (e.g. GNOME Wayland). */
   file_clipboard_watch_likely?: boolean
 }
@@ -393,6 +400,14 @@ export async function postSendFile(path: string): Promise<void> {
   await request('/api/send_file', { method: 'POST', body: JSON.stringify({ path }) })
 }
 
+export async function postSendBatch(paths: string[]): Promise<void> {
+  await request('/api/send_batch', { method: 'POST', body: JSON.stringify({ paths }) })
+}
+
+export async function postCancelBatch(): Promise<void> {
+  await request('/api/cancel_batch', { method: 'POST', body: '{}' })
+}
+
 export async function postSendFileBytes(input: {
   name: string
   data_base64: string
@@ -446,6 +461,8 @@ export function filePhaseLabel(phase: string | null | undefined): string {
       return '已完成'
     case 'failed':
       return '失败'
+    case 'cancelled':
+      return '已取消'
     default:
       return '空闲'
   }
@@ -462,11 +479,30 @@ export function fileProgressPercent(status: HubStatus | null): number {
   return Math.max(0, Math.min(100, Math.round((got / total) * 100)))
 }
 
-/** Tauri native file dialog → absolute path. null if cancelled / not in Tauri. */
-export async function pickSendFileNative(): Promise<string | null> {
+export function batchProgressPercent(status: HubStatus | null): number {
+  if (!status?.file_batch_id) return fileProgressPercent(status)
+  const total = status.file_batch_bytes_total ?? 0
+  if (total <= 0) {
+    return status.file_transfer_phase === 'done' ? 100 : 0
+  }
+  const completed = status.file_batch_bytes_completed ?? 0
+  const current = status.file_batch_current_path ? (status.file_bytes_received ?? 0) : 0
+  return Math.max(0, Math.min(100, Math.round(((completed + current) / total) * 100)))
+}
+
+/** Tauri native multi-file dialog → absolute paths. Empty if cancelled / not in Tauri. */
+export async function pickSendFilesNative(): Promise<string[]> {
+  const invoke = getTauriInvoke()
+  if (!invoke) return []
+  const paths = await invoke('pick_send_files')
+  return Array.isArray(paths) ? paths.filter((path): path is string => typeof path === 'string') : []
+}
+
+/** Tauri native directory dialog → absolute path. null if cancelled / not in Tauri. */
+export async function pickSendFolderNative(): Promise<string | null> {
   const invoke = getTauriInvoke()
   if (!invoke) return null
-  const path = (await invoke('pick_send_file')) as string | null
+  const path = (await invoke('pick_send_folder')) as string | null
   return path ?? null
 }
 

@@ -1,7 +1,7 @@
 # 协议草案 · M590Bridge
 
-> 状态：draft（至 **task-055** 批次清单与路径安全基础）
-> 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；**单文件 offer/request/chunk/complete（磁盘流 + SHA-256）**；批次清单协议基础
+> 状态：draft（至 **task-056** 批次清单与串行运行时）
+> 范围：局域网 1 对 1；文本 + 图片（RGBA/PNG）；**文件 offer/request/chunk/complete（磁盘流 + SHA-256）**；多文件/目录批次清单与串行传输
 
 ## 版本
 
@@ -35,7 +35,7 @@
 分片：`FILE_CHUNK_SIZE = 256 KiB`；每轮泵送最多 `OUTBOUND_CHUNKS_PER_PUMP = 4` 片；单个 `FileChunk` 不得超过 256 KiB。
 `transfer_id`：最多 128 字节，只允许 ASCII 字母、数字、`.`、`_`、`-`，且不能为 `.` / `..`；它只能作为接收临时目录下的单路径组件。
 
-批次清单限制：`batch_id` 和 `entry_id` 均为安全单路径组件；相对路径统一使用 `/`，拒绝绝对路径、Windows 盘符/UNC、反斜杠、空组件、`.`、`..` 和 NUL。单批次最多 4096 个条目、路径最多 64 层、编码清单最多 4 MiB、文件总字节最多 8 GiB。条目类型为 `file` 或 `directory`；目录的 `size` 固定为 0 且 `sha256_hex` 必须为空。清单还拒绝重复 entry id 和相对路径。后续 task-056 会把文件条目的 `entry_id` 作为现有单文件请求链路的安全传输 id；生成方必须保证活动会话内唯一。
+批次清单限制：`batch_id` 和 `entry_id` 均为安全单路径组件；相对路径统一使用 `/`，拒绝绝对路径、Windows 盘符/UNC、反斜杠、空组件、`.`、`..` 和 NUL。单批次最多 4096 个条目、路径最多 64 层、编码清单最多 4 MiB、文件总字节最多 8 GiB。条目类型为 `file` 或 `directory`；目录的 `size` 固定为 0 且 `sha256_hex` 必须为空。清单还拒绝重复 entry id 和相对路径。task-056 将文件条目的 `entry_id` 作为现有单文件请求链路的安全传输 id；发送端用随机批次 nonce + 递增序号保证活动会话内唯一。
 
 ## 消息类型（msg_type）
 
@@ -78,13 +78,24 @@
 **本刀取舍**：仍走**同一 TCP 控制/数据连接**串行帧（未开独立数据连接）；靠分批 pump 避免一次把整文件 chunk 堆进 outbox，心跳/剪贴板可在 pump 间隙处理。
 Windows 单文件 OS 文件剪贴板现已接入：OLE STA 仅持有虚拟 `IDataObject`，网络 Session 线程负责分片和校验，有界管道提供背压。读取端关闭、剪贴板被替换或已开始读取后 30 秒无进展时发送 `FileCancel`；尚未粘贴的 offer 保留到剪贴板被替换或会话断开。`IStream` 只支持当前位置 no-op seek；向前/向后移动均明确失败。
 
-**仍未做**：批次运行时、文件夹虚拟目录、断点续传、多文件并行、独立数据连接；Linux
-FUSE 当前只完成单文件网络按需读取。
+### 批次运行时（task-056）
 
-`FileBatchOffer` 目前只完成协议模型、路径安全校验和 frame round-trip；单文件 `Session`
-会明确拒绝该消息，尚未接入 UI、Hub、Windows OLE 或 Linux FUSE 的批次行为（task-055）。
+1. Hub 的 `/api/send_batch` 接受多个本地文件/目录路径；目录按平台无关相对路径稳定排序，
+   不跟随 symlink，扫描结果构造成一个 `FileBatchOffer`。
+2. 接收端验证清单后按 manifest 顺序一次只请求一个文件条目；每个条目继续复用
+   `FileRequest → FileChunk → FileComplete`，不并行、不新增连接。
+3. 完成条目先从 `.partial/<entry_id>.part` 移入 `.partial/<batch_id>.batch/` 暂存树；
+   整批成功后才把单一顶层节点或多顶层容器发布到保存目录，同名目标使用后缀避让。
+4. 新批次替换旧批次；`/api/cancel_batch`、对端取消、条目失败和断线均清理未完成
+   `.part` 与批次暂存树。status 同时暴露批次文件数/总字节和当前条目进度。
 
-**hub**：自动 request + `.partial` → 保存目录；`POST /api/send_file`（路径流式）；`send_file_bytes` 仍限内存 cap。
+**仍未做**：Windows OLE 多文件 `IDataObject`、Linux FUSE 虚拟目录树、断点续传、
+多文件并行、独立数据连接。当前批次由 UI 手动选择/拖放后自动保存，OS 文件管理器
+“复制多个文件/文件夹后在对端直接粘贴”分别留给 task-057/task-058。
+
+**hub**：单文件自动 request/虚拟剪贴板；`POST /api/send_file`（路径流式）；
+`send_file_bytes` 仍限内存 cap；`POST /api/send_batch` 扫描路径并串行传输；
+`POST /api/cancel_batch` 取消当前批次。
 
 所有业务消息在类型上携带或保留 `DeviceId`，便于以后扩展；**运行时 MVP 仅 1 peer**。
 
@@ -95,6 +106,7 @@ FUSE 当前只完成单文件网络按需读取。
 - Tauri WebView 通过受限 command 获取内嵌 Hub 的进程临时令牌；独立 daemon 可用 `M590_HUB_TOKEN` 注入，未注入时只输出到当前终端。
 - CORS 仅回显 Tauri origin；debug 构建额外允许带有效端口的 localhost/loopback 开发 origin。无 `Origin` 的 CLI 请求仍必须鉴权。
 - `send_file_bytes` 的源文件上限为 4 MiB；HTTP reader 为 Base64 JSON 放大预留空间，并在读取 body 前校验 `Content-Length`。
+- `send_batch` 的 JSON 为 `{"paths":["..."]}`；路径只在本机 Hub 解析，不在线上传输绝对路径。
 
 ## 会话状态
 
@@ -108,7 +120,7 @@ FUSE 当前只完成单文件网络按需读取。
 
 - QUIC / 公网中继
 - 加密套件定稿（见 open-questions Q7）
-- 文件夹 / OS 文件剪贴板 / 断点续传 / 多文件并行
+- 多文件/文件夹 OS 剪贴板粘贴 / 断点续传 / 多文件并行
 - 多 peer 网格
 
 ## 传输（task-006）

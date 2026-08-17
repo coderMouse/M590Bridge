@@ -1,25 +1,26 @@
 //! Localhost HTTP control API for the operable UI shell.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use m590_clipboard::{ClipboardService, PlatformClipboard};
 use m590_core::{
-    ConnectionState, DeviceId, InboundClipboardResult, InboundFileResult, Message,
-    QueueClipboardResult, QueueFileResult, Session, SessionEvent, DEFAULT_HEARTBEAT_MISS_THRESHOLD,
-    MAX_FILE_BYTES, MAX_MEMORY_FILE_BYTES,
+    BatchEntry, BatchEntryKind, BatchFileSource, ConnectionState, DeviceId, FileBatchOfferPayload,
+    InboundClipboardResult, InboundFileResult, Message, QueueClipboardResult, QueueFileResult,
+    Session, SessionEvent, DEFAULT_HEARTBEAT_MISS_THRESHOLD, MAX_BATCH_ENTRIES,
+    MAX_BATCH_PATH_DEPTH, MAX_FILE_BYTES, MAX_MEMORY_FILE_BYTES,
 };
 use m590_net::{accept_framed, connect_framed_timeout, listen_on, TcpFrameStream};
 
 use crate::config;
 use crate::discovery::DiscoveryHandle;
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 use crate::file_save;
 #[cfg(target_os = "linux")]
 use crate::linux_virtual_file_manager::LinuxVirtualFileManager;
@@ -33,6 +34,7 @@ static STOP_BRIDGE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_RUNNING: AtomicBool = AtomicBool::new(false);
 static BRIDGE_STOPPING: AtomicBool = AtomicBool::new(false);
 static BRIDGE_TRANSITION: Mutex<()> = Mutex::new(());
+static NEXT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
 
 type SharedDiscovery = Arc<Mutex<Option<Arc<DiscoveryHandle>>>>;
 
@@ -88,6 +90,84 @@ struct QueuedFileStatus {
     transfer_id: String,
     file_name: String,
     bytes: u64,
+}
+
+#[derive(Debug)]
+struct PreparedBatch {
+    batch_id: String,
+    display_name: String,
+    entries: Vec<BatchEntry>,
+    sources: Vec<BatchFileSource>,
+}
+
+#[derive(Debug)]
+struct OutboundBatchState {
+    batch_id: String,
+    display_name: String,
+    files: Vec<BatchEntry>,
+    pending_ids: HashSet<String>,
+    completed_files: u32,
+    completed_bytes: u64,
+    total_bytes: u64,
+}
+
+impl OutboundBatchState {
+    fn from_prepared(prepared: &PreparedBatch) -> Self {
+        let files: Vec<BatchEntry> = prepared
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == BatchEntryKind::File)
+            .cloned()
+            .collect();
+        Self {
+            batch_id: prepared.batch_id.clone(),
+            display_name: prepared.display_name.clone(),
+            pending_ids: files.iter().map(|entry| entry.entry_id.clone()).collect(),
+            completed_files: 0,
+            completed_bytes: 0,
+            total_bytes: files.iter().map(|entry| entry.size).sum(),
+            files,
+        }
+    }
+
+    fn entry(&self, entry_id: &str) -> Option<&BatchEntry> {
+        self.files.iter().find(|entry| entry.entry_id == entry_id)
+    }
+}
+
+#[derive(Debug)]
+struct InboundBatchState {
+    batch_id: String,
+    display_name: String,
+    entries: Vec<BatchEntry>,
+    files: Vec<BatchEntry>,
+    pending_ids: HashSet<String>,
+    current_index: usize,
+    completed_files: u32,
+    completed_bytes: u64,
+    total_bytes: u64,
+    save_dir: PathBuf,
+    partial_dir: PathBuf,
+    staging_dir: PathBuf,
+    committed: bool,
+}
+
+impl InboundBatchState {
+    fn current(&self) -> Option<&BatchEntry> {
+        self.files.get(self.current_index)
+    }
+}
+
+impl Drop for InboundBatchState {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for entry in &self.files {
+            let _ = fs::remove_file(self.partial_dir.join(format!("{}.part", entry.entry_id)));
+        }
+        let _ = fs::remove_dir_all(&self.staging_dir);
+    }
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -220,7 +300,7 @@ pub fn run_hub_with_token_on_ready(
     println!("hub_auth=required header=X-M590-Token");
     println!("hub_status=ready (UI can open operable shell and point API to this address)");
     println!(
-        "endpoints=GET /api/status /api/config /api/discover POST /api/discover/refresh /api/listen /api/connect /api/push /api/send_file /api/disconnect /api/config"
+        "endpoints=GET /api/status /api/config /api/discover POST /api/discover/refresh /api/listen /api/connect /api/push /api/send_file /api/send_batch /api/cancel_batch /api/disconnect /api/config"
     );
     let cfg_path = config::default_config_path();
     println!("config_path={}", cfg_path.display());
@@ -393,6 +473,28 @@ fn handle_http(
                 Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
             }
         }
+        ("POST", "/api/send_batch") => match json_string_array(&request.body, "paths")
+            .and_then(|paths| push_batch(&shared, paths))
+        {
+            Ok(()) => write_response(
+                &mut stream,
+                200,
+                "application/json",
+                "{\"ok\":true}",
+                cors_origin,
+            ),
+            Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
+        },
+        ("POST", "/api/cancel_batch") => match queue_batch_cancel(&shared) {
+            Ok(()) => write_response(
+                &mut stream,
+                200,
+                "application/json",
+                "{\"ok\":true}",
+                cors_origin,
+            ),
+            Err(err) => write_json_error(&mut stream, 400, &err, cors_origin),
+        },
         ("POST", "/api/send_file_bytes") => {
             let name = json_get(&request.body, "name").unwrap_or_default();
             let data_b64 = json_get(&request.body, "data_base64").unwrap_or_default();
@@ -671,6 +773,24 @@ fn json_get(body: &str, key: &str) -> Option<String> {
         serde_json::Value::Number(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn json_string_array(body: &str, key: &str) -> Result<Vec<String>, String> {
+    let object: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("invalid JSON: {err}"))?;
+    let values = object
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{key} must be an array of strings"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{key} must contain only strings"))
+        })
+        .collect()
 }
 
 fn claim_bridge() -> Result<(), String> {
@@ -1161,7 +1281,7 @@ fn push_file(shared: &SharedStatus, path: String) -> Result<(), String> {
     if phase != HubPhase::Connected {
         return Err("not connected".into());
     }
-    if pending.file_path.is_some() {
+    if pending.file_path.is_some() || pending.batch.is_some() {
         return Err("file send already pending".into());
     }
     pending.file_path = Some(path);
@@ -1172,6 +1292,8 @@ struct PendingCommands {
     text: Option<String>,
     file_path: Option<String>,
     file_bytes: Option<(String, Vec<u8>)>,
+    batch: Option<PreparedBatch>,
+    cancel_batch: bool,
 }
 
 impl PendingCommands {
@@ -1180,6 +1302,8 @@ impl PendingCommands {
             text: None,
             file_path: None,
             file_bytes: None,
+            batch: None,
+            cancel_batch: false,
         }
     }
 
@@ -1187,6 +1311,8 @@ impl PendingCommands {
         self.text = None;
         self.file_path = None;
         self.file_bytes = None;
+        self.batch = None;
+        self.cancel_batch = false;
     }
 }
 
@@ -1225,11 +1351,221 @@ fn push_file_bytes(shared: &SharedStatus, name: String, data_b64: String) -> Res
             data.len()
         ));
     }
-    if pending.file_bytes.is_some() {
+    if pending.file_bytes.is_some() || pending.batch.is_some() {
         return Err("file bytes send already pending".into());
     }
     pending.file_bytes = Some((name, data));
     Ok(())
+}
+
+#[derive(Debug)]
+struct ScannedBatchEntry {
+    relative_path: String,
+    kind: BatchEntryKind,
+    size: u64,
+    source: Option<PathBuf>,
+}
+
+fn push_batch(shared: &SharedStatus, paths: Vec<String>) -> Result<(), String> {
+    if with_status(shared, |s| s.phase) != HubPhase::Connected {
+        return Err("not connected".into());
+    }
+    let prepared = scan_batch_paths(paths)?;
+    let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
+    if pending.file_path.is_some() || pending.file_bytes.is_some() || pending.batch.is_some() {
+        return Err("file send already pending".into());
+    }
+    pending.batch = Some(prepared);
+    Ok(())
+}
+
+fn queue_batch_cancel(shared: &SharedStatus) -> Result<(), String> {
+    if with_status(shared, |s| s.phase) != HubPhase::Connected {
+        return Err("not connected".into());
+    }
+    let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
+    pending.batch = None;
+    pending.cancel_batch = true;
+    Ok(())
+}
+
+fn scan_batch_paths(paths: Vec<String>) -> Result<PreparedBatch, String> {
+    if paths.is_empty() {
+        return Err("paths must contain at least one file or directory".into());
+    }
+    if paths.len() > MAX_BATCH_ENTRIES {
+        return Err(format!(
+            "too many selected paths: {} > {MAX_BATCH_ENTRIES}",
+            paths.len()
+        ));
+    }
+
+    let batch_seq = NEXT_BATCH_ID.fetch_add(1, Ordering::Relaxed);
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|error| format!("generate batch id: {error}"))?;
+    let batch_id = format!("batch-{}-{batch_seq}", m590_core::bytes_to_hex(&nonce));
+    let mut roots = Vec::with_capacity(paths.len());
+    for raw in paths {
+        if raw.is_empty() {
+            return Err("selected path must not be empty".into());
+        }
+        let path = PathBuf::from(&raw);
+        let metadata = fs::symlink_metadata(&path).map_err(|err| format!("stat {raw}: {err}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("symbolic links are not supported: {raw}"));
+        }
+        let root_name = utf8_file_name(&path)?;
+        roots.push((root_name, path, metadata));
+    }
+    roots.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let display_name = if roots.len() == 1 {
+        roots[0].0.clone()
+    } else {
+        format!("{} items", roots.len())
+    };
+    let mut scanned = Vec::new();
+    for (root_name, path, metadata) in roots {
+        if metadata.is_file() {
+            scan_regular_file(&path, root_name, metadata.len(), &mut scanned)?;
+        } else if metadata.is_dir() {
+            scanned.push(ScannedBatchEntry {
+                relative_path: root_name.clone(),
+                kind: BatchEntryKind::Directory,
+                size: 0,
+                source: None,
+            });
+            scan_directory(&path, &root_name, 1, &mut scanned)?;
+        } else {
+            return Err(format!("unsupported filesystem entry: {}", path.display()));
+        }
+        if scanned.len() > MAX_BATCH_ENTRIES {
+            return Err(format!(
+                "batch contains too many entries: {} > {MAX_BATCH_ENTRIES}",
+                scanned.len()
+            ));
+        }
+    }
+    scanned.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+
+    let mut entries = Vec::with_capacity(scanned.len());
+    let mut sources = Vec::new();
+    for (index, item) in scanned.into_iter().enumerate() {
+        let entry_id = format!("{batch_id}-entry-{}", index + 1);
+        let entry = BatchEntry::new(
+            entry_id.clone(),
+            item.relative_path,
+            item.kind,
+            item.size,
+            "",
+        )
+        .map_err(|err| err.to_string())?;
+        if let Some(path) = item.source {
+            sources.push(BatchFileSource::new(entry_id, path));
+        }
+        entries.push(entry);
+    }
+
+    FileBatchOfferPayload::new(
+        DeviceId::new("local-batch-scan"),
+        batch_id.clone(),
+        display_name.clone(),
+        entries.clone(),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(PreparedBatch {
+        batch_id,
+        display_name,
+        entries,
+        sources,
+    })
+}
+
+fn scan_directory(
+    directory: &Path,
+    relative_directory: &str,
+    depth: usize,
+    scanned: &mut Vec<ScannedBatchEntry>,
+) -> Result<(), String> {
+    if depth >= MAX_BATCH_PATH_DEPTH {
+        return Err(format!(
+            "directory tree exceeds depth limit {MAX_BATCH_PATH_DEPTH}: {}",
+            directory.display()
+        ));
+    }
+    let mut children = Vec::new();
+    for child in fs::read_dir(directory)
+        .map_err(|err| format!("read directory {}: {err}", directory.display()))?
+    {
+        let child = child.map_err(|err| format!("read directory entry: {err}"))?;
+        let name = child
+            .file_name()
+            .to_str()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("non-UTF-8 file name under {}", directory.display()))?
+            .to_string();
+        children.push((name, child.path()));
+    }
+    children.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (name, path) in children {
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+        // Never follow directory or file symlinks. Nested links are deliberately omitted.
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let relative_path = format!("{relative_directory}/{name}");
+        if metadata.is_dir() {
+            scanned.push(ScannedBatchEntry {
+                relative_path: relative_path.clone(),
+                kind: BatchEntryKind::Directory,
+                size: 0,
+                source: None,
+            });
+            if scanned.len() > MAX_BATCH_ENTRIES {
+                return Err(format!(
+                    "batch contains too many entries: {} > {MAX_BATCH_ENTRIES}",
+                    scanned.len()
+                ));
+            }
+            scan_directory(&path, &relative_path, depth + 1, scanned)?;
+        } else if metadata.is_file() {
+            scan_regular_file(&path, relative_path, metadata.len(), scanned)?;
+        } else {
+            return Err(format!("unsupported filesystem entry: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn scan_regular_file(
+    path: &Path,
+    relative_path: String,
+    size: u64,
+    scanned: &mut Vec<ScannedBatchEntry>,
+) -> Result<(), String> {
+    if size > MAX_FILE_BYTES {
+        return Err(format!(
+            "file too large: {} is {size}B > limit {MAX_FILE_BYTES}B",
+            path.display()
+        ));
+    }
+    scanned.push(ScannedBatchEntry {
+        relative_path,
+        kind: BatchEntryKind::File,
+        size,
+        source: Some(path.to_path_buf()),
+    });
+    Ok(())
+}
+
+fn utf8_file_name(path: &Path) -> Result<String, String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("path has no UTF-8 file name: {}", path.display()))
 }
 
 fn listen_worker(
@@ -1330,6 +1666,8 @@ fn run_session_loop(
     let mut content_seq = 0u64;
     let mut latest_clipboard_file_offer_id: Option<String> = None;
     let mut queued_file_status: Option<QueuedFileStatus> = None;
+    let mut outbound_batch: Option<OutboundBatchState> = None;
+    let mut inbound_batch: Option<InboundBatchState> = None;
     #[cfg(target_os = "windows")]
     let ole_manager = WindowsVirtualFileManager::start().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
@@ -1432,6 +1770,21 @@ fn run_session_loop(
             last_heartbeat = Instant::now();
         }
 
+        let cancel_batch = {
+            let mut pending = PENDING_COMMANDS.lock().expect("pending commands lock");
+            std::mem::take(&mut pending.cancel_batch)
+        };
+        if cancel_batch {
+            cancel_runtime_batch(
+                &shared,
+                session,
+                conn,
+                &mut outbound_batch,
+                &mut inbound_batch,
+                "cancelled by local user",
+            )?;
+        }
+
         let pending_text = PENDING_COMMANDS
             .lock()
             .expect("pending commands lock")
@@ -1461,6 +1814,14 @@ fn run_session_loop(
             .file_path
             .take();
         if let Some(path) = pending_file {
+            cancel_runtime_batch(
+                &shared,
+                session,
+                conn,
+                &mut outbound_batch,
+                &mut inbound_batch,
+                "replaced by a single-file send",
+            )?;
             match offer_local_file(session, &mut content_seq, &path) {
                 Ok((summary, transfer_id, file_name, bytes)) => {
                     conn.send_all(session.take_outbox().iter())
@@ -1492,6 +1853,14 @@ fn run_session_loop(
             .file_bytes
             .take();
         if let Some((name, data)) = pending_file_bytes {
+            cancel_runtime_batch(
+                &shared,
+                session,
+                conn,
+                &mut outbound_batch,
+                &mut inbound_batch,
+                "replaced by a single-file send",
+            )?;
             match offer_file_bytes(session, &mut content_seq, name, data) {
                 Ok((summary, transfer_id, file_name, bytes)) => {
                     conn.send_all(session.take_outbox().iter())
@@ -1517,6 +1886,54 @@ fn run_session_loop(
             }
         }
 
+        let pending_batch = PENDING_COMMANDS
+            .lock()
+            .expect("pending commands lock")
+            .batch
+            .take();
+        if let Some(prepared) = pending_batch {
+            cancel_runtime_batch(
+                &shared,
+                session,
+                conn,
+                &mut outbound_batch,
+                &mut inbound_batch,
+                "replaced by a newer batch",
+            )?;
+            let state = OutboundBatchState::from_prepared(&prepared);
+            match session.offer_file_batch_paths(
+                prepared.batch_id.clone(),
+                prepared.display_name.clone(),
+                prepared.entries,
+                prepared.sources,
+            ) {
+                Ok(QueueFileResult::Queued) => {
+                    let outbox = session.take_outbox();
+                    conn.send_all(outbox.iter()).map_err(|e| e.to_string())?;
+                    mark_outbound_batch_started(&shared, &state);
+                    if state.files.is_empty() {
+                        mark_batch_done(&shared, &state.batch_id, None);
+                    } else {
+                        outbound_batch = Some(state);
+                    }
+                }
+                Ok(other) => {
+                    with_status(&shared, |status| {
+                        mark_batch_failed(
+                            status,
+                            &prepared.batch_id,
+                            &format!("queue batch failed: {other:?}"),
+                        );
+                    });
+                }
+                Err(err) => {
+                    with_status(&shared, |status| {
+                        mark_batch_failed(status, &prepared.batch_id, &err.to_string());
+                    });
+                }
+            }
+        }
+
         // Stream more file chunks without starving the rest of the loop forever.
         if session.has_pending_outbound_file() {
             session.pump_outbound_file().map_err(|e| e.to_string())?;
@@ -1525,6 +1942,7 @@ fn run_session_loop(
             conn.send_all(outbox.iter()).map_err(|e| e.to_string())?;
             let resolutions =
                 note_outbound_file_completes(&shared, &outbox, &mut queued_file_status);
+            note_outbound_batch_completes(&shared, session, conn, &outbox, &mut outbound_batch)?;
             rearm_completed_clipboard_offers(
                 clipboard.as_mut(),
                 &mut latest_clipboard_file_offer_id,
@@ -1546,6 +1964,7 @@ fn run_session_loop(
                 Ok(Some(msg)) => {
                     file_progressed |=
                         matches!(msg, Message::FileChunk(_) | Message::FileComplete(_));
+                    note_outbound_batch_request(&shared, &msg, outbound_batch.as_ref());
                     session
                         .handle(SessionEvent::Message(msg))
                         .map_err(|e| e.to_string())?;
@@ -1554,6 +1973,13 @@ fn run_session_loop(
                     conn.send_all(outbox.iter()).map_err(|e| e.to_string())?;
                     let resolutions =
                         note_outbound_file_completes(&shared, &outbox, &mut queued_file_status);
+                    note_outbound_batch_completes(
+                        &shared,
+                        session,
+                        conn,
+                        &outbox,
+                        &mut outbound_batch,
+                    )?;
                     rearm_completed_clipboard_offers(
                         clipboard.as_mut(),
                         &mut latest_clipboard_file_offer_id,
@@ -1624,6 +2050,17 @@ fn run_session_loop(
                             }
                             _ => None,
                         };
+                        let batch_handled = handle_batch_file_event(
+                            &shared,
+                            session,
+                            conn,
+                            &file_event,
+                            &mut outbound_batch,
+                            &mut inbound_batch,
+                        )?;
+                        if batch_handled {
+                            continue;
+                        }
                         #[cfg(any(target_os = "linux", target_os = "windows"))]
                         if let Some(current) = virtual_receive.as_mut() {
                             if let InboundFileResult::Chunk { transfer_id, data } = &file_event {
@@ -1972,13 +2409,15 @@ fn run_session_loop(
                             }
                         }
                         #[cfg(not(target_os = "windows"))]
-                        if let Some((tid, got, total)) = session.inbound_file_progress() {
-                            with_status(&shared, |s| {
-                                s.file_transfer_phase = Some("receiving".into());
-                                s.last_file_transfer_id = Some(tid);
-                                s.file_bytes_received = Some(got);
-                                s.file_bytes_total = Some(total);
-                            });
+                        if inbound_batch.is_none() {
+                            if let Some((tid, got, total)) = session.inbound_file_progress() {
+                                with_status(&shared, |s| {
+                                    s.file_transfer_phase = Some("receiving".into());
+                                    s.last_file_transfer_id = Some(tid);
+                                    s.file_bytes_received = Some(got);
+                                    s.file_bytes_total = Some(total);
+                                });
+                            }
                         }
                     }
                 }
@@ -2581,11 +3020,660 @@ fn run_session_loop(
             }
         }
 
+        update_batch_progress(
+            &shared,
+            session,
+            outbound_batch.as_ref(),
+            inbound_batch.as_ref(),
+        );
+
         match session_loop_pause(session.has_active_file_transfer(), file_progressed) {
             SessionLoopPause::Yield => thread::yield_now(),
             SessionLoopPause::Sleep(delay) => thread::sleep(delay),
         }
     }
+}
+
+fn cancel_runtime_batch(
+    shared: &SharedStatus,
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    outbound: &mut Option<OutboundBatchState>,
+    inbound: &mut Option<InboundBatchState>,
+    reason: &str,
+) -> Result<(), String> {
+    let mut ids = Vec::new();
+    let mut cancelled_batch_id = None;
+    if let Some(state) = outbound.take() {
+        cancelled_batch_id = Some(state.batch_id.clone());
+        ids.extend(state.pending_ids);
+    }
+    if let Some(state) = inbound.take() {
+        cancelled_batch_id = Some(state.batch_id.clone());
+        ids.extend(state.pending_ids.iter().cloned());
+    }
+    if ids.is_empty() && cancelled_batch_id.is_none() {
+        return Ok(());
+    }
+    cancel_transfer_ids(session, conn, ids, reason)?;
+    with_status(shared, |status| {
+        status.file_transfer_phase = Some("cancelled".into());
+        if let Some(batch_id) = cancelled_batch_id {
+            status.last_file_transfer_id = Some(batch_id);
+        }
+        status.file_batch_current_path = None;
+        status.file_bytes_received = None;
+        status.file_bytes_total = None;
+        status.last_error = None;
+    });
+    Ok(())
+}
+
+fn cancel_transfer_ids(
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    ids: impl IntoIterator<Item = String>,
+    reason: &str,
+) -> Result<(), String> {
+    for transfer_id in ids {
+        session
+            .cancel_file(transfer_id, reason)
+            .map_err(|err| err.to_string())?;
+        let outbox = session.take_outbox();
+        conn.send_all(outbox.iter())
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn mark_outbound_batch_started(shared: &SharedStatus, batch: &OutboundBatchState) {
+    let current = batch.files.first();
+    with_status(shared, |status| {
+        status.file_transfer_phase = Some("sending".into());
+        status.last_file_transfer_id = Some(batch.batch_id.clone());
+        status.last_file_name = Some(batch.display_name.clone());
+        status.last_file_bytes = Some(batch.total_bytes);
+        status.last_file_saved_path = None;
+        status.file_bytes_received = Some(0);
+        status.file_bytes_total = current.map(|entry| entry.size);
+        status.file_batch_id = Some(batch.batch_id.clone());
+        status.file_batch_name = Some(batch.display_name.clone());
+        status.file_batch_files_completed = Some(0);
+        status.file_batch_files_total = Some(batch.files.len() as u32);
+        status.file_batch_bytes_completed = Some(0);
+        status.file_batch_bytes_total = Some(batch.total_bytes);
+        status.file_batch_current_path = current.map(|entry| entry.relative_path.clone());
+        status.last_sync_text = Some(format!(
+            "[batch offer {} files {}B id={}]",
+            batch.files.len(),
+            batch.total_bytes,
+            batch.batch_id
+        ));
+        status.last_error = None;
+    });
+}
+
+fn mark_inbound_batch_started(shared: &SharedStatus, batch: &InboundBatchState) {
+    let current = batch.current();
+    with_status(shared, |status| {
+        status.file_transfer_phase = Some("receiving".into());
+        status.last_file_transfer_id = Some(batch.batch_id.clone());
+        status.last_file_name = Some(batch.display_name.clone());
+        status.last_file_bytes = Some(batch.total_bytes);
+        status.last_file_saved_path = None;
+        status.file_bytes_received = Some(0);
+        status.file_bytes_total = current.map(|entry| entry.size);
+        status.file_batch_id = Some(batch.batch_id.clone());
+        status.file_batch_name = Some(batch.display_name.clone());
+        status.file_batch_files_completed = Some(0);
+        status.file_batch_files_total = Some(batch.files.len() as u32);
+        status.file_batch_bytes_completed = Some(0);
+        status.file_batch_bytes_total = Some(batch.total_bytes);
+        status.file_batch_current_path = current.map(|entry| entry.relative_path.clone());
+        status.last_sync_text = Some(format!(
+            "[batch receiving {} files {}B id={}]",
+            batch.files.len(),
+            batch.total_bytes,
+            batch.batch_id
+        ));
+        status.last_error = None;
+    });
+}
+
+fn mark_batch_done(shared: &SharedStatus, batch_id: &str, saved_path: Option<&Path>) {
+    with_status(shared, |status| {
+        if status.file_batch_id.as_deref() != Some(batch_id) {
+            return;
+        }
+        status.file_transfer_phase = Some("done".into());
+        status.last_file_transfer_id = Some(batch_id.to_string());
+        status.file_batch_files_completed = status.file_batch_files_total;
+        status.file_batch_bytes_completed = status.file_batch_bytes_total;
+        status.file_batch_current_path = None;
+        status.file_bytes_received = status.file_bytes_total;
+        status.last_file_saved_path = saved_path.map(|path| path.display().to_string());
+        status.last_error = None;
+    });
+}
+
+fn mark_batch_failed(status: &mut HubStatus, batch_id: &str, message: &str) {
+    status.file_transfer_phase = Some("failed".into());
+    status.last_file_transfer_id = Some(batch_id.to_string());
+    status.file_batch_id = Some(batch_id.to_string());
+    status.file_batch_current_path = None;
+    status.file_bytes_received = None;
+    status.file_bytes_total = None;
+    status.last_error = Some(format!("batch transfer failed: {message}"));
+}
+
+fn note_outbound_batch_request(
+    shared: &SharedStatus,
+    message: &Message,
+    batch: Option<&OutboundBatchState>,
+) {
+    let (Some(batch), Message::FileRequest(request)) = (batch, message) else {
+        return;
+    };
+    let Some(entry) = batch.entry(&request.transfer_id) else {
+        return;
+    };
+    if !batch.pending_ids.contains(&entry.entry_id) {
+        return;
+    }
+    with_status(shared, |status| {
+        status.file_transfer_phase = Some("sending".into());
+        status.last_file_transfer_id = Some(batch.batch_id.clone());
+        status.file_batch_current_path = Some(entry.relative_path.clone());
+        status.file_bytes_received = Some(0);
+        status.file_bytes_total = Some(entry.size);
+        status.last_error = None;
+    });
+}
+
+fn note_outbound_batch_completes(
+    shared: &SharedStatus,
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    outbox: &[Message],
+    batch: &mut Option<OutboundBatchState>,
+) -> Result<(), String> {
+    for message in outbox {
+        let Message::FileComplete(complete) = message else {
+            continue;
+        };
+        let Some(state) = batch.as_mut() else {
+            continue;
+        };
+        let Some(entry) = state.entry(&complete.transfer_id).cloned() else {
+            continue;
+        };
+        if !state.pending_ids.remove(&complete.transfer_id) {
+            continue;
+        }
+        if !complete.ok {
+            let failed = batch.take().expect("outbound batch exists");
+            cancel_transfer_ids(
+                session,
+                conn,
+                failed.pending_ids,
+                "batch failed while sending",
+            )?;
+            with_status(shared, |status| {
+                mark_batch_failed(status, &failed.batch_id, &complete.message);
+            });
+            return Ok(());
+        }
+
+        state.completed_files = state.completed_files.saturating_add(1);
+        state.completed_bytes = state.completed_bytes.saturating_add(entry.size);
+        let next = state
+            .files
+            .iter()
+            .find(|candidate| state.pending_ids.contains(&candidate.entry_id));
+        with_status(shared, |status| {
+            if status.file_batch_id.as_deref() != Some(state.batch_id.as_str()) {
+                return;
+            }
+            status.file_batch_files_completed = Some(state.completed_files);
+            status.file_batch_bytes_completed = Some(state.completed_bytes);
+            status.file_batch_current_path = next.map(|entry| entry.relative_path.clone());
+            status.file_bytes_received = Some(0);
+            status.file_bytes_total = next.map(|entry| entry.size);
+        });
+        if state.pending_ids.is_empty() {
+            let finished = batch.take().expect("outbound batch exists");
+            mark_batch_done(shared, &finished.batch_id, None);
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn handle_batch_file_event(
+    shared: &SharedStatus,
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    event: &InboundFileResult,
+    outbound: &mut Option<OutboundBatchState>,
+    inbound: &mut Option<InboundBatchState>,
+) -> Result<bool, String> {
+    match event {
+        InboundFileResult::BatchOffered {
+            batch_id,
+            display_name,
+            entries,
+        } => {
+            cancel_runtime_batch(
+                shared,
+                session,
+                conn,
+                outbound,
+                inbound,
+                "replaced by a newer remote batch",
+            )?;
+            let save_dir = with_status(shared, |status| PathBuf::from(&status.file_save_dir));
+            let mut state = match prepare_inbound_batch(
+                batch_id.clone(),
+                display_name.clone(),
+                entries.clone(),
+                save_dir,
+            ) {
+                Ok(state) => state,
+                Err(error) => {
+                    let ids = entries
+                        .iter()
+                        .filter(|entry| entry.kind == BatchEntryKind::File)
+                        .map(|entry| entry.entry_id.clone());
+                    cancel_transfer_ids(session, conn, ids, "cannot prepare batch destination")?;
+                    notify_batch_failure(session, conn, batch_id, &error)?;
+                    with_status(shared, |status| {
+                        mark_batch_failed(status, batch_id, &error);
+                    });
+                    return Ok(true);
+                }
+            };
+            mark_inbound_batch_started(shared, &state);
+            if state.files.is_empty() {
+                match commit_inbound_batch(&mut state) {
+                    Ok(saved) => mark_batch_done(shared, batch_id, Some(&saved)),
+                    Err(error) => {
+                        notify_batch_failure(session, conn, batch_id, &error)?;
+                        with_status(shared, |status| {
+                            mark_batch_failed(status, batch_id, &error);
+                        });
+                    }
+                }
+                return Ok(true);
+            }
+            if let Err(error) = request_current_batch_file(shared, session, conn, &state) {
+                let ids = state.pending_ids.iter().cloned().collect::<Vec<_>>();
+                cancel_transfer_ids(session, conn, ids, "cannot request batch file")?;
+                with_status(shared, |status| {
+                    mark_batch_failed(status, batch_id, &error);
+                });
+                return Ok(true);
+            }
+            *inbound = Some(state);
+            Ok(true)
+        }
+        InboundFileResult::Applied {
+            transfer_id,
+            file_name,
+            path,
+            size,
+            ..
+        } if inbound.as_ref().is_some_and(|state| {
+            state
+                .current()
+                .is_some_and(|entry| entry.entry_id == *transfer_id)
+        }) =>
+        {
+            let mut state = inbound.take().expect("inbound batch exists");
+            let current = state.current().cloned().expect("current batch file");
+            let result = stage_completed_batch_file(&state, &current, file_name, path, *size);
+            if let Err(error) = result {
+                state.pending_ids.remove(transfer_id);
+                let ids = state.pending_ids.iter().cloned().collect::<Vec<_>>();
+                cancel_transfer_ids(session, conn, ids, "batch staging failed")?;
+                with_status(shared, |status| {
+                    mark_batch_failed(status, &state.batch_id, &error);
+                });
+                return Ok(true);
+            }
+
+            state.pending_ids.remove(transfer_id);
+            state.completed_files = state.completed_files.saturating_add(1);
+            state.completed_bytes = state.completed_bytes.saturating_add(*size);
+            state.current_index += 1;
+            if state.current().is_some() {
+                with_status(shared, |status| {
+                    status.file_batch_files_completed = Some(state.completed_files);
+                    status.file_batch_bytes_completed = Some(state.completed_bytes);
+                });
+                if let Err(error) = request_current_batch_file(shared, session, conn, &state) {
+                    let ids = state.pending_ids.iter().cloned().collect::<Vec<_>>();
+                    cancel_transfer_ids(session, conn, ids, "cannot request batch file")?;
+                    with_status(shared, |status| {
+                        mark_batch_failed(status, &state.batch_id, &error);
+                    });
+                    return Ok(true);
+                }
+                *inbound = Some(state);
+            } else {
+                let batch_id = state.batch_id.clone();
+                match commit_inbound_batch(&mut state) {
+                    Ok(saved) => mark_batch_done(shared, &batch_id, Some(&saved)),
+                    Err(error) => {
+                        notify_batch_failure(session, conn, &batch_id, &error)?;
+                        with_status(shared, |status| {
+                            mark_batch_failed(status, &batch_id, &error);
+                        });
+                    }
+                }
+            }
+            Ok(true)
+        }
+        InboundFileResult::Failed {
+            transfer_id,
+            message,
+        } if inbound
+            .as_ref()
+            .is_some_and(|state| state.pending_ids.contains(transfer_id)) =>
+        {
+            let mut failed = inbound.take().expect("inbound batch exists");
+            failed.pending_ids.remove(transfer_id);
+            let ids = failed.pending_ids.iter().cloned().collect::<Vec<_>>();
+            cancel_transfer_ids(session, conn, ids, "batch peer transfer failed")?;
+            with_status(shared, |status| {
+                mark_batch_failed(status, &failed.batch_id, message);
+            });
+            Ok(true)
+        }
+        InboundFileResult::Failed {
+            transfer_id,
+            message,
+        } if outbound
+            .as_ref()
+            .is_some_and(|state| state.pending_ids.contains(transfer_id)) =>
+        {
+            let mut failed = outbound.take().expect("outbound batch exists");
+            failed.pending_ids.remove(transfer_id);
+            cancel_transfer_ids(
+                session,
+                conn,
+                failed.pending_ids,
+                "batch peer cancelled transfer",
+            )?;
+            with_status(shared, |status| {
+                mark_batch_failed(status, &failed.batch_id, message);
+            });
+            Ok(true)
+        }
+        InboundFileResult::Failed {
+            transfer_id,
+            message,
+        } if outbound
+            .as_ref()
+            .is_some_and(|state| state.batch_id == *transfer_id)
+            || inbound
+                .as_ref()
+                .is_some_and(|state| state.batch_id == *transfer_id)
+            || with_status(shared, |status| {
+                status.file_batch_id.as_deref() == Some(transfer_id.as_str())
+            }) =>
+        {
+            cancel_runtime_batch(
+                shared,
+                session,
+                conn,
+                outbound,
+                inbound,
+                "batch failed on peer",
+            )?;
+            with_status(shared, |status| {
+                mark_batch_failed(status, transfer_id, message);
+            });
+            Ok(true)
+        }
+        InboundFileResult::Offered { .. } if outbound.is_some() || inbound.is_some() => {
+            cancel_runtime_batch(
+                shared,
+                session,
+                conn,
+                outbound,
+                inbound,
+                "replaced by a single-file offer",
+            )?;
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn notify_batch_failure(
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    batch_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    session
+        .cancel_file(batch_id.to_string(), format!("batch failed: {message}"))
+        .map_err(|error| error.to_string())?;
+    let outbox = session.take_outbox();
+    conn.send_all(outbox.iter())
+        .map_err(|error| error.to_string())
+}
+
+fn prepare_inbound_batch(
+    batch_id: String,
+    display_name: String,
+    entries: Vec<BatchEntry>,
+    save_dir: PathBuf,
+) -> Result<InboundBatchState, String> {
+    let partial_dir = save_dir.join(".partial");
+    let staging_dir = partial_dir.join(format!("{batch_id}.batch"));
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)
+            .map_err(|error| format!("remove stale batch staging directory: {error}"))?;
+    }
+    fs::create_dir_all(&staging_dir)
+        .map_err(|error| format!("create batch staging directory: {error}"))?;
+
+    let files: Vec<BatchEntry> = entries
+        .iter()
+        .filter(|entry| entry.kind == BatchEntryKind::File)
+        .cloned()
+        .collect();
+    for entry in &entries {
+        let relative = batch_relative_path(&entry.relative_path)?;
+        let destination = staging_dir.join(relative);
+        if entry.kind == BatchEntryKind::Directory {
+            fs::create_dir_all(&destination)
+                .map_err(|error| format!("create batch directory: {error}"))?;
+        } else if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create batch file parent: {error}"))?;
+        }
+    }
+
+    Ok(InboundBatchState {
+        batch_id,
+        display_name,
+        pending_ids: files.iter().map(|entry| entry.entry_id.clone()).collect(),
+        current_index: 0,
+        completed_files: 0,
+        completed_bytes: 0,
+        total_bytes: files.iter().map(|entry| entry.size).sum(),
+        files,
+        entries,
+        save_dir,
+        partial_dir,
+        staging_dir,
+        committed: false,
+    })
+}
+
+fn request_current_batch_file(
+    shared: &SharedStatus,
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    batch: &InboundBatchState,
+) -> Result<(), String> {
+    let current = batch
+        .current()
+        .ok_or_else(|| "batch has no current file".to_string())?;
+    match session.request_file(current.entry_id.clone()) {
+        Ok(QueueFileResult::Queued) => {
+            let outbox = session.take_outbox();
+            conn.send_all(outbox.iter())
+                .map_err(|error| error.to_string())?;
+            with_status(shared, |status| {
+                status.file_transfer_phase = Some("receiving".into());
+                status.last_file_transfer_id = Some(batch.batch_id.clone());
+                status.file_batch_current_path = Some(current.relative_path.clone());
+                status.file_bytes_received = Some(0);
+                status.file_bytes_total = Some(current.size);
+                status.last_error = None;
+            });
+            Ok(())
+        }
+        Ok(other) => Err(format!("request batch file failed: {other:?}")),
+        Err(error) => Err(format!("request batch file error: {error}")),
+    }
+}
+
+fn stage_completed_batch_file(
+    batch: &InboundBatchState,
+    entry: &BatchEntry,
+    file_name: &str,
+    part_path: &Path,
+    size: u64,
+) -> Result<(), String> {
+    if file_name != entry.relative_path || size != entry.size {
+        return Err("completed batch file does not match manifest".into());
+    }
+    let expected_part = batch.partial_dir.join(format!("{}.part", entry.entry_id));
+    if part_path != expected_part {
+        return Err("completed batch file escaped partial directory".into());
+    }
+    let destination = batch
+        .staging_dir
+        .join(batch_relative_path(&entry.relative_path)?);
+    if destination.exists() {
+        return Err(format!(
+            "duplicate batch staging destination: {}",
+            entry.relative_path
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create batch destination parent: {error}"))?;
+    }
+    fs::rename(part_path, &destination)
+        .map_err(|error| format!("stage completed batch file: {error}"))
+}
+
+fn commit_inbound_batch(batch: &mut InboundBatchState) -> Result<PathBuf, String> {
+    let top_levels: HashSet<String> = batch
+        .entries
+        .iter()
+        .filter_map(|entry| entry.relative_path.split('/').next().map(str::to_owned))
+        .collect();
+    let (source, destination_name, remove_staging_parent) = if top_levels.len() == 1 {
+        let top = top_levels.iter().next().expect("one batch top-level");
+        (batch.staging_dir.join(top), top.clone(), true)
+    } else {
+        (
+            batch.staging_dir.clone(),
+            safe_batch_container_name(&batch.display_name),
+            false,
+        )
+    };
+    let destination = file_save::unique_save_path(&batch.save_dir, &destination_name)?;
+    fs::rename(&source, &destination)
+        .map_err(|error| format!("publish completed batch: {error}"))?;
+    if remove_staging_parent {
+        let _ = fs::remove_dir(&batch.staging_dir);
+    }
+    batch.committed = true;
+    Ok(destination)
+}
+
+fn batch_relative_path(relative_path: &str) -> Result<PathBuf, String> {
+    m590_core::validate_batch_relative_path(relative_path).map_err(|error| error.to_string())?;
+    let mut path = PathBuf::new();
+    for component in relative_path.split('/') {
+        path.push(component);
+    }
+    Ok(path)
+}
+
+fn safe_batch_container_name(display_name: &str) -> String {
+    let sanitized: String = display_name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() || matches!(sanitized, "." | "..") {
+        "M590Bridge-batch".into()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn update_batch_progress(
+    shared: &SharedStatus,
+    session: &Session,
+    outbound: Option<&OutboundBatchState>,
+    inbound: Option<&InboundBatchState>,
+) {
+    if let Some(batch) = outbound {
+        if let Some((transfer_id, sent, total)) = session.outbound_file_progress() {
+            if let Some(entry) = batch.entry(&transfer_id) {
+                with_status(shared, |status| {
+                    status.file_transfer_phase = Some("sending".into());
+                    status.last_file_transfer_id = Some(batch.batch_id.clone());
+                    status.file_batch_current_path = Some(entry.relative_path.clone());
+                    status.file_bytes_received = Some(sent);
+                    status.file_bytes_total = Some(total);
+                });
+            }
+        }
+        return;
+    }
+    if let Some(batch) = inbound {
+        let Some(current) = batch.current() else {
+            return;
+        };
+        if let Some((transfer_id, received, total)) = session.inbound_file_progress() {
+            if transfer_id == current.entry_id {
+                with_status(shared, |status| {
+                    status.file_transfer_phase = Some("receiving".into());
+                    status.last_file_transfer_id = Some(batch.batch_id.clone());
+                    status.file_batch_current_path = Some(current.relative_path.clone());
+                    status.file_bytes_received = Some(received);
+                    status.file_bytes_total = Some(total);
+                });
+            }
+        }
+    }
+}
+
+fn clear_batch_status_fields(status: &mut HubStatus) {
+    status.file_batch_id = None;
+    status.file_batch_name = None;
+    status.file_batch_files_completed = None;
+    status.file_batch_files_total = None;
+    status.file_batch_bytes_completed = None;
+    status.file_batch_bytes_total = None;
+    status.file_batch_current_path = None;
 }
 
 fn mark_file_sending(
@@ -2596,6 +3684,7 @@ fn mark_file_sending(
     bytes: u64,
 ) {
     with_status(shared, |s| {
+        clear_batch_status_fields(s);
         s.file_transfer_phase = Some("sending".into());
         s.last_file_transfer_id = Some(transfer_id);
         s.last_file_name = Some(file_name);
@@ -2844,6 +3933,7 @@ fn prepare_linux_virtual_offer(
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn mark_virtual_offer(shared: &SharedStatus, offer: &DeferredVirtualOffer) {
     with_status(shared, |s| {
+        clear_batch_status_fields(s);
         s.file_transfer_phase = Some("offered".into());
         s.last_file_transfer_id = Some(offer.transfer_id.clone());
         s.last_file_name = Some(offer.file_name.clone());
@@ -2958,6 +4048,7 @@ fn handle_inbound_file(
             size,
         } => {
             with_status(shared, |s| {
+                clear_batch_status_fields(s);
                 s.file_transfer_phase = Some("offered".into());
                 s.last_file_transfer_id = Some(transfer_id.clone());
                 s.last_file_name = Some(file_name.clone());
@@ -3039,6 +4130,7 @@ fn handle_inbound_file(
             Ok(())
         }
         InboundFileResult::Chunk { .. } | InboundFileResult::StreamCompleted { .. } => Ok(()),
+        InboundFileResult::BatchOffered { .. } => Ok(()),
     }
 }
 
@@ -3046,11 +4138,130 @@ fn handle_inbound_file(
 mod tests {
     use super::*;
     use std::net::Shutdown;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     static BRIDGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn batch_test_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("m590-hub-batch-{nanos}-{sequence}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn batch_scan_is_stable_and_skips_nested_symlinks() {
+        let root = batch_test_dir();
+        let folder = root.join("folder");
+        fs::create_dir_all(folder.join("empty")).unwrap();
+        fs::write(folder.join("z.txt"), b"zzz").unwrap();
+        fs::write(folder.join("a.txt"), b"a").unwrap();
+        let loose = root.join("loose.bin");
+        fs::write(&loose, b"loose").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&loose, folder.join("ignored-link")).unwrap();
+
+        let prepared = scan_batch_paths(vec![
+            loose.to_string_lossy().into_owned(),
+            folder.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let paths: Vec<&str> = prepared
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "folder",
+                "folder/a.txt",
+                "folder/empty",
+                "folder/z.txt",
+                "loose.bin"
+            ]
+        );
+        assert_eq!(prepared.sources.len(), 3);
+        assert!(paths.iter().all(|path| !path.contains("ignored-link")));
+        assert_eq!(prepared.display_name, "2 items");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inbound_batch_stages_nested_files_and_publishes_as_one_tree() {
+        let root = batch_test_dir();
+        let save_dir = root.join("inbox");
+        fs::create_dir_all(save_dir.join("folder")).unwrap();
+        let entries = vec![
+            BatchEntry::directory("dir-1", "folder").unwrap(),
+            BatchEntry::directory("dir-2", "folder/empty").unwrap(),
+            BatchEntry::file("file-1", "folder/nested/a.txt", 3, "").unwrap(),
+            BatchEntry::file("file-2", "folder/zero.bin", 0, "").unwrap(),
+        ];
+        let mut batch = prepare_inbound_batch(
+            "batch-test".into(),
+            "folder".into(),
+            entries,
+            save_dir.clone(),
+        )
+        .unwrap();
+        let first_part = batch.partial_dir.join("file-1.part");
+        let second_part = batch.partial_dir.join("file-2.part");
+        fs::write(&first_part, b"abc").unwrap();
+        fs::write(&second_part, b"").unwrap();
+        stage_completed_batch_file(
+            &batch,
+            &batch.files[0],
+            "folder/nested/a.txt",
+            &first_part,
+            3,
+        )
+        .unwrap();
+        stage_completed_batch_file(&batch, &batch.files[1], "folder/zero.bin", &second_part, 0)
+            .unwrap();
+
+        let published = commit_inbound_batch(&mut batch).unwrap();
+        assert_eq!(published.file_name().unwrap(), "folder-1");
+        assert_eq!(fs::read(published.join("nested/a.txt")).unwrap(), b"abc");
+        assert_eq!(fs::metadata(published.join("zero.bin")).unwrap().len(), 0);
+        assert!(published.join("empty").is_dir());
+        assert!(!batch.staging_dir.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dropping_uncommitted_batch_removes_parts_and_staging_tree() {
+        let root = batch_test_dir();
+        let save_dir = root.join("inbox");
+        let entries = vec![BatchEntry::file("file-1", "a.txt", 4, "").unwrap()];
+        let batch =
+            prepare_inbound_batch("batch-clean".into(), "a.txt".into(), entries, save_dir).unwrap();
+        let part = batch.partial_dir.join("file-1.part");
+        let staging = batch.staging_dir.clone();
+        fs::write(&part, b"part").unwrap();
+        drop(batch);
+        assert!(!part.exists());
+        assert!(!staging.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_json_paths_require_a_string_array() {
+        assert_eq!(
+            json_string_array(r#"{"paths":["a","b"]}"#, "paths").unwrap(),
+            vec!["a", "b"]
+        );
+        assert!(json_string_array(r#"{"paths":"a"}"#, "paths").is_err());
+        assert!(json_string_array(r#"{"paths":[1]}"#, "paths").is_err());
+    }
 
     fn http_exchange(request: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3427,6 +4638,30 @@ mod tests {
             Some("first")
         );
         clear_pending_commands();
+
+        let root = batch_test_dir();
+        let folder = root.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("a.txt"), b"a").unwrap();
+        assert_eq!(
+            push_batch(&shared, vec![folder.to_string_lossy().into_owned()]),
+            Ok(())
+        );
+        {
+            let pending = PENDING_COMMANDS.lock().unwrap();
+            let batch = pending.batch.as_ref().expect("queued batch");
+            assert_eq!(batch.entries.len(), 2);
+            assert_eq!(batch.sources.len(), 1);
+        }
+        assert_eq!(queue_batch_cancel(&shared), Ok(()));
+        {
+            let pending = PENDING_COMMANDS.lock().unwrap();
+            assert!(pending.batch.is_none());
+            assert!(pending.cancel_batch);
+        }
+        clear_pending_commands();
+        let _ = fs::remove_dir_all(root);
+
         with_status(&shared, |status| status.phase = HubPhase::Idle);
         assert_eq!(
             push_text(&shared, "later".into()),

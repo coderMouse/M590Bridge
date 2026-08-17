@@ -47,7 +47,7 @@ pub struct HubStatus {
     pub connect_addr: Option<String>,
     pub hub_api: Option<String>,
     pub file_save_dir: String,
-    /// idle | offered | sending | receiving | done | failed
+    /// idle | offered | sending | receiving | done | failed | cancelled
     pub file_transfer_phase: Option<String>,
     pub last_file_transfer_id: Option<String>,
     pub last_file_name: Option<String>,
@@ -55,6 +55,13 @@ pub struct HubStatus {
     pub last_file_saved_path: Option<String>,
     pub file_bytes_received: Option<u64>,
     pub file_bytes_total: Option<u64>,
+    pub file_batch_id: Option<String>,
+    pub file_batch_name: Option<String>,
+    pub file_batch_files_completed: Option<u32>,
+    pub file_batch_files_total: Option<u32>,
+    pub file_batch_bytes_completed: Option<u64>,
+    pub file_batch_bytes_total: Option<u64>,
+    pub file_batch_current_path: Option<String>,
     /// False on Linux Wayland without data-control: file-manager copy may be invisible.
     pub file_clipboard_watch_likely: bool,
 }
@@ -94,6 +101,13 @@ impl HubStatus {
             last_file_saved_path: None,
             file_bytes_received: None,
             file_bytes_total: None,
+            file_batch_id: None,
+            file_batch_name: None,
+            file_batch_files_completed: None,
+            file_batch_files_total: None,
+            file_batch_bytes_completed: None,
+            file_batch_bytes_total: None,
+            file_batch_current_path: None,
             file_clipboard_watch_likely: m590_clipboard::file_clipboard_watch_likely(),
         }
     }
@@ -130,6 +144,13 @@ impl HubStatus {
         self.last_file_saved_path = None;
         self.file_bytes_received = None;
         self.file_bytes_total = None;
+        self.file_batch_id = None;
+        self.file_batch_name = None;
+        self.file_batch_files_completed = None;
+        self.file_batch_files_total = None;
+        self.file_batch_bytes_completed = None;
+        self.file_batch_bytes_total = None;
+        self.file_batch_current_path = None;
     }
 
     pub fn to_json(&self) -> String {
@@ -187,6 +208,13 @@ impl HubStatus {
 \"last_file_saved_path\":{file_path},\
 \"file_bytes_received\":{file_rx},\
 \"file_bytes_total\":{file_total},\
+\"file_batch_id\":{batch_id},\
+\"file_batch_name\":{batch_name},\
+\"file_batch_files_completed\":{batch_files_done},\
+\"file_batch_files_total\":{batch_files_total},\
+\"file_batch_bytes_completed\":{batch_bytes_done},\
+\"file_batch_bytes_total\":{batch_bytes_total},\
+\"file_batch_current_path\":{batch_current_path},\
 \"file_clipboard_watch_likely\":{file_watch}\
 }}",
             phase = self.phase.as_str(),
@@ -217,6 +245,13 @@ impl HubStatus {
             file_path = opt_str(&self.last_file_saved_path),
             file_rx = opt_u64(self.file_bytes_received),
             file_total = opt_u64(self.file_bytes_total),
+            batch_id = opt_str(&self.file_batch_id),
+            batch_name = opt_str(&self.file_batch_name),
+            batch_files_done = opt_u64(self.file_batch_files_completed.map(u64::from)),
+            batch_files_total = opt_u64(self.file_batch_files_total.map(u64::from)),
+            batch_bytes_done = opt_u64(self.file_batch_bytes_completed),
+            batch_bytes_total = opt_u64(self.file_batch_bytes_total),
+            batch_current_path = opt_str(&self.file_batch_current_path),
             file_watch = self.file_clipboard_watch_likely,
         )
     }
@@ -255,6 +290,13 @@ mod tests {
             last_file_saved_path: Some("/tmp/inbox/a.txt".into()),
             file_bytes_received: Some(3),
             file_bytes_total: Some(3),
+            file_batch_id: Some("batch-1".into()),
+            file_batch_name: Some("files".into()),
+            file_batch_files_completed: Some(1),
+            file_batch_files_total: Some(2),
+            file_batch_bytes_completed: Some(3),
+            file_batch_bytes_total: Some(8),
+            file_batch_current_path: Some("folder/b.txt".into()),
             ..HubStatus::default()
         };
         let json = s.to_json();
@@ -264,6 +306,8 @@ mod tests {
         assert!(json.contains("last_file_name"), "{json}");
         assert!(json.contains("a.txt"), "{json}");
         assert!(json.contains("file_bytes_total"), "{json}");
+        assert!(json.contains("\"file_batch_id\":\"batch-1\""), "{json}");
+        assert!(json.contains("folder/b.txt"), "{json}");
         assert!(json.contains("file_clipboard_watch_likely"), "{json}");
     }
 }

@@ -1,4 +1,4 @@
 [[permission]]
 identifier = "allow-pick-send-file"
-description = "Allow native desktop file picker for sending a file over the bridge."
-commands.allow = ["pick_send_file"]
+description = "Allow native desktop multi-file and folder pickers for batch sending over the bridge."
+commands.allow = ["pick_send_files", "pick_send_folder"]

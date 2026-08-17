@@ -395,14 +395,20 @@ fn hub_http_exchange(
     Ok((status, resp_body.to_string()))
 }
 
-fn post_hub_send_file(path: &Path, auth_token: &str) -> Result<(), String> {
-    let path_s = path.to_string_lossy();
-    let body = serde_json::json!({ "path": path_s.as_ref() }).to_string();
-    let (status, detail) = hub_http_exchange("POST", "/api/send_file", &body, auth_token)?;
+fn post_hub_send_batch(paths: &[PathBuf], auth_token: &str) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("batch paths must not be empty".into());
+    }
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let body = serde_json::json!({ "paths": paths }).to_string();
+    let (status, detail) = hub_http_exchange("POST", "/api/send_batch", &body, auth_token)?;
     if status == 200 {
         Ok(())
     } else {
-        Err(format!("hub rejected file: {detail}"))
+        Err(format!("hub rejected batch: {detail}"))
     }
 }
 
@@ -419,14 +425,31 @@ struct HubApiResponse {
     body: String,
 }
 
-/// Native file dialog (starts at Desktop/桌面). Returns absolute path.
+/// Native multi-file dialog (starts at Desktop/桌面). Returns absolute paths.
 #[tauri::command]
-fn pick_send_file() -> Result<Option<String>, String> {
-    let mut dialog = rfd::FileDialog::new().set_title("选择要发送的文件");
+fn pick_send_files() -> Result<Vec<String>, String> {
+    let mut dialog = rfd::FileDialog::new().set_title("选择要发送的文件（可多选）");
     if let Some(dir) = desktop_dir() {
         dialog = dialog.set_directory(dir);
     }
-    Ok(dialog.pick_file().map(|p| p.to_string_lossy().into_owned()))
+    Ok(dialog
+        .pick_files()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
+}
+
+/// Native directory dialog (starts at Desktop/桌面). Returns one absolute path.
+#[tauri::command]
+fn pick_send_folder() -> Result<Option<String>, String> {
+    let mut dialog = rfd::FileDialog::new().set_title("选择要发送的文件夹");
+    if let Some(dir) = desktop_dir() {
+        dialog = dialog.set_directory(dir);
+    }
+    Ok(dialog
+        .pick_folder()
+        .map(|path| path.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
@@ -506,7 +529,8 @@ pub fn run() {
         .manage(HubAuthToken(hub_token))
         .manage(hub_runtime)
         .invoke_handler(tauri::generate_handler![
-            pick_send_file,
+            pick_send_files,
+            pick_send_folder,
             hub_auth_token,
             hub_runtime_info,
             hub_api_request,
@@ -620,12 +644,17 @@ pub fn run() {
                 let _ = window.minimize();
             }
             WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
-                if let Some(path) = paths.iter().find(|p| p.is_file()) {
+                let paths: Vec<PathBuf> = paths
+                    .iter()
+                    .filter(|path| path.is_file() || path.is_dir())
+                    .cloned()
+                    .collect();
+                if !paths.is_empty() {
                     let token = window.state::<HubAuthToken>();
-                    if let Err(err) = post_hub_send_file(path, &token.0) {
-                        eprintln!("drop_send_file_error={err}");
+                    if let Err(err) = post_hub_send_batch(&paths, &token.0) {
+                        eprintln!("drop_send_batch_error={err}");
                     } else {
-                        eprintln!("drop_send_file_ok={}", path.display());
+                        eprintln!("drop_send_batch_ok=count={}", paths.len());
                     }
                 }
             }

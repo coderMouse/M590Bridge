@@ -15,9 +15,10 @@ pub use protocol::{
     MAX_FILE_CHUNK_BYTES, MAX_IMAGE_PIXELS, MAX_INLINE_IMAGE_BYTES, PROTOCOL_VERSION,
 };
 pub use session::{
-    InboundClipboardResult, InboundFileResult, QueueClipboardResult, QueueFileResult, Session,
-    SessionEvent, SessionSnapshot, DEFAULT_HEARTBEAT_MISS_THRESHOLD, FILE_CHUNK_SIZE,
-    MAX_FILE_BYTES, MAX_IN_FLIGHT_FILE_BYTES, MAX_MEMORY_FILE_BYTES, OUTBOUND_CHUNKS_PER_PUMP,
+    BatchFileSource, InboundClipboardResult, InboundFileResult, QueueClipboardResult,
+    QueueFileResult, Session, SessionEvent, SessionSnapshot, DEFAULT_HEARTBEAT_MISS_THRESHOLD,
+    FILE_CHUNK_SIZE, MAX_FILE_BYTES, MAX_IN_FLIGHT_FILE_BYTES, MAX_MEMORY_FILE_BYTES,
+    OUTBOUND_CHUNKS_PER_PUMP,
 };
 
 /// Crate / product version string used by the daemon binary.
