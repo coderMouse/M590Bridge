@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（实现与本地自动化验证完成，待 Linux/Windows 桌面交互和跨机复测）
+`completed`
 
 ## 背景
 
@@ -42,12 +42,11 @@ npm run build
 
 - [x] 多选/文件夹输入能生成合法批次，并由 Core loopback 验证按序完成传输。
 - [x] 取消、替换、断线和非法清单均有确定状态；未提交批次的 `.part`/暂存树有自动清理测试。
-- [ ] Linux/Windows 至少完成各自本地 UI 测试；跨机验收另行记录。
+- [x] Linux/Windows 均完成本地 UI 测试，跨机验收结果已记录。
 
 ## 下一步
 
-- 在 Linux 与 Windows 桌面端完成多选、文件夹、拖放、取消、替换和断线复测；确认后将
-  本 task 标记 completed，再进入 task-057。
+- 执行 task-057：把已验收的批次状态机接入 Windows Explorer 多文件/嵌套目录虚拟剪贴板。
 
 ## 实施记录
 
@@ -68,6 +67,8 @@ npm run build
   模式仍只保留 4MiB 单文件回退。
 - 2026-08-17：提交前审查补齐对端返回批次级失败时的发送端运行时清理，避免状态已失败但
   未请求条目仍留在 Session 中；随后重新通过任务要求的 Rust 测试、前端 lint 与构建。
+- 2026-08-17：用户确认 Linux/Windows 桌面多选、文件夹、拖放、取消/替换/断线及跨机
+  内容验收通过，task-056 正式完成。
 
 ## 修改文件
 
@@ -100,19 +101,20 @@ npm run build
   当前改动涉及的 lib/bin 与 Tauri Clippy 均通过。
 - `cargo fmt --all -- --check`：通过。
 - `git diff --check`：通过。
+- Linux/Windows 桌面交互与跨机验收：用户确认通过；覆盖本 task 要求的多选、文件夹、
+  拖放、取消、替换、断线和最终内容一致性。
 
 ## 文档影响检查
 
 - 已更新：本 task、计划、协议草案、UI 规格、命令和项目结构图；新增 Hub API、status
   字段、桌面选择入口和批次运行时均有对应文档。
+- 完成验收后已同步：`AGENTS.md`、`docs/plans/current.md`、`项目说明.md` 的能力状态与
+  下一任务指向。
 - 无需新增 API inventory：仓库当前没有该文档，Hub 控制 API 继续由
   `docs/discovery/commands.md` 与 `docs/domain/protocol-draft.md` 共同登记。
 
 ## 风险 / blocker
 
-- 当前环境可以完成 Linux 本地构建和协议 loopback；Windows 原生对话框与跨机批次传输
-  仍需 Windows 真机复测，不会用本机结果代替。
-- Linux 当前有图形会话，但自动化命令不能替代原生对话框/拖放人工交互；Linux 与
-  Windows 均需真机确认按钮、多路径拖放、取消、替换、断线和最终目录内容。
+- 无 task-056 blocker；Linux/Windows 桌面交互与跨机结果已由用户确认通过。
 - 本 task 的手动批次会自动保存到接收目录；Windows Explorer 多文件虚拟剪贴板和 Linux
   FUSE 目录树仍分别属于 task-057/task-058。
