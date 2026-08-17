@@ -52,6 +52,8 @@ cd ui && npm run dev
 | `npm run desktop:standalone` | 构建并运行不依赖开发服务器的 release 桌面端 |
 | `npm run desktop:build` | Tauri 构建 |
 | `npm run desktop:build:windows` | 在 Windows 上构建当前用户 NSIS `.exe` |
+| `./ui/scripts/package-linux.sh` | 从仓库根目录一键生成 Linux `.deb` |
+| `.\ui\scripts\package-windows.ps1` | 从仓库根目录一键生成 Windows NSIS `.exe` |
 
 ## Ubuntu / Debian 安装包
 
@@ -68,11 +70,11 @@ sudo apt-get install -y \
 从仓库根目录构建 `.deb`：
 
 ```bash
-cd ui
-npm ci
-npm run desktop:build -- --bundles deb
-cd ..
+./ui/scripts/package-linux.sh
 ```
+
+脚本会检查基础命令和 Linux Tauri/AppIndicator 开发库、执行 `npm ci` 与 Tauri 打包，并在
+成功后打印实际 `.deb` 路径。
 
 产物位于仓库根目录的
 `target/release/bundle/deb/M590Bridge_<version>_amd64.deb`。可先检查，再安装或卸载：
@@ -92,13 +94,12 @@ sudo apt remove m590-bridge
 （Desktop development with C++ + Windows SDK）。在 Windows PowerShell 执行：
 
 ```powershell
-cd ui
-npm ci
-npm run build
-cargo test -p m590-ui --lib
-npm run desktop:build:windows
-Get-ChildItem ..\target\release\bundle\nsis\*.exe
+.\ui\scripts\package-windows.ps1
 ```
+
+脚本会检查 Node.js、Cargo 与 Windows MSVC Rust host、执行 `npm ci` 与 Tauri NSIS 打包，
+并在成功后打印实际 `.exe` 路径。Tauri 会通过 `beforeBuildCommand` 自动完成前端构建；
+完整 Rust 测试和 Windows 运行验收见 `docs/tasks/task-042.md`。
 
 安装包采用当前用户模式，不要求管理员权限。设置页「登录时自动启动」写入 HKCU Run；
 关闭开关或卸载会删除 `M590Bridge` 值。安装包当前未签名，SmartScreen 可能提示未知

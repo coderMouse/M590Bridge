@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-17（task-052、task-053 真机完成）
+> 更新日期：2026-08-17（task-054 增加 Linux / Windows 一键打包入口）
 
 ## 桌面（推荐）
 
@@ -38,13 +38,16 @@ sudo apt-get install -y \
   libssl-dev libwebkit2gtk-4.1-dev libxdo-dev wget
 ```
 
-构建、检查与安装（从仓库根目录执行）：
+一键打包（从仓库根目录执行）：
 
 ```bash
-cd ui
-npm ci
-npm run desktop:build -- --bundles deb
-cd ..
+./ui/scripts/package-linux.sh
+```
+
+脚本会检查 Linux 基础命令与 GTK/WebKitGTK/AppIndicator 开发库，执行 `npm ci` 和 Tauri
+`.deb` 构建，成功后打印实际产物路径。检查与安装仍按需执行：
+
+```bash
 dpkg-deb --info target/release/bundle/deb/M590Bridge_*_amd64.deb
 dpkg-deb --contents target/release/bundle/deb/M590Bridge_*_amd64.deb
 sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
@@ -68,13 +71,12 @@ Windows 构建机需要 Node.js 22 LTS、Rust stable MSVC、Visual Studio Build 
 （Desktop development with C++ + Windows SDK）。从仓库根目录执行：
 
 ```powershell
-cd ui
-npm ci
-npm run build
-cargo test -p m590-ui --lib
-npm run desktop:build:windows
-Get-ChildItem ..\target\release\bundle\nsis\*.exe
+.\ui\scripts\package-windows.ps1
 ```
+
+脚本会检查 Node.js、Cargo 与 Windows MSVC Rust host，执行 `npm ci` 和 Tauri NSIS 构建，
+成功后打印实际 `.exe` 路径。`npm run build` 已由 Tauri 的 `beforeBuildCommand` 自动执行；
+Rust 测试、注册表检查和跨机回归属于完整验收，不需要每次打包手工重复输入。
 
 - NSIS 为当前用户安装，不要求管理员权限；产物未签名，SmartScreen 可能提示未知发布者。
 - 设置页开关读写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `M590Bridge` 值。
@@ -259,4 +261,5 @@ docs/plans/current.md
 docs/domain/protocol-draft.md
 docs/tasks/task-042.md
 docs/tasks/task-043.md
+docs/tasks/task-054.md
 ```

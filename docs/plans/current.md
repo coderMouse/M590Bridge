@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-17
-> 阶段：task-053 Linux 托盘菜单文字回归已修复并真机通过；task-042 继续暂停
+> 阶段：task-054 Linux 一键打包已生成实包；Windows 一键脚本待 Windows 构建机验证；task-042 继续暂停
 
 ## 目标（近期）
 
@@ -50,6 +50,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
 - [ ] **task-042** Windows NSIS 安装包 / 用户登录自启（NSIS 已成功打包安装；登录自启、卸载清理与跨机回归待验收）
+- [ ] **task-054** Linux / Windows 一键打包脚本（Linux `.deb` 已真实通过；Windows PowerShell 脚本待 Windows 构建机执行）
 
 ## 产品分期对照
 
@@ -89,15 +90,17 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | Linux 用户登录自启 | **有**（task-038/039；正式/standalone 桌面端显式启停，开发壳拒绝开启） |
 | Windows NSIS 安装包 | **已成功打包安装**（task-042；当前用户安装、未签名；功能回归待验收） |
 | Windows 用户登录自启 | **待真机验收**（task-042；HKCU Run、开发壳拒绝开启、卸载清理） |
+| 一键本地打包 | **Linux 已验证，Windows 脚本待执行**（task-054；脚本负责环境检查、`npm ci`、Tauri 打包和产物路径输出） |
 | localhost Hub API 鉴权 | **有**（task-035；进程临时令牌 + 限定 CORS） |
 | 设置「发现方式」开关 | 无（默认开启 browse） |
 
 ## 下一步（有序）
 
-1. 等待用户决定是否恢复 task-042 剩余的登录自启与跨机回归验收（当前暂停）
-2. （可选）独立文件数据连接 / 更高吞吐调优
-3. （可选）设置页发现开关 / 本机显示名
-4. （可选）多文件并行 / 文件夹
+1. 在 Windows 构建机执行 task-054 一键脚本，确认 NSIS `.exe` 产物路径输出
+2. 等待用户决定是否恢复 task-042 剩余的登录自启与跨机回归验收（当前暂停）
+3. （可选）独立文件数据连接 / 更高吞吐调优
+4. （可选）设置页发现开关 / 本机显示名
+5. （可选）多文件并行 / 文件夹
 
 > task-044 至 task-053 均已完成相应真机验收。task-052 已证明 Linux FUSE 单文件可在
 > Nautilus 粘贴时通过网络惰性读取并显示系统进度；task-053 已修复 Linux 托盘文字回归。
@@ -116,19 +119,14 @@ npm run desktop:standalone
 Linux 安装包：
 
 ```bash
-cd ui
-npm run desktop:build -- --bundles deb
-cd ..
+./ui/scripts/package-linux.sh
 sudo apt install ./target/release/bundle/deb/M590Bridge_*_amd64.deb
 ```
 
 Windows 10（在 Windows 开发终端中）：
 
 ```powershell
-cd ui
-npm ci
-npm run desktop:build:windows
-Get-ChildItem ..\target\release\bundle\nsis\*.exe
+.\ui\scripts\package-windows.ps1
 ```
 
 - **创建配对**：本机生成配对码 → 开始等待（会 mDNS 广播）  

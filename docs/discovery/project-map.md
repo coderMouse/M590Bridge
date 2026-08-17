@@ -1,7 +1,7 @@
 # 项目结构图 · M590Bridge
 
-> 更新日期：2026-08-14
-> 状态：文本+图片+流式文件+mDNS+Linux/Windows 发布；task-051 Linux FUSE 单文件本机原型真机通过，task-052 网络接线开发中
+> 更新日期：2026-08-17
+> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-054 正在补齐两端一键打包入口
 
 ```text
 crates/
@@ -22,6 +22,8 @@ ui/
   src/             # React：OperableApp 配对/发现/文件发送/登录自启；bridgeApi 自动鉴权
   scripts/
     prepare-standalone.mjs # Linux standalone 的隐藏 GNOME 应用身份与图标
+    package-linux.sh       # Linux .deb 依赖检查、锁定依赖安装、Tauri 打包与产物定位
+    package-windows.ps1    # Windows NSIS 依赖检查、锁定依赖安装、Tauri 打包与产物定位
   src-tauri/       # Tauri 2 m590-ui；托盘、Linux XDG / Windows HKCU autostart commands
     permissions/
       autostart.toml       # Linux/Windows 用户登录自启读写
@@ -30,6 +32,6 @@ ui/
       installer-hooks.nsh # NSIS 卸载清理当前用户 Run 值
 docs/
   plans/current.md
-  tasks/           # ..051
+  tasks/           # ..054
   domain/          # 协议草案
 ```
