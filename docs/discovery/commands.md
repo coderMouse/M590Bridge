@@ -124,6 +124,15 @@ cargo check -p m590-daemon --target x86_64-pc-windows-gnu
 
 ### Windows Explorer 多文件/目录真机验收（task-057）
 
+在接入网络前，可先用本机 OLE 集合探针确认 Explorer 能识别两个顶层文件、嵌套文件、
+嵌套空目录和顶层空目录；终端的 `content_opened` 应只在粘贴时出现：
+
+```powershell
+cargo run -p m590-clipboard --example windows_virtual_file_collection
+```
+
+探针成功后再进行下面的 Linux↔Windows 网络批次验收。
+
 先在 Windows 构建并运行当前代码，Linux 端运行同一提交。配对后从 Linux/发送端通过
 “选择文件”或“选择文件夹”发送一个包含多个顶层文件、嵌套目录、空目录、空文件和大文件
 的批次：

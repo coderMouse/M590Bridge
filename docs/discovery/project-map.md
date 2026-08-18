@@ -10,7 +10,8 @@ crates/
     examples/set_file_and_read.rs   # Linux text/uri-list 发布与 Nautilus 真机探针
     src/virtual_file.rs          # 安全文件名/相对路径、虚拟文件集合、惰性内容工厂
     src/windows_virtual_file.rs  # 多项 IDataObject / FILEGROUPDESCRIPTORW / 按索引延迟 IStream
-    examples/windows_virtual_file.rs # Windows Explorer 真机原型
+    examples/windows_virtual_file.rs # Windows Explorer 单文件真机原型
+    examples/windows_virtual_file_collection.rs # Windows Explorer 多文件/目录 OLE 探针
   m590-net/        # 帧 1..16、版本拒绝、批次清单字段校验、TCP
   m590-daemon/     # hub：send_file/send_batch、批次暂存或 Windows OLE 串行惰性流、status、mDNS
     src/linux_virtual_file.rs             # Linux-only 单文件 FUSE 元数据/惰性读取与句柄回收

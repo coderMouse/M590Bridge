@@ -52,41 +52,36 @@ impl ClipboardFormats {
         })
     }
 
-    fn as_format_etc(self, collection: &VirtualFileCollection) -> Vec<FORMATETC> {
-        let mut formats = Vec::with_capacity(
-            2 + collection
-                .entries()
-                .iter()
-                .filter(|entry| !entry.is_directory())
-                .count(),
-        );
-        formats.push(FORMATETC {
-            cfFormat: self.descriptor,
-            ptd: std::ptr::null_mut(),
-            dwAspect: DVASPECT_CONTENT.0,
-            lindex: FORMAT_INDEX_NONE,
-            tymed: TYMED_HGLOBAL.0 as u32,
-        });
-        for (index, entry) in collection.entries().iter().enumerate() {
-            if entry.is_directory() {
-                continue;
-            }
-            formats.push(FORMATETC {
+    fn as_format_etc(self) -> [FORMATETC; 3] {
+        [
+            FORMATETC {
+                cfFormat: self.descriptor,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: FORMAT_INDEX_NONE,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            },
+            // FILECONTENTS is one clipboard format whose concrete descriptor is
+            // selected by the lindex supplied to GetData.  Enumerating one entry
+            // per file causes Explorer to retain only the first duplicate format.
+            // Keep this wildcard even for directory-only collections: Explorer
+            // needs the descriptor/contents format pair, but does not fetch a
+            // stream for FILE_ATTRIBUTE_DIRECTORY descriptors.
+            FORMATETC {
                 cfFormat: self.contents,
                 ptd: std::ptr::null_mut(),
                 dwAspect: DVASPECT_CONTENT.0,
-                lindex: index as i32,
+                lindex: FORMAT_INDEX_NONE,
                 tymed: TYMED_ISTREAM.0 as u32,
-            });
-        }
-        formats.push(FORMATETC {
-            cfFormat: self.preferred_drop_effect,
-            ptd: std::ptr::null_mut(),
-            dwAspect: DVASPECT_CONTENT.0,
-            lindex: FORMAT_INDEX_NONE,
-            tymed: TYMED_HGLOBAL.0 as u32,
-        });
-        formats
+            },
+            FORMATETC {
+                cfFormat: self.preferred_drop_effect,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: FORMAT_INDEX_NONE,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            },
+        ]
     }
 }
 
@@ -102,6 +97,7 @@ fn register_format(name: windows::core::PCWSTR) -> Result<u16> {
 enum RequestedFormat {
     Descriptor,
     Contents(usize),
+    ContentsQuery,
     PreferredDropEffect,
 }
 
@@ -115,6 +111,7 @@ impl VirtualFileDataObject {
     fn requested_format(
         &self,
         format: *const FORMATETC,
+        allow_contents_wildcard: bool,
     ) -> std::result::Result<RequestedFormat, HRESULT> {
         if format.is_null() {
             return Err(E_POINTER);
@@ -133,17 +130,22 @@ impl VirtualFileDataObject {
             }
             (RequestedFormat::Descriptor, TYMED_HGLOBAL.0 as u32)
         } else if format.cfFormat == self.formats.contents {
-            let index = usize::try_from(format.lindex).map_err(|_| DV_E_LINDEX)?;
-            if self
-                .collection
-                .entries()
-                .get(index)
-                .and_then(VirtualFileCollectionEntry::file_contents)
-                .is_none()
-            {
-                return Err(DV_E_LINDEX);
+            if allow_contents_wildcard && format.lindex == FORMAT_INDEX_NONE {
+                (RequestedFormat::ContentsQuery, TYMED_ISTREAM.0 as u32)
+            } else {
+                let index = usize::try_from(format.lindex).map_err(|_| DV_E_LINDEX)?;
+                match self.collection.entries().get(index) {
+                    Some(entry) if entry.file_contents().is_some() => {
+                        (RequestedFormat::Contents(index), TYMED_ISTREAM.0 as u32)
+                    }
+                    // Explorer does not fetch contents for a directory, but may
+                    // query the shared FILECONTENTS capability at its index.
+                    Some(_) if allow_contents_wildcard => {
+                        (RequestedFormat::ContentsQuery, TYMED_ISTREAM.0 as u32)
+                    }
+                    _ => return Err(DV_E_LINDEX),
+                }
             }
-            (RequestedFormat::Contents(index), TYMED_ISTREAM.0 as u32)
         } else if format.cfFormat == self.formats.preferred_drop_effect {
             if format.lindex != FORMAT_INDEX_NONE {
                 return Err(DV_E_LINDEX);
@@ -251,10 +253,14 @@ fn hglobal_medium_from_descriptors(descriptors: &[FILEDESCRIPTORW]) -> Result<ST
 
 impl IDataObject_Impl for VirtualFileDataObject_Impl {
     fn GetData(&self, format: *const FORMATETC) -> Result<STGMEDIUM> {
-        match self.requested_format(format).map_err(Error::from_hresult)? {
+        match self
+            .requested_format(format, false)
+            .map_err(Error::from_hresult)?
+        {
             RequestedFormat::Descriptor => self.descriptor_medium(),
             RequestedFormat::PreferredDropEffect => self.preferred_drop_effect_medium(),
             RequestedFormat::Contents(index) => self.content_medium(index),
+            RequestedFormat::ContentsQuery => unreachable!("GetData rejects capability queries"),
         }
     }
 
@@ -263,7 +269,7 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
     }
 
     fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
-        match self.requested_format(format) {
+        match self.requested_format(format, true) {
             Ok(_) => S_OK,
             Err(err) => err,
         }
@@ -297,7 +303,7 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
         if direction != DATADIR_GET.0 as u32 {
             return Err(Error::from_hresult(E_NOTIMPL));
         }
-        let formats = self.formats.as_format_etc(&self.collection);
+        let formats = self.formats.as_format_etc();
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
     }
 

@@ -50,8 +50,8 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 
 ## 下一步
 
-- 在 Windows 10 构建当前代码，完成 Explorer 多文件/嵌套目录、取消、替换、断线与
-  单文件回归真机验收并记录结果。
+- 在 Windows 10 先运行无网络 OLE 集合探针，再重新打包并复测 Explorer 多文件、嵌套目录、
+  空目录与单文件回归；通过后继续取消、替换和断线验收。
 
 ## 实施记录
 
@@ -71,12 +71,23 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 - 2026-08-18：按 Win32 Shell 规则让 `EnumFormatEtc` 为每个文件 descriptor 枚举独立的
   `CFSTR_FILECONTENTS` 索引格式；目录项不枚举内容格式，集合条目数限制到可表达的
   `FORMATETC.lindex` 范围。
+- 2026-08-18：Windows 10 首轮真机验收不通过：多文件只能粘贴其中一个，嵌套目录和
+  空目录无法粘贴。task-057 保持 `in_progress`。对照 Explorer 使用的成熟 `IDataObject`
+  实现后确认，`EnumFormatEtc` 应只公开一个 `lindex=-1` 的 `CFSTR_FILECONTENTS` 通配格式，
+  具体 descriptor 索引由后续 `GetData` 请求携带；目录集合也必须保留 descriptor/contents
+  格式对，即使 Explorer 不会为目录请求内容流。
+- 2026-08-18：已将 `EnumFormatEtc` 改为始终枚举一个通配 `CFSTR_FILECONTENTS`；
+  `QueryGetData` 接受该能力查询，而 `GetData` 仍只接受 Explorer 提供的具体文件 descriptor
+  索引并拒绝目录内容流。新增无网络 Windows 集合探针，固定覆盖两个顶层文件、嵌套文件、
+  嵌套空目录和顶层空目录，以便先区分 OLE/Shell 问题与跨机网络调度问题。
 
 ## 修改文件
 
 - `crates/m590-clipboard/Cargo.toml`、`src/lib.rs`、`src/virtual_file.rs`、
   `src/windows_virtual_file.rs`：集合模型、Windows 路径校验、多项 OLE descriptor 与按索引
   `IStream`，并保留单文件兼容入口。
+- `crates/m590-clipboard/examples/windows_virtual_file_collection.rs`：本机 OLE 多文件、
+  嵌套文件、空目录探针。
 - `crates/m590-daemon/src/windows_virtual_file_manager.rs`：STA 线程发布及条件替换集合。
 - `crates/m590-daemon/src/virtual_file_bridge.rs`：网络请求开始前不计算排队流读取超时。
 - `crates/m590-daemon/src/hub.rs`：Windows 批次发布、逐文件惰性请求、串行调度、状态和清理。
@@ -96,17 +107,29 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 - `cargo clippy -p m590-clipboard -p m590-daemon --lib --bins --no-deps -- -D warnings`：
   通过，无 warning。
 - `cargo fmt --all -- --check`、`git diff --check`：通过。
-- Windows 10 Explorer 真机：待验收；当前 Linux 环境只能交叉编译，不能代替 Shell/OLE
+- 首轮 Windows 10 Explorer 真机：不通过；多文件只粘贴一个，嵌套目录和空目录不能粘贴。
+- 本轮返工 `cargo test -p m590-clipboard`：通过，23 passed。
+- 本轮返工 `cargo test -p m590-daemon virtual_file_bridge`：通过，5 passed。
+- 本轮返工 `cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --lib --examples`：
+  通过，包含新增集合探针。
+- 本轮返工 `cargo check -p m590-daemon --target x86_64-pc-windows-gnu --examples`：通过。
+- 本轮返工 `cargo clippy -p m590-clipboard -p m590-daemon --target x86_64-pc-windows-gnu
+  --lib --bins --examples --no-deps -- -D warnings`：通过，无 warning。
+- 本轮返工 `cargo test --workspace`：通过，共 144 个单元测试，doc-tests 无失败。
+- 本轮返工 `cargo fmt --all -- --check`、`git diff --check`：通过。
+- 修复后 Windows 10 Explorer：待复测；当前 Linux 环境只能交叉编译，不能代替 Shell/OLE
   行为验证。
 
 ## 文档影响检查
 
-- 已更新：本 task、当前计划、项目入口、协议草案、项目结构图和 Windows 验收命令。
+- 已更新：本 task、当前计划、项目入口、协议草案、项目结构图和 Windows 验收命令；
+  本轮为新增 OLE 集合探针同步了项目结构图和真机命令。
 - 无需更新：协议字段、Hub HTTP API、UI 交互、安装器和 Linux FUSE 均未改变。
 
 ## 风险 / blocker
 
-- task-057 仍需 Windows 10 Explorer 真机验收后才能标记完成。
+- Windows 10 首轮真机验收已确认多文件/目录行为失败；修复后仍需 Explorer 复测才能
+  标记完成。
 - 沿用 task-044 的一次性网络 offer：同一剪贴板 offer 完成后再次 `Ctrl+V` 仍不保证可重开
   `FILECONTENTS`；本 task 验证“重新发送同批输入后再次粘贴”。若产品要求同一 offer 任意
   次粘贴，需要另建任务扩展发送源保留与重复请求协议生命周期。
