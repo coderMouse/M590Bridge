@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-18
-> 阶段：task-057 standalone 干净复测仍失败，已加入 OLE/Hub/吞吐链路诊断等待 Windows 日志
+> 阶段：task-057 已定位发送端 file_list 只取第一项并修复，等待 Windows 批次粘贴复测
 
 ## 目标（近期）
 
@@ -50,8 +50,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 进行中 / 暂停
 
-- [ ] **task-057** Windows Explorer 多文件剪贴板粘贴（OLE 集合探针通过；standalone 在
-  5910 预检版本仍复现，已加入批次清单、`GetData.lindex`、网络调度与实测速率诊断）
+- [ ] **task-057** Windows Explorer 多文件剪贴板粘贴（诊断确认失败样本从未收到批次，
+  已将文件管理器多路径/目录 file_list 改走 `FileBatchOffer`，等待端到端复测）
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
@@ -85,7 +85,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | UI 选文件发送 + 进度 + 保存目录 | **有** |
 | 文件夹 / OS 文件剪贴板 | 手动文件夹批次已通过；Windows Explorer 多文件/目录代码待真机验收，Linux FUSE 仍限单文件 |
 | 大文件流式（磁盘流+SHA-256，软上限 8GiB） | **有**（task-033；同连接串行；task-036 已移除固定批次节流和多帧累计误判） |
-| file_list 触发原文件 offer（非图片，路径流式） | **有** |
+| file_list 触发原文件 offer（非图片，路径流式） | **有**；单文件走原 offer，多路径/目录走批次（待 task-057 真机复测） |
 | 路径文本（非图片）→ file offer | **有**（task-025） |
 | 发送方 FileComplete → UI done/满进度 | **有**（task-025） |
 | GNOME Wayland 文件管理器复制自动同步 | **受限**（用原生选文件/窗口拖放，task-026/027） |
@@ -105,8 +105,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. Windows 10 运行诊断版 standalone，分别复现小型多文件/嵌套目录和一个大文件，回传
-   `[task-057]` 行；据清单、`GetData.lindex`、`FileRequest` 与完成速率定位 **task-057**
+1. 两端拉取同一提交，从发送端文件管理器复制多路径/目录，在 Windows Explorer 粘贴；
+   确认日志出现 `clipboard_batch_queued`、`batch_received entries>1` 及多个 `GetData.lindex`
 2. task-057 完成后执行 **task-058**：Linux FUSE 虚拟目录树
 3. 完成 OS 文件管理器多文件/文件夹直接粘贴端到端真机验收
 4. （可选）设置页发现开关 / 本机显示名

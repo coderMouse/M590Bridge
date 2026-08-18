@@ -138,9 +138,9 @@ cargo run -p m590-clipboard --example windows_virtual_file_collection
 
 探针成功后再进行下面的 Linux↔Windows 网络批次验收。
 
-先在 Windows 构建并运行当前代码，Linux 端运行同一提交。配对后从 Linux/发送端通过
-“选择文件”或“选择文件夹”发送一个包含多个顶层文件、嵌套目录、空目录、空文件和大文件
-的批次：
+先在 Windows 构建并运行当前代码，发送端运行同一提交。配对后可直接在文件管理器复制
+多个顶层文件或一个目录；也可通过“选择文件”“选择文件夹”发送。测试批次应包含嵌套目录、
+空目录、空文件和大文件：
 
 1. Windows 接收端未在 Explorer 粘贴前，不应向网络请求文件内容，接收目录也不应出现
    `.partial` 批次树。
@@ -155,6 +155,9 @@ cargo run -p m590-clipboard --example windows_virtual_file_collection
 从 `batch_received` / `publish_collection` 到 `network_stream_completed` 的所有
 `[task-057]` 行。日志中的 `effective_mib_s` 包含请求到完成的等待，`data_mib_s` 从首块到
 完成，可据此区分网络吞吐下降与文件间调度等待。
+发送端终端还应先出现 `clipboard_file_list_detected ... action=batch`、
+`clipboard_batch_queued` 和 `batch_offer_sent`；接收端应出现 `batch_received entries=`，
+若仍是 `single_ole_stream_request`，说明发送端剪贴板后端只暴露了一个根路径。
 
 同一剪贴板 offer 完成后直接再次 `Ctrl+V` 仍受一次性 offer 限制，不属于本 task 的重复
 发送验收；需要支持时应另建生命周期任务。

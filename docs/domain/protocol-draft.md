@@ -82,6 +82,8 @@ Windows 单文件 OS 文件剪贴板现已接入：OLE STA 仅持有虚拟 `IDat
 
 1. Hub 的 `/api/send_batch` 接受多个本地文件/目录路径；目录按平台无关相对路径稳定排序，
    不跟随 symlink，扫描结果构造成一个 `FileBatchOffer`。
+   task-057 还将剪贴板后端可见的多个根路径或单个目录 file_list 接到同一入口；单个普通
+   文件继续使用既有 `FileOffer`，单个图片继续优先同步为剪贴板位图。
 2. 接收端验证清单后按 manifest 顺序一次只请求一个文件条目；每个条目继续复用
    `FileRequest → FileChunk → FileComplete`，不并行、不新增连接。
 3. 完成条目先从 `.partial/<entry_id>.part` 移入 `.partial/<batch_id>.batch/` 暂存树；

@@ -56,12 +56,12 @@ const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "windows")]
 const REPLACED_BATCH_REQUEST_GRACE: Duration = Duration::from_secs(2);
 
-#[cfg(all(target_os = "windows", feature = "task-057-diagnostics"))]
+#[cfg(feature = "task-057-diagnostics")]
 fn task_057_diagnostic(args: std::fmt::Arguments<'_>) {
     eprintln!("[task-057][hub] {args}");
 }
 
-#[cfg(all(target_os = "windows", not(feature = "task-057-diagnostics")))]
+#[cfg(not(feature = "task-057-diagnostics"))]
 fn task_057_diagnostic(_args: std::fmt::Arguments<'_>) {}
 
 #[cfg(target_os = "windows")]
@@ -1491,6 +1491,10 @@ fn queue_batch_cancel(shared: &SharedStatus) -> Result<(), String> {
     Ok(())
 }
 
+fn file_list_requires_batch(paths: &[PathBuf]) -> bool {
+    paths.len() > 1 || paths.first().is_some_and(|path| path.is_dir())
+}
+
 fn scan_batch_paths(paths: Vec<String>) -> Result<PreparedBatch, String> {
     if paths.is_empty() {
         return Err("paths must contain at least one file or directory".into());
@@ -2007,6 +2011,18 @@ fn run_session_loop(
                 "replaced by a newer batch",
             )?;
             let state = OutboundBatchState::from_prepared(&prepared);
+            let entry_count = prepared.entries.len();
+            let directory_count = prepared
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == BatchEntryKind::Directory)
+                .count();
+            task_057_diagnostic(format_args!(
+                "batch_offer_dispatch batch_id={:?} entries={} files={} directories={directory_count}",
+                prepared.batch_id,
+                entry_count,
+                state.files.len()
+            ));
             match session.offer_file_batch_paths(
                 prepared.batch_id.clone(),
                 prepared.display_name.clone(),
@@ -2016,6 +2032,12 @@ fn run_session_loop(
                 Ok(QueueFileResult::Queued) => {
                     let outbox = session.take_outbox();
                     conn.send_all(outbox.iter()).map_err(|e| e.to_string())?;
+                    task_057_diagnostic(format_args!(
+                        "batch_offer_sent batch_id={:?} entries={} files={} directories={directory_count}",
+                        prepared.batch_id,
+                        entry_count,
+                        state.files.len()
+                    ));
                     mark_outbound_batch_started(&shared, &state);
                     if state.files.is_empty() {
                         mark_batch_done(&shared, &state.batch_id, None);
@@ -3418,7 +3440,10 @@ fn run_session_loop(
 
         if let Some(clip) = clipboard.as_mut() {
             let auto = with_status(&shared, |s| s.auto_sync);
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(target_os = "windows")]
+            let virtual_clipboard_active =
+                virtual_receive.is_some() || virtual_batch_receive.is_some();
+            #[cfg(target_os = "linux")]
             let virtual_clipboard_active = virtual_receive.is_some();
             #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             let virtual_clipboard_active = false;
@@ -3426,9 +3451,48 @@ fn run_session_loop(
                 // File-manager copies expose text/uri-list (file_list), not plain text/image.
                 if let Ok(Some(paths)) = clip.poll_file_list_change() {
                     latest_clipboard_file_offer_id = None;
-                    // Images: keep bitmap clipboard path (Word/paint paste).
                     let mut handled = false;
-                    if let Ok(Some(image)) = m590_clipboard::image_from_paths(&paths) {
+                    let file_count = paths.iter().filter(|path| path.is_file()).count();
+                    let directory_count = paths.iter().filter(|path| path.is_dir()).count();
+                    task_057_diagnostic(format_args!(
+                        "clipboard_file_list_detected roots={} files={file_count} directories={directory_count} action={}",
+                        paths.len(),
+                        if file_list_requires_batch(&paths) {
+                            "batch"
+                        } else {
+                            "single"
+                        }
+                    ));
+
+                    // Multiple roots or any directory need a manifest. Keep the existing
+                    // bitmap promotion only for one copied image, so mixed/image batches
+                    // retain their original file semantics.
+                    if file_list_requires_batch(&paths) {
+                        let batch_paths = paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>();
+                        match push_batch(&shared, batch_paths) {
+                            Ok(()) => {
+                                task_057_diagnostic(format_args!(
+                                    "clipboard_batch_queued roots={} files={file_count} directories={directory_count}",
+                                    paths.len()
+                                ));
+                                handled = true;
+                            }
+                            Err(err) => {
+                                task_057_diagnostic(format_args!(
+                                    "clipboard_batch_rejected roots={} error={err:?}",
+                                    paths.len()
+                                ));
+                                with_status(&shared, |s| {
+                                    s.file_transfer_phase = Some("failed".into());
+                                    s.last_error = Some(format!("file_list batch: {err}"));
+                                });
+                            }
+                        }
+                    } else if let Ok(Some(image)) = m590_clipboard::image_from_paths(&paths) {
+                        // One image keeps bitmap clipboard behavior for Word/paint paste.
                         content_seq += 1;
                         let cid = format!("ui-clip-imgfiles-{}-{content_seq}", std::process::id());
                         match image.prepare_inline(m590_core::Session::INLINE_IMAGE_MAX_BYTES) {
@@ -3482,7 +3546,7 @@ fn run_session_loop(
                             }
                         }
                     }
-                    // Non-image regular files: V2 file offer (first path only, streamed ≤ MAX_FILE_BYTES).
+                    // One non-image regular file keeps the proven single-file OLE lifecycle.
                     if !handled {
                         if let Some(path) = m590_clipboard::first_regular_file(&paths) {
                             match offer_local_file(
@@ -5149,6 +5213,24 @@ mod tests {
         let path = std::env::temp_dir().join(format!("m590-hub-batch-{nanos}-{sequence}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn clipboard_file_list_uses_batch_for_multiple_roots_or_a_directory() {
+        let root = batch_test_dir();
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        let folder = root.join("folder");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::create_dir(&folder).unwrap();
+
+        assert!(!file_list_requires_batch(&[]));
+        assert!(!file_list_requires_batch(std::slice::from_ref(&first)));
+        assert!(file_list_requires_batch(&[first, second]));
+        assert!(file_list_requires_batch(&[folder]));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

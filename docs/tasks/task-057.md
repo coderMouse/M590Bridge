@@ -50,9 +50,9 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 
 ## 下一步
 
-- Windows 10 拉取当前提交后运行 `desktop:standalone`，先复现包含 2 个顶层文件、嵌套
-  文件和空目录的小批次，再用同一个大文件做速度对照；回传完整 `[task-057]` 行，以确认
-  清单、Explorer `lindex`、逐文件网络请求和实际 MiB/s。
+- 两端拉取当前提交并运行 `desktop:standalone`；从发送端文件管理器复制包含 2 个顶层
+  文件、嵌套文件和空目录的选择，在 Windows Explorer 粘贴。确认发送端出现
+  `clipboard_batch_queued`，接收端出现 `batch_received entries>1` 和多个 `GetData.lindex`。
 
 ## 实施记录
 
@@ -94,6 +94,19 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   `FileRequest` 发出、首块延迟、完成耗时与 MiB/s；单文件路径也输出同口径速度，便于与
   用户之前的大 MP4 对照。`desktop:standalone` 在 Windows 临时保留控制台；普通打包与
   NSIS 不启用诊断 feature，行为不变。
+- 2026-08-18：真机日志确认失败样本并未进入 Windows 批次路径：只有
+  `publish_collection entries=1` / `single_ole_stream_request`，transfer id 也是
+  `ui-file-*`，没有 `batch_received`。因此 Explorer 只显示一个文件符合其收到的数据，OLE
+  集合不是本次丢项位置。对应发送端代码仍明确调用 `first_regular_file(&paths)`，会丢弃
+  file_list 的其余顶层路径并跳过单个目录。
+- 2026-08-18：修复发送入口：一个普通文件保持已验收的单文件 offer，一个图片保持位图
+  同步；多个根路径或任一目录使用 task-056 的安全扫描与 `FileBatchOffer`，保留嵌套/空
+  目录。Windows 接收虚拟批次期间也计入 `virtual_clipboard_active`，避免轮询自己发布的
+  OLE 集合形成回传。诊断扩展到发送端的 file_list 数量、批次排队和 offer 发出。
+- 2026-08-18：用户的大文件日志得到 1,387,616,317B / 302.516s，端到端
+  `effective_mib_s=4.37`、首块后 `data_mib_s=4.38`，请求调度仅 2ms、首块 258ms；没有
+  发现应用层请求间停顿。本轮未改分块、TCP 缓冲或 Session 泵，需用同方向 `iperf3`
+  对照后判断是网络/磁盘环境还是传输管线吞吐。
 
 ## 修改文件
 
@@ -105,7 +118,8 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 - `crates/m590-daemon/src/windows_virtual_file_manager.rs`：STA 线程发布及条件替换集合。
 - `crates/m590-daemon/src/virtual_file_bridge.rs`：网络请求开始前不计算排队流读取超时。
 - `crates/m590-daemon/Cargo.toml`、`src/hub.rs`：Windows 批次发布、逐文件惰性请求、串行
-  调度、状态和清理，并向 standalone 透传 task-057 诊断 feature。
+  调度、状态和清理；多路径/目录 file_list 自动生成批次并避免接收虚拟批次回传；向
+  standalone 透传 task-057 诊断 feature。
 - `ui/scripts/prepare-standalone.mjs`：standalone 启动前检查固定 Hub 端口，拒绝与旧实例并行。
 - `ui/package.json`、`ui/src-tauri/Cargo.toml`、`ui/src-tauri/src/main.rs`：仅 standalone
   启用 task-057 诊断并在 Windows 显示控制台；正式构建继续使用 windowed subsystem。
@@ -160,10 +174,17 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 - 本轮诊断 `cargo test --workspace`：通过，共 144 个单元测试，doc-tests 无失败。
 - 本轮诊断 `npm run lint -- --deny-warnings`、`npm run build`、
   `node --check scripts/prepare-standalone.mjs`：通过。
+- 本轮 file_list 修复 `cargo test --workspace`：通过；clipboard 23、core 37、daemon lib 55、
+  daemon bin 1、net 21、Tauri lib 8，共 145 个单元测试，doc-tests 无失败；新增测试确认
+  单文件保留单路，多根路径/单目录选择批次。
+- 本轮 file_list 修复 Windows GNU 诊断交叉检查：`m590-clipboard --lib --examples` 与
+  `m590-daemon --lib --bins --examples` 均通过。
+- 本轮 file_list 修复本机与 Windows GNU Clippy：通过，`-D warnings` 无 warning；
+  `cargo fmt --all -- --check`、`git diff --check`：通过。
 
 ## 文档影响检查
 
-- 已更新：本 task、当前计划、项目入口、协议草案、项目结构图和 Windows 验收命令；
+- 已更新：本 task、当前计划、项目入口、协议草案、UI 规格和 Windows 验收命令；
   本轮为新增 OLE 集合探针同步了项目结构图和真机命令，并补充 standalone 旧实例预检及
   feature-gated 诊断说明。
 - 无需更新：协议字段、Hub HTTP API、UI 交互、安装器和 Linux FUSE 均未改变。
@@ -172,10 +193,10 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 
 - Windows 10 首轮真机验收已确认多文件/目录行为失败；修复后仍需 Explorer 复测才能
   标记完成。
-- 无网络 OLE 已通过且带 5910 预检的 standalone 仍失败；当前必须依据新增的清单、
-  `GetData.lindex` 与网络调度日志判断是批次接线丢项、Explorer 请求差异还是串行调度停滞。
-- 用户反馈速度体感下降，但源码比较未发现本轮修改传输算法；需用新增单文件/批次
-  `effective_mib_s` 与 `data_mib_s` 取得真机事实后再决定是否需要吞吐修复。
+- 失败日志已定位到发送端只发布第一项，并已改为 file_list 多路径/目录批次；Windows
+  Explorer 端到端结果仍须真机复测，不能以本机 OLE 探针或交叉编译替代。
+- 大文件实测为 4.37 MiB/s，应用请求/首块等待只占约 0.26s；源码比较未发现本轮修改传输
+  算法。需以同方向 `iperf3` 和本机磁盘读写对照后再决定是否需要吞吐修复。
 - 沿用 task-044 的一次性网络 offer：同一剪贴板 offer 完成后再次 `Ctrl+V` 仍不保证可重开
   `FILECONTENTS`；本 task 验证“重新发送同批输入后再次粘贴”。若产品要求同一 offer 任意
   次粘贴，需要另建任务扩展发送源保留与重复请求协议生命周期。
