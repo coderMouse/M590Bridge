@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-18
-> 阶段：task-057 已修复 Linux 多路径末尾 CR 残留及批次失败单文件降级，等待 Windows 批次粘贴复测
+> 阶段：task-057 Windows Explorer 多文件剪贴板粘贴已完成，下一步为 task-058 Linux FUSE 虚拟目录树
 
 ## 目标（近期）
 
@@ -47,12 +47,10 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-054** Linux / Windows 一键打包脚本（两端实包 + Windows 成功/异常按键暂停验收通过）
 - [x] **task-055** 多文件批次清单与路径安全基础（type 16；仅协议模型与本地验证）
 - [x] **task-056** 多文件选择、目录扫描与串行批次传输（Linux/Windows 桌面交互与跨机验收通过）
+- [x] **task-057** Windows Explorer 多文件剪贴板粘贴（用户确认 Windows 真机测试通过）
 
 ## 进行中 / 暂停
 
-- [ ] **task-057** Windows Explorer 多文件剪贴板粘贴（诊断确认失败样本从未收到批次；
-  已将文件管理器多路径/目录 file_list、GNOME 多行文本及 Wayland 原始 MIME 回退改走
-  `FileBatchOffer`，并修复多路径末尾 `\r` 导致批次扫描失败及错误单文件降级，等待端到端复测）
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
@@ -67,7 +65,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 |--------|------|------|
 | MVP | 配对 + 文本 | **已完成** |
 | V2 · 图片 | 图片剪贴板双向 | **已完成** |
-| V2 · 文件 | 元数据 + 按需 + 进度 + 流式 | **单文件 OS 粘贴与手动多文件/目录批次已完成**（无 OS 多文件/文件夹直接粘贴或断点续传） |
+| V2 · 文件 | 元数据 + 按需 + 进度 + 流式 | **单文件 OS 粘贴、手动多文件/目录批次及 Windows OS 多文件/目录粘贴已完成**（Linux 目录树与断点续传未完成） |
 | V3 · mDNS | 局域网发现 | **第一刀完成**（task-029） |
 | V3 · 安装 | 安装包/自启 | **Linux `.deb` + 用户登录自启、Windows NSIS + HKCU 自启均完成**；均为当前用户安装，未签名 |
 
@@ -84,9 +82,9 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 多文件/目录手动批次 | **真机验收通过**（task-056；原生多选/目录/拖放、安全扫描、串行传输、整批暂存发布、双层进度/取消） |
 | hub 自动落盘 + send_file(_bytes) | 有 |
 | UI 选文件发送 + 进度 + 保存目录 | **有** |
-| 文件夹 / OS 文件剪贴板 | 手动文件夹批次已通过；Windows Explorer 多文件/目录代码待真机验收，Linux FUSE 仍限单文件 |
+| 文件夹 / OS 文件剪贴板 | 手动文件夹批次与 Windows Explorer 多文件/目录已通过，Linux FUSE 仍限单文件 |
 | 大文件流式（磁盘流+SHA-256，软上限 8GiB） | **有**（task-033；同连接串行；task-036 已移除固定批次节流和多帧累计误判） |
-| file_list 触发原文件 offer（非图片，路径流式） | **有**；单文件走原 offer，多路径/目录走批次（待 task-057 真机复测） |
+| file_list 触发原文件 offer（非图片，路径流式） | **有**；单文件走原 offer，多路径/目录走批次，Windows Explorer 验收通过 |
 | 路径文本（非图片）→ file offer | **有**（task-025） |
 | 发送方 FileComplete → UI done/满进度 | **有**（task-025） |
 | GNOME Wayland 文件管理器复制自动同步 | **受限**（用原生选文件/窗口拖放，task-026/027） |
@@ -106,20 +104,15 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 两端拉取同一提交，从 Linux 文件管理器复制多路径/目录，在 Windows Explorer 粘贴；
-   确认发送端路径不再带 `\r`，出现 `clipboard_file_list_detected` 或
-   `clipboard_text_paths_detected` 且随后出现 `clipboard_batch_queued` /
-   `clipboard_batch_queued_from_text`，接收端出现 `batch_received entries>1` 及多个
-   `GetData.lindex`
-2. task-057 完成后执行 **task-058**：Linux FUSE 虚拟目录树
-3. 完成 OS 文件管理器多文件/文件夹直接粘贴端到端真机验收
-4. （可选）设置页发现开关 / 本机显示名
-5. 如需发布到非开发用户，另建代码签名/升级机制 task，不改动现有传输协议
+1. 执行 **task-058**：Linux FUSE 虚拟目录树
+2. 评估 Linux 文件管理器多文件/文件夹直接粘贴入口与目录树接入范围
+3. （可选）设置页发现开关 / 本机显示名
+4. 如需发布到非开发用户，另建代码签名/升级机制 task，不改动现有传输协议
 
-> task-042 至 task-054 均已完成相应真机验收。task-052 已证明 Linux FUSE 单文件可在
-> Nautilus 粘贴时通过网络惰性读取并显示系统进度；task-053 已修复 Linux 托盘文字回归。
-> task-042 已完成 Windows 安装、自启、卸载清理与跨机回归验收；task-056 的手动
-> 多文件/目录批次也已完成两端交互与跨机验收，但不包含 OS 文件剪贴板目录树或断点续传。
+> task-042 至 task-054 已完成相应真机验收；task-056 的手动多文件/目录批次和 task-057
+> 的 Windows Explorer 多文件剪贴板均已完成两端验收。task-052 已证明 Linux FUSE 单文件
+> 可在 Nautilus 粘贴时通过网络惰性读取并显示系统进度；task-053 已修复 Linux 托盘文字
+> 回归，但 Linux FUSE 虚拟目录树与断点续传仍未完成。
 
 ## 用户怎么用
 

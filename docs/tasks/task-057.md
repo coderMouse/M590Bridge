@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`
+`completed`
 
 ## 背景
 
@@ -46,16 +46,13 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 
 ## 完成标准
 
-- [ ] Explorer 能粘贴多文件及嵌套文件夹，内容和相对路径一致。
-- [ ] 系统进度、取消、替换和断线均无死锁或残留状态。
-- [ ] 单文件回归保持通过；Windows 真机结果已记录。
+- [x] Explorer 能粘贴多文件及嵌套文件夹，内容和相对路径一致。
+- [x] 系统进度、取消、替换和断线均无死锁或残留状态。
+- [x] 单文件回归保持通过；Windows 真机结果已记录。
 
 ## 下一步
 
-- 两端拉取当前提交并运行 `desktop:standalone`；从 Linux 文件管理器复制包含多个顶层
-  文件和目录的选择，在 Windows Explorer 粘贴。确认发送端路径不再带 `\r` 并出现
-  `clipboard_batch_queued`，接收端出现 `batch_received entries>1` 和多个 `GetData.lindex`；
-  再覆盖嵌套/空目录、取消、替换、断线及重新发送后的再次粘贴。
+- task-057 已完成；下一步执行 task-058 Linux FUSE 虚拟目录树。
 
 ## 实施记录
 
@@ -121,6 +118,7 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   空文本文件。Linux 现会在初始化与每次轮询时保守清洗文件列表：仅当原路径不存在、清洗
   后路径确实存在时替换，避免改写合法路径；需要批次的选择即使扫描失败也不再降级为部分
   单文件 offer。
+- 2026-08-18：用户确认修复后 Windows 10 真机测试通过，task-057 完成；后续进入 task-058。
 
 ## 修改文件
 
@@ -215,25 +213,25 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   无 warning。
 - 本轮 CR 路径修复 `cargo clippy -p m590-clipboard -p m590-daemon --lib --bins --no-deps --
   -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
+- Windows 10 真机复测：用户确认 task-057 测试通过，完成标准全部满足。
 
 ## 文档影响检查
 
 - 已更新：本 task、当前计划、`AGENTS.md` 与项目说明，记录 CR 路径根因、禁止批次失败后
-  部分降级及新的真机复测门槛。
+  部分降级及用户确认的 Windows 真机验收结果。
 - 历史已更新：协议草案、项目结构图、UI 规格、Windows 验收命令、standalone 旧实例预检
   与 feature-gated 诊断说明。
 - 无需更新：本轮未改变协议字段、Hub HTTP API、UI 交互、安装器、模块职责或 Linux FUSE。
 
 ## 风险 / blocker
 
-- Windows 10 首轮真机验收已确认多文件/目录行为失败；修复后仍需 Explorer 复测才能
-  标记完成。
+- Windows 10 首轮真机验收曾确认多文件/目录行为失败；修复后用户已确认 Explorer 真机
+  复测通过。
 - 失败日志先后定位到发送端只发布第一项，以及多路径末尾 `\r` 使批次扫描失败后又降级为
-  单文件；两处均已修复。Windows Explorer 端到端结果仍须真机复测，不能以本机 OLE 探针
-  或交叉编译替代。
+  单文件；两处均已修复并完成 Windows 真机验收。
 - Linux Wayland 原始 MIME 补读依赖 compositor 的 data-control；没有该协议时只能依赖
-  arboard/X11 可见内容或多行文本回退。本轮已修复 arboard 多路径末尾 `\r`，但仍需真机
-  确认发送端进入 `clipboard_batch_queued`，不能用单元测试替代桌面剪贴板行为。
+  arboard/X11 可见内容或多行文本回退；该限制仍存在。本 task 的 Windows 验收不代表
+  Linux Nautilus 已支持多文件/文件夹直接粘贴。
 - 大文件实测为 4.37 MiB/s，应用请求/首块等待只占约 0.26s；源码比较未发现本轮修改传输
   算法。需以同方向 `iperf3` 和本机磁盘读写对照后再决定是否需要吞吐修复。
 - 沿用 task-044 的一次性网络 offer：同一剪贴板 offer 完成后再次 `Ctrl+V` 仍不保证可重开
