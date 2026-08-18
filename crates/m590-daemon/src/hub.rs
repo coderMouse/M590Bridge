@@ -160,6 +160,75 @@ struct LinuxVirtualReceive {
     clipboard_replaced: bool,
 }
 
+#[cfg(target_os = "linux")]
+struct LinuxVirtualBatchFile {
+    entry: BatchEntry,
+    bridge: VirtualFileBridge,
+    producer: PipeProducer,
+    requested: bool,
+    completed: bool,
+    consumed: bool,
+    released: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxVirtualBatchReceive {
+    batch_id: String,
+    files: Vec<LinuxVirtualBatchFile>,
+    active_index: Option<usize>,
+    completed_files: u32,
+    completed_bytes: u64,
+    clipboard_replaced: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxVirtualBatchReceive {
+    fn file_index(&self, transfer_id: &str) -> Option<usize> {
+        self.files
+            .iter()
+            .position(|file| file.entry.entry_id == transfer_id)
+    }
+
+    fn must_finish(&self) -> bool {
+        self.files.iter().any(|file| {
+            linux_virtual_receive_must_finish(
+                file.requested,
+                file.completed,
+                file.consumed,
+                file.released,
+            )
+        })
+    }
+
+    fn is_complete(&self) -> bool {
+        self.files.iter().all(|file| file.completed)
+    }
+
+    fn pending_ids(&self) -> impl Iterator<Item = String> + '_ {
+        self.files
+            .iter()
+            .filter(|file| !file.completed)
+            .map(|file| file.entry.entry_id.clone())
+    }
+
+    fn next_requested_index(&self) -> Option<usize> {
+        self.files
+            .iter()
+            .position(|file| file.requested && !file.completed)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxVirtualBatchReceive {
+    fn drop(&mut self) {
+        for file in &self.files {
+            if !file.completed {
+                file.producer.fail("virtual batch receiver stopped");
+            }
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Debug)]
 struct DeferredVirtualOffer {
@@ -168,7 +237,7 @@ struct DeferredVirtualOffer {
     size: u64,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Debug)]
 struct DeferredVirtualBatchOffer {
     batch_id: String,
@@ -176,7 +245,7 @@ struct DeferredVirtualBatchOffer {
     entries: Vec<BatchEntry>,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl DeferredVirtualBatchOffer {
     fn file_ids(&self) -> impl Iterator<Item = String> + '_ {
         self.entries
@@ -1789,7 +1858,11 @@ fn run_session_loop(
     #[cfg(target_os = "linux")]
     let mut virtual_receive: Option<LinuxVirtualReceive> = None;
     #[cfg(target_os = "linux")]
+    let mut virtual_batch_receive: Option<LinuxVirtualBatchReceive> = None;
+    #[cfg(target_os = "linux")]
     let mut deferred_virtual_offer: Option<DeferredVirtualOffer> = None;
+    #[cfg(target_os = "linux")]
+    let mut deferred_virtual_batch_offer: Option<DeferredVirtualBatchOffer> = None;
     while session.state() != ConnectionState::Connected {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             let _ = session.handle(SessionEvent::Disconnect);
@@ -1893,6 +1966,34 @@ fn run_session_loop(
                 &mut inbound_batch,
                 "cancelled by local user",
             )?;
+            #[cfg(target_os = "linux")]
+            {
+                let mut cancelled_virtual_batch = None;
+                if let Some(current) = virtual_batch_receive.take() {
+                    cancelled_virtual_batch = Some(current.batch_id.clone());
+                    cancel_linux_virtual_batch(session, conn, &current, "cancelled by local user")?;
+                }
+                if let Some(deferred) = deferred_virtual_batch_offer.take() {
+                    cancelled_virtual_batch = Some(deferred.batch_id.clone());
+                    cancel_deferred_linux_virtual_batch(
+                        session,
+                        conn,
+                        deferred,
+                        "cancelled by local user",
+                    )?;
+                }
+                if let Some(batch_id) = cancelled_virtual_batch {
+                    fuse_manager.clear();
+                    with_status(&shared, |status| {
+                        status.file_transfer_phase = Some("cancelled".into());
+                        status.last_file_transfer_id = Some(batch_id);
+                        status.file_batch_current_path = None;
+                        status.file_bytes_received = None;
+                        status.file_bytes_total = None;
+                        status.last_error = None;
+                    });
+                }
+            }
         }
 
         let pending_text = PENDING_COMMANDS
@@ -2298,6 +2399,129 @@ fn run_session_loop(
                             }
                             continue;
                         }
+                        #[cfg(target_os = "linux")]
+                        if let InboundFileResult::BatchOffered {
+                            batch_id,
+                            display_name,
+                            entries,
+                        } = &file_event
+                        {
+                            cancel_runtime_batch(
+                                &shared,
+                                session,
+                                conn,
+                                &mut outbound_batch,
+                                &mut inbound_batch,
+                                "replaced by a Linux virtual batch",
+                            )?;
+                            let next = DeferredVirtualBatchOffer {
+                                batch_id: batch_id.clone(),
+                                display_name: display_name.clone(),
+                                entries: entries.clone(),
+                            };
+                            let must_defer = virtual_receive.as_ref().is_some_and(|current| {
+                                linux_virtual_receive_must_finish(
+                                    current.requested,
+                                    current.completed,
+                                    current.consumed,
+                                    current.released,
+                                )
+                            }) || virtual_batch_receive
+                                .as_ref()
+                                .is_some_and(LinuxVirtualBatchReceive::must_finish);
+                            if must_defer {
+                                if let Some(stale) = deferred_virtual_offer.take() {
+                                    session
+                                        .cancel_file(
+                                            stale.transfer_id,
+                                            "replaced by a newer deferred batch offer",
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                if let Some(stale) = deferred_virtual_batch_offer.take() {
+                                    cancel_deferred_linux_virtual_batch(
+                                        session,
+                                        conn,
+                                        stale,
+                                        "replaced by a newer deferred batch offer",
+                                    )?;
+                                }
+                                deferred_virtual_batch_offer = Some(next);
+                            } else {
+                                if let Some(previous) = virtual_receive.take() {
+                                    if !previous.completed {
+                                        previous.producer.fail("replaced by a newer batch offer");
+                                        session
+                                            .cancel_file(
+                                                previous.transfer_id,
+                                                "replaced by a newer batch offer",
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                        conn.send_all(session.take_outbox().iter())
+                                            .map_err(|error| error.to_string())?;
+                                    }
+                                }
+                                if let Some(previous) = virtual_batch_receive.take() {
+                                    cancel_linux_virtual_batch(
+                                        session,
+                                        conn,
+                                        &previous,
+                                        "replaced by a newer batch offer",
+                                    )?;
+                                }
+                                if let Some(stale) = deferred_virtual_offer.take() {
+                                    session
+                                        .cancel_file(
+                                            stale.transfer_id,
+                                            "replaced by a newer batch offer",
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                if let Some(stale) = deferred_virtual_batch_offer.take() {
+                                    cancel_deferred_linux_virtual_batch(
+                                        session,
+                                        conn,
+                                        stale,
+                                        "replaced by a newer batch offer",
+                                    )?;
+                                }
+                                let published = clipboard
+                                    .as_mut()
+                                    .ok_or_else(|| {
+                                        "Linux clipboard unavailable for virtual batch".to_string()
+                                    })
+                                    .and_then(|clip| {
+                                        publish_linux_virtual_batch_offer(
+                                            &mut fuse_manager,
+                                            clip,
+                                            &next,
+                                        )
+                                    });
+                                match published {
+                                    Ok(receive) => {
+                                        virtual_batch_receive = Some(receive);
+                                        mark_linux_virtual_batch_offer(&shared, &next);
+                                    }
+                                    Err(error) => {
+                                        cancel_deferred_linux_virtual_batch(
+                                            session,
+                                            conn,
+                                            next,
+                                            "cannot publish Linux virtual batch",
+                                        )?;
+                                        fuse_manager.clear();
+                                        with_status(&shared, |status| {
+                                            mark_batch_failed(status, batch_id, &error);
+                                        });
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         let failed_transfer_id = match &file_event {
                             InboundFileResult::Failed { transfer_id, .. } => {
                                 Some(transfer_id.clone())
@@ -2319,6 +2543,18 @@ fn run_session_loop(
                             session,
                             conn,
                             &ole_manager,
+                            &file_event,
+                            &mut virtual_batch_receive,
+                            &mut deferred_virtual_batch_offer,
+                        )? {
+                            continue;
+                        }
+                        #[cfg(target_os = "linux")]
+                        if handle_linux_virtual_batch_stream_event(
+                            &shared,
+                            session,
+                            conn,
+                            &mut fuse_manager,
                             &file_event,
                             &mut virtual_batch_receive,
                             &mut deferred_virtual_batch_offer,
@@ -2583,8 +2819,18 @@ fn run_session_loop(
                                                 current.consumed,
                                                 current.released,
                                             )
-                                        });
+                                        }) || virtual_batch_receive
+                                            .as_ref()
+                                            .is_some_and(LinuxVirtualBatchReceive::must_finish);
                                     if must_defer {
+                                        if let Some(stale) = deferred_virtual_batch_offer.take() {
+                                            cancel_deferred_linux_virtual_batch(
+                                                session,
+                                                conn,
+                                                stale,
+                                                "replaced by a newer deferred file offer",
+                                            )?;
+                                        }
                                         if let Some(stale) = deferred_virtual_offer.replace(next) {
                                             session
                                                 .cancel_file(
@@ -2611,6 +2857,14 @@ fn run_session_loop(
                                                     .map_err(|e| e.to_string())?;
                                             }
                                         }
+                                        if let Some(previous) = virtual_batch_receive.take() {
+                                            cancel_linux_virtual_batch(
+                                                session,
+                                                conn,
+                                                &previous,
+                                                "replaced by a newer file offer",
+                                            )?;
+                                        }
                                         if let Some(stale) = deferred_virtual_offer.take() {
                                             session
                                                 .cancel_file(
@@ -2620,6 +2874,14 @@ fn run_session_loop(
                                                 .map_err(|e| e.to_string())?;
                                             conn.send_all(session.take_outbox().iter())
                                                 .map_err(|e| e.to_string())?;
+                                        }
+                                        if let Some(stale) = deferred_virtual_batch_offer.take() {
+                                            cancel_deferred_linux_virtual_batch(
+                                                session,
+                                                conn,
+                                                stale,
+                                                "replaced by a newer file offer",
+                                            )?;
                                         }
                                         let published = clipboard
                                             .as_mut()
@@ -2781,7 +3043,37 @@ fn run_session_loop(
                                 }
                             }
                         }
-                        #[cfg(not(target_os = "windows"))]
+                        #[cfg(target_os = "linux")]
+                        if let Some(batch) = virtual_batch_receive.as_ref() {
+                            if let Some(index) = batch.active_index {
+                                if let Some((tid, got, total)) = session.inbound_file_progress() {
+                                    if tid == batch.files[index].entry.entry_id {
+                                        with_status(&shared, |status| {
+                                            status.file_transfer_phase = Some("receiving".into());
+                                            status.last_file_transfer_id =
+                                                Some(batch.batch_id.clone());
+                                            status.file_batch_current_path = Some(
+                                                batch.files[index].entry.relative_path.clone(),
+                                            );
+                                            status.file_bytes_received = Some(got);
+                                            status.file_bytes_total = Some(total);
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(target_os = "linux")]
+                        if inbound_batch.is_none() && virtual_batch_receive.is_none() {
+                            if let Some((tid, got, total)) = session.inbound_file_progress() {
+                                with_status(&shared, |s| {
+                                    s.file_transfer_phase = Some("receiving".into());
+                                    s.last_file_transfer_id = Some(tid);
+                                    s.file_bytes_received = Some(got);
+                                    s.file_bytes_total = Some(total);
+                                });
+                            }
+                        }
+                        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                         if inbound_batch.is_none() {
                             if let Some((tid, got, total)) = session.inbound_file_progress() {
                                 with_status(&shared, |s| {
@@ -3353,13 +3645,143 @@ fn run_session_loop(
                 } else if keep_current
                     && current.completed
                     && current.consumed
-                    && deferred_virtual_offer.is_some()
+                    && current.released
+                    && (deferred_virtual_offer.is_some() || deferred_virtual_batch_offer.is_some())
                 {
                     keep_current = false;
                     promote_deferred_if_current = true;
                 }
                 if keep_current {
                     virtual_receive = Some(current);
+                }
+            }
+
+            if let Some(mut current) = virtual_batch_receive.take() {
+                let mut keep_current = true;
+                let mut cancel_reason = None;
+                for index in 0..current.files.len() {
+                    while let Some(event) = current.files[index].bridge.take_event() {
+                        match event {
+                            BridgeEvent::Request => {
+                                current.files[index].requested = true;
+                                if current.files[index].completed {
+                                    current.files[index].producer.finish();
+                                }
+                            }
+                            BridgeEvent::Consumed => current.files[index].consumed = true,
+                            BridgeEvent::Released => current.files[index].released = true,
+                            BridgeEvent::Cancel(reason) => {
+                                cancel_reason = Some(reason);
+                                break;
+                            }
+                        }
+                    }
+                    if cancel_reason.is_some() {
+                        break;
+                    }
+                }
+
+                if let Some(reason) = cancel_reason {
+                    cancel_linux_virtual_batch(session, conn, &current, &reason)?;
+                    fuse_manager.clear();
+                    with_status(&shared, |status| {
+                        mark_batch_failed(status, &current.batch_id, &reason);
+                    });
+                    keep_current = false;
+                    promote_deferred = true;
+                }
+
+                if keep_current && current.active_index.is_none() {
+                    if let Some(index) = current.next_requested_index() {
+                        let transfer_id = current.files[index].entry.entry_id.clone();
+                        let request_error = match session.request_file_stream(transfer_id) {
+                            Ok(QueueFileResult::Queued) => {
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|error| error.to_string())?;
+                                current.files[index].producer.start();
+                                current.active_index = Some(index);
+                                with_status(&shared, |status| {
+                                    status.file_transfer_phase = Some("receiving".into());
+                                    status.last_file_transfer_id = Some(current.batch_id.clone());
+                                    status.file_batch_current_path =
+                                        Some(current.files[index].entry.relative_path.clone());
+                                    status.file_bytes_received = Some(0);
+                                    status.file_bytes_total = Some(current.files[index].entry.size);
+                                    status.last_error = None;
+                                });
+                                None
+                            }
+                            Ok(other) => Some(format!("request failed: {other:?}")),
+                            Err(error) => Some(error.to_string()),
+                        };
+                        if let Some(error) = request_error {
+                            cancel_linux_virtual_batch(session, conn, &current, &error)?;
+                            fuse_manager.clear();
+                            with_status(&shared, |status| {
+                                mark_batch_failed(status, &current.batch_id, &error);
+                            });
+                            keep_current = false;
+                            promote_deferred = true;
+                        }
+                    }
+                }
+
+                if keep_current && !current.clipboard_replaced {
+                    if let Some(clip) = clipboard.as_mut() {
+                        match fuse_manager.is_current(clip) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if current.must_finish() {
+                                    current.clipboard_replaced = true;
+                                } else {
+                                    cancel_linux_virtual_batch(
+                                        session,
+                                        conn,
+                                        &current,
+                                        "clipboard replaced",
+                                    )?;
+                                    fuse_manager.clear();
+                                    with_status(&shared, |status| {
+                                        status.file_transfer_phase = Some("cancelled".into());
+                                        status.file_batch_current_path = None;
+                                        status.file_bytes_received = None;
+                                        status.file_bytes_total = None;
+                                        status.last_error = None;
+                                    });
+                                    keep_current = false;
+                                }
+                                discard_deferred = true;
+                                latest_clipboard_file_offer_id = None;
+                            }
+                            Err(error) => {
+                                with_status(&shared, |status| {
+                                    status.last_error =
+                                        Some(format!("FUSE clipboard ownership: {error}"));
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if keep_current && current.clipboard_replaced && !current.must_finish() {
+                    cancel_linux_virtual_batch(session, conn, &current, "clipboard replaced")?;
+                    fuse_manager.clear();
+                    keep_current = false;
+                } else if keep_current
+                    && !current.must_finish()
+                    && (deferred_virtual_offer.is_some() || deferred_virtual_batch_offer.is_some())
+                {
+                    cancel_linux_virtual_batch(
+                        session,
+                        conn,
+                        &current,
+                        "replaced after active batch streams completed",
+                    )?;
+                    keep_current = false;
+                    promote_deferred_if_current = true;
+                }
+                if keep_current {
+                    virtual_batch_receive = Some(current);
                 }
             }
 
@@ -3370,6 +3792,14 @@ fn run_session_loop(
                         .map_err(|e| e.to_string())?;
                     conn.send_all(session.take_outbox().iter())
                         .map_err(|e| e.to_string())?;
+                }
+                if let Some(stale) = deferred_virtual_batch_offer.take() {
+                    cancel_deferred_linux_virtual_batch(
+                        session,
+                        conn,
+                        stale,
+                        "clipboard replaced",
+                    )?;
                 }
             } else if promote_deferred {
                 if let Some(next) = deferred_virtual_offer.take() {
@@ -3394,6 +3824,28 @@ fn run_session_loop(
                                 .map_err(|e| e.to_string())?;
                             conn.send_all(session.take_outbox().iter())
                                 .map_err(|e| e.to_string())?;
+                        }
+                    }
+                } else if let Some(next) = deferred_virtual_batch_offer.take() {
+                    let published = clipboard
+                        .as_mut()
+                        .ok_or_else(|| "Linux clipboard unavailable for virtual batch".to_string())
+                        .and_then(|clip| {
+                            publish_linux_virtual_batch_offer(&mut fuse_manager, clip, &next)
+                        });
+                    match published {
+                        Ok(receive) => {
+                            virtual_batch_receive = Some(receive);
+                            mark_linux_virtual_batch_offer(&shared, &next);
+                        }
+                        Err(error) => {
+                            fuse_manager.clear();
+                            cancel_deferred_linux_virtual_batch(
+                                session,
+                                conn,
+                                next,
+                                &format!("FUSE publish failed: {error}"),
+                            )?;
                         }
                     }
                 }
@@ -3434,6 +3886,94 @@ fn run_session_loop(
                             });
                         }
                     }
+                } else if let Some(next) = deferred_virtual_batch_offer.take() {
+                    let replaced = clipboard
+                        .as_mut()
+                        .ok_or_else(|| "Linux clipboard unavailable for virtual batch".to_string())
+                        .and_then(|clip| {
+                            replace_linux_virtual_batch_offer_if_current(
+                                &mut fuse_manager,
+                                clip,
+                                &next,
+                            )
+                        });
+                    match replaced {
+                        Ok(Some(receive)) => {
+                            virtual_batch_receive = Some(receive);
+                            mark_linux_virtual_batch_offer(&shared, &next);
+                        }
+                        Ok(None) => {
+                            cancel_deferred_linux_virtual_batch(
+                                session,
+                                conn,
+                                next,
+                                "clipboard replaced",
+                            )?;
+                            latest_clipboard_file_offer_id = None;
+                        }
+                        Err(error) => {
+                            fuse_manager.clear();
+                            cancel_deferred_linux_virtual_batch(
+                                session,
+                                conn,
+                                next,
+                                &format!("FUSE replace failed: {error}"),
+                            )?;
+                            with_status(&shared, |status| {
+                                status.file_transfer_phase = Some("failed".into());
+                                status.last_error = Some(format!("FUSE replace: {error}"));
+                            });
+                        }
+                    }
+                }
+            }
+            if virtual_receive.is_none() && virtual_batch_receive.is_none() {
+                if let Some(next) = deferred_virtual_offer.take() {
+                    let published = clipboard
+                        .as_mut()
+                        .ok_or_else(|| "Linux clipboard unavailable for virtual file".to_string())
+                        .and_then(|clip| {
+                            publish_linux_virtual_offer(&mut fuse_manager, clip, &next)
+                        });
+                    match published {
+                        Ok(receive) => {
+                            virtual_receive = Some(receive);
+                            mark_virtual_offer(&shared, &next);
+                        }
+                        Err(error) => {
+                            fuse_manager.clear();
+                            session
+                                .cancel_file(
+                                    next.transfer_id,
+                                    format!("FUSE publish failed: {error}"),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            conn.send_all(session.take_outbox().iter())
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                } else if let Some(next) = deferred_virtual_batch_offer.take() {
+                    let published = clipboard
+                        .as_mut()
+                        .ok_or_else(|| "Linux clipboard unavailable for virtual batch".to_string())
+                        .and_then(|clip| {
+                            publish_linux_virtual_batch_offer(&mut fuse_manager, clip, &next)
+                        });
+                    match published {
+                        Ok(receive) => {
+                            virtual_batch_receive = Some(receive);
+                            mark_linux_virtual_batch_offer(&shared, &next);
+                        }
+                        Err(error) => {
+                            fuse_manager.clear();
+                            cancel_deferred_linux_virtual_batch(
+                                session,
+                                conn,
+                                next,
+                                &format!("FUSE publish failed: {error}"),
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -3444,7 +3984,8 @@ fn run_session_loop(
             let virtual_clipboard_active =
                 virtual_receive.is_some() || virtual_batch_receive.is_some();
             #[cfg(target_os = "linux")]
-            let virtual_clipboard_active = virtual_receive.is_some();
+            let virtual_clipboard_active =
+                virtual_receive.is_some() || virtual_batch_receive.is_some();
             #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             let virtual_clipboard_active = false;
             if auto && !virtual_clipboard_active {
@@ -4982,6 +5523,292 @@ fn handle_windows_virtual_batch_stream_event(
 }
 
 #[cfg(target_os = "linux")]
+fn publish_linux_virtual_batch_offer(
+    manager: &mut LinuxVirtualFileManager,
+    clipboard: &mut PlatformClipboard,
+    offer: &DeferredVirtualBatchOffer,
+) -> Result<LinuxVirtualBatchReceive, String> {
+    let (tree, receive) = prepare_linux_virtual_batch_offer(offer)?;
+    manager
+        .publish_tree(clipboard, tree)
+        .map_err(|error| error.to_string())?;
+    Ok(receive)
+}
+
+#[cfg(target_os = "linux")]
+fn replace_linux_virtual_batch_offer_if_current(
+    manager: &mut LinuxVirtualFileManager,
+    clipboard: &mut PlatformClipboard,
+    offer: &DeferredVirtualBatchOffer,
+) -> Result<Option<LinuxVirtualBatchReceive>, String> {
+    let (tree, receive) = prepare_linux_virtual_batch_offer(offer)?;
+    Ok(manager
+        .replace_tree_if_current(clipboard, tree)
+        .map_err(|error| error.to_string())?
+        .then_some(receive))
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_virtual_batch_offer(
+    offer: &DeferredVirtualBatchOffer,
+) -> Result<
+    (
+        crate::linux_virtual_file::LinuxVirtualFileTree,
+        LinuxVirtualBatchReceive,
+    ),
+    String,
+> {
+    use crate::linux_virtual_file::{LinuxVirtualFileTree, LinuxVirtualFileTreeEntry};
+
+    let mut tree_entries = Vec::with_capacity(offer.entries.len());
+    let mut files = Vec::new();
+    for entry in &offer.entries {
+        match entry.kind {
+            BatchEntryKind::Directory => {
+                tree_entries.push(
+                    LinuxVirtualFileTreeEntry::directory(&entry.relative_path)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            BatchEntryKind::File => {
+                let file_name = entry
+                    .relative_path
+                    .rsplit('/')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| "batch file name missing".to_string())?;
+                let (bridge, producer) = VirtualFileBridge::new();
+                let file = bridge
+                    .linux_virtual_file(file_name.to_string(), entry.size)
+                    .map_err(|error| error.to_string())?;
+                tree_entries.push(
+                    LinuxVirtualFileTreeEntry::file(&entry.relative_path, file)
+                        .map_err(|error| error.to_string())?,
+                );
+                files.push(LinuxVirtualBatchFile {
+                    entry: entry.clone(),
+                    bridge,
+                    producer,
+                    requested: false,
+                    completed: false,
+                    consumed: false,
+                    released: false,
+                });
+            }
+        }
+    }
+    let tree = LinuxVirtualFileTree::new(tree_entries).map_err(|error| error.to_string())?;
+    Ok((
+        tree,
+        LinuxVirtualBatchReceive {
+            batch_id: offer.batch_id.clone(),
+            files,
+            active_index: None,
+            completed_files: 0,
+            completed_bytes: 0,
+            clipboard_replaced: false,
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn cancel_linux_virtual_batch(
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    batch: &LinuxVirtualBatchReceive,
+    reason: &str,
+) -> Result<(), String> {
+    for file in &batch.files {
+        if !file.completed {
+            file.producer.fail(reason);
+        }
+    }
+    cancel_transfer_ids(session, conn, batch.pending_ids(), reason)
+}
+
+#[cfg(target_os = "linux")]
+fn cancel_deferred_linux_virtual_batch(
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    offer: DeferredVirtualBatchOffer,
+    reason: &str,
+) -> Result<(), String> {
+    let file_ids = offer.file_ids().collect::<Vec<_>>();
+    if file_ids.is_empty() {
+        session
+            .cancel_file(offer.batch_id, reason)
+            .map_err(|error| error.to_string())?;
+        return conn
+            .send_all(session.take_outbox().iter())
+            .map_err(|error| error.to_string());
+    }
+    cancel_transfer_ids(session, conn, file_ids, reason)
+}
+
+#[cfg(target_os = "linux")]
+fn mark_linux_virtual_batch_offer(shared: &SharedStatus, offer: &DeferredVirtualBatchOffer) {
+    let files = offer
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == BatchEntryKind::File)
+        .count() as u32;
+    let total_bytes = offer
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == BatchEntryKind::File)
+        .map(|entry| entry.size)
+        .sum::<u64>();
+    with_status(shared, |status| {
+        status.file_transfer_phase = Some("offered".into());
+        status.last_file_transfer_id = Some(offer.batch_id.clone());
+        status.last_file_name = Some(offer.display_name.clone());
+        status.last_file_bytes = Some(total_bytes);
+        status.last_file_saved_path = None;
+        status.file_bytes_received = Some(0);
+        status.file_bytes_total = Some(total_bytes);
+        status.file_batch_id = Some(offer.batch_id.clone());
+        status.file_batch_name = Some(offer.display_name.clone());
+        status.file_batch_files_completed = Some(0);
+        status.file_batch_files_total = Some(files);
+        status.file_batch_bytes_completed = Some(0);
+        status.file_batch_bytes_total = Some(total_bytes);
+        status.file_batch_current_path = offer
+            .entries
+            .iter()
+            .find(|entry| entry.kind == BatchEntryKind::File)
+            .map(|entry| entry.relative_path.clone());
+        status.last_sync_text = Some(format!(
+            "[batch file offer {} files {}B id={}]",
+            files, total_bytes, offer.batch_id
+        ));
+        status.last_error = None;
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn handle_linux_virtual_batch_stream_event(
+    shared: &SharedStatus,
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    manager: &mut LinuxVirtualFileManager,
+    event: &InboundFileResult,
+    receive: &mut Option<LinuxVirtualBatchReceive>,
+    deferred: &mut Option<DeferredVirtualBatchOffer>,
+) -> Result<bool, String> {
+    match event {
+        InboundFileResult::Chunk { transfer_id, data }
+            if receive
+                .as_ref()
+                .is_some_and(|batch| batch.file_index(transfer_id).is_some()) =>
+        {
+            let batch = receive.as_mut().expect("matching Linux virtual batch");
+            let index = batch
+                .file_index(transfer_id)
+                .expect("matching Linux virtual batch file");
+            let push_error = batch.files[index]
+                .producer
+                .push(data)
+                .err()
+                .map(|error| format!("virtual batch stream: {error}"));
+            let (received, total) = session
+                .inbound_file_progress()
+                .filter(|(id, _, _)| id == transfer_id)
+                .map(|(_, received, total)| (received, total))
+                .unwrap_or_else(|| {
+                    let received =
+                        with_status(shared, |status| status.file_bytes_received.unwrap_or(0));
+                    (
+                        received.saturating_add(data.len() as u64),
+                        batch.files[index].entry.size,
+                    )
+                });
+            with_status(shared, |status| {
+                status.file_transfer_phase = Some("receiving".into());
+                status.last_file_transfer_id = Some(batch.batch_id.clone());
+                status.file_batch_current_path =
+                    Some(batch.files[index].entry.relative_path.clone());
+                status.file_bytes_received = Some(received);
+                status.file_bytes_total = Some(total);
+                status.last_error = push_error;
+            });
+            Ok(true)
+        }
+        InboundFileResult::StreamCompleted {
+            transfer_id, size, ..
+        } if receive
+            .as_ref()
+            .is_some_and(|batch| batch.file_index(transfer_id).is_some()) =>
+        {
+            let batch = receive.as_mut().expect("matching Linux virtual batch");
+            let index = batch
+                .file_index(transfer_id)
+                .expect("matching Linux virtual batch file");
+            if !batch.files[index].completed {
+                batch.files[index].producer.finish();
+                batch.files[index].completed = true;
+                batch.completed_files = batch.completed_files.saturating_add(1);
+                batch.completed_bytes = batch.completed_bytes.saturating_add(*size);
+            }
+            if batch.active_index == Some(index) {
+                batch.active_index = None;
+            }
+            let next = batch
+                .files
+                .iter()
+                .find(|file| !file.completed)
+                .map(|file| file.entry.relative_path.clone());
+            with_status(shared, |status| {
+                status.file_batch_files_completed = Some(batch.completed_files);
+                status.file_batch_bytes_completed = Some(batch.completed_bytes);
+                status.file_batch_current_path = next;
+                status.file_bytes_received = Some(*size);
+                status.file_bytes_total = Some(*size);
+                status.last_error = None;
+            });
+            if batch.is_complete() {
+                mark_batch_done(shared, &batch.batch_id, None);
+            }
+            Ok(true)
+        }
+        InboundFileResult::Failed {
+            transfer_id,
+            message,
+        } if receive.as_ref().is_some_and(|batch| {
+            batch.batch_id == *transfer_id || batch.file_index(transfer_id).is_some()
+        }) =>
+        {
+            let failed = receive.take().expect("matching Linux virtual batch");
+            let batch_id = failed.batch_id.clone();
+            cancel_linux_virtual_batch(session, conn, &failed, message)?;
+            manager.clear();
+            with_status(shared, |status| {
+                mark_batch_failed(status, &batch_id, message);
+            });
+            Ok(true)
+        }
+        InboundFileResult::Failed {
+            transfer_id,
+            message,
+        } if deferred.as_ref().is_some_and(|batch| {
+            batch.batch_id == *transfer_id
+                || batch.entries.iter().any(|entry| {
+                    entry.kind == BatchEntryKind::File && entry.entry_id == *transfer_id
+                })
+        }) =>
+        {
+            let failed = deferred.take().expect("matching deferred Linux batch");
+            let batch_id = failed.batch_id.clone();
+            cancel_deferred_linux_virtual_batch(session, conn, failed, message)?;
+            with_status(shared, |status| {
+                mark_batch_failed(status, &batch_id, message);
+            });
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn publish_linux_virtual_offer(
     manager: &mut LinuxVirtualFileManager,
     clipboard: &mut PlatformClipboard,
@@ -5542,6 +6369,60 @@ mod tests {
         assert!(linux_completed_replaced_virtual_receive_can_detach(
             true, true, true, true
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_virtual_batch_preparation_is_lazy_and_schedules_requested_files() {
+        let offer = DeferredVirtualBatchOffer {
+            batch_id: "batch-1".into(),
+            display_name: "batch".into(),
+            entries: vec![
+                BatchEntry::directory("dir-1", "folder").unwrap(),
+                BatchEntry::file("file-1", "folder/one.bin", 3, "").unwrap(),
+                BatchEntry::file("file-2", "two.bin", 4, "").unwrap(),
+            ],
+        };
+        let (_tree, mut receive) = prepare_linux_virtual_batch_offer(&offer).unwrap();
+
+        assert_eq!(receive.files.len(), 2);
+        assert_eq!(receive.files[0].entry.relative_path, "folder/one.bin");
+        assert_eq!(receive.files[1].entry.relative_path, "two.bin");
+        assert!(receive
+            .files
+            .iter()
+            .all(|file| file.bridge.take_event().is_none()));
+        assert_eq!(receive.next_requested_index(), None);
+        assert!(!receive.must_finish());
+
+        receive.files[1].requested = true;
+        assert_eq!(receive.next_requested_index(), Some(1));
+        assert!(receive.must_finish());
+        receive.files[1].completed = true;
+        receive.files[1].consumed = true;
+        assert!(receive.must_finish());
+        receive.files[1].released = true;
+        assert!(!receive.must_finish());
+        assert!(!receive.is_complete());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_virtual_directory_only_batch_needs_no_stream() {
+        let offer = DeferredVirtualBatchOffer {
+            batch_id: "batch-empty-dir".into(),
+            display_name: "empty folders".into(),
+            entries: vec![
+                BatchEntry::directory("dir-1", "empty").unwrap(),
+                BatchEntry::directory("dir-2", "empty/nested").unwrap(),
+            ],
+        };
+        let (_tree, receive) = prepare_linux_virtual_batch_offer(&offer).unwrap();
+
+        assert!(receive.files.is_empty());
+        assert!(receive.is_complete());
+        assert!(!receive.must_finish());
+        assert_eq!(receive.next_requested_index(), None);
     }
 
     #[test]

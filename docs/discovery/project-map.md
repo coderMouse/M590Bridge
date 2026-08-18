@@ -1,7 +1,7 @@
 # 项目结构图 · M590Bridge
 
 > 更新日期：2026-08-18
-> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-057 Windows OLE 集合代码待真机验收
+> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-058 Linux FUSE tree 待 Nautilus 跨机验收
 
 ```text
 crates/
@@ -13,9 +13,9 @@ crates/
     examples/windows_virtual_file.rs # Windows Explorer 单文件真机原型
     examples/windows_virtual_file_collection.rs # Windows Explorer 多文件/目录 OLE 探针
   m590-net/        # 帧 1..16、版本拒绝、批次清单字段校验、TCP
-  m590-daemon/     # hub：send_file/send_batch、批次暂存或 Windows OLE 串行惰性流、status、mDNS
-    src/linux_virtual_file.rs             # Linux-only 单文件 FUSE 元数据/惰性读取与句柄回收
-    src/linux_virtual_file_manager.rs     # Linux FUSE 挂载、文件 URI 发布与生命周期
+  m590-daemon/     # hub：send_file/send_batch、批次暂存或 Windows OLE/Linux FUSE tree 串行惰性流、status、mDNS
+    src/linux_virtual_file.rs             # Linux-only 单文件/tree FUSE 元数据、路径安全、逐文件惰性读取与句柄回收
+    src/linux_virtual_file_manager.rs     # Linux 单文件/tree 挂载、顶层文件 URI 列表发布、条件替换与清理
     src/virtual_file_bridge.rs          # 有界网络字节管道、请求启动/排队、消费/释放、取消/超时
     src/windows_virtual_file_manager.rs # Windows STA/OLE 单文件或集合 guard 生命周期（Windows-only）
     examples/linux_virtual_file.rs      # Linux FUSE/Nautilus 按需读取与进度探针

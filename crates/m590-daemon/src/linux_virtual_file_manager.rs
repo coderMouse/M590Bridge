@@ -1,21 +1,23 @@
-//! Linux FUSE mount and clipboard ownership for one remote virtual file.
+//! Linux FUSE mount and clipboard ownership for remote virtual files and trees.
 
 #![cfg(target_os = "linux")]
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use m590_clipboard::ClipboardService;
 
-use crate::linux_virtual_file::{LinuxVirtualFile, LinuxVirtualFileMount};
+use crate::linux_virtual_file::{
+    LinuxVirtualFile, LinuxVirtualFileMount, LinuxVirtualFileTree, LinuxVirtualFileTreeMount,
+};
 
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default)]
 pub struct LinuxVirtualFileManager {
-    current: Option<MountedVirtualFile>,
+    current: Option<MountedVirtualClipboard>,
 }
 
 impl LinuxVirtualFileManager {
@@ -28,12 +30,21 @@ impl LinuxVirtualFileManager {
         clipboard: &mut dyn ClipboardService,
         file: LinuxVirtualFile,
     ) -> io::Result<()> {
-        let next = MountedVirtualFile::mount(file)?;
-        clipboard
-            .write_file_list(&[next.file_path().to_path_buf()])
-            .map_err(|error| io::Error::other(format!("publish FUSE file clipboard: {error}")))?;
-        self.current = Some(next);
-        Ok(())
+        self.publish_mounted(
+            clipboard,
+            MountedVirtualClipboard::File(MountedVirtualFile::mount(file)?),
+        )
+    }
+
+    pub fn publish_tree(
+        &mut self,
+        clipboard: &mut dyn ClipboardService,
+        tree: LinuxVirtualFileTree,
+    ) -> io::Result<()> {
+        self.publish_mounted(
+            clipboard,
+            MountedVirtualClipboard::Tree(MountedVirtualTree::mount(tree)?),
+        )
     }
 
     /// Replace the current offer only while its exact FUSE path still owns the clipboard.
@@ -50,6 +61,20 @@ impl LinuxVirtualFileManager {
         Ok(true)
     }
 
+    /// Replace the current offer with a tree only while its full path list owns the clipboard.
+    pub fn replace_tree_if_current(
+        &mut self,
+        clipboard: &mut dyn ClipboardService,
+        tree: LinuxVirtualFileTree,
+    ) -> io::Result<bool> {
+        if !self.is_current(clipboard)? {
+            self.clear();
+            return Ok(false);
+        }
+        self.publish_tree(clipboard, tree)?;
+        Ok(true)
+    }
+
     pub fn is_current(&self, clipboard: &mut dyn ClipboardService) -> io::Result<bool> {
         let Some(current) = self.current.as_ref() else {
             return Ok(false);
@@ -57,11 +82,38 @@ impl LinuxVirtualFileManager {
         let paths = clipboard
             .read_file_list()
             .map_err(|error| io::Error::other(format!("read file clipboard: {error}")))?;
-        Ok(paths.as_slice() == [current.file_path()])
+        Ok(paths.as_slice() == current.clipboard_paths())
     }
 
     pub fn clear(&mut self) {
         self.current = None;
+    }
+
+    fn publish_mounted(
+        &mut self,
+        clipboard: &mut dyn ClipboardService,
+        next: MountedVirtualClipboard,
+    ) -> io::Result<()> {
+        clipboard
+            .write_file_list(next.clipboard_paths())
+            .map_err(|error| io::Error::other(format!("publish FUSE clipboard: {error}")))?;
+        self.current = Some(next);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum MountedVirtualClipboard {
+    File(MountedVirtualFile),
+    Tree(MountedVirtualTree),
+}
+
+impl MountedVirtualClipboard {
+    fn clipboard_paths(&self) -> &[PathBuf] {
+        match self {
+            Self::File(file) => std::slice::from_ref(&file.file_path),
+            Self::Tree(tree) => tree.root_paths(),
+        }
     }
 }
 
@@ -69,28 +121,26 @@ impl LinuxVirtualFileManager {
 struct MountedVirtualFile {
     mount: Option<LinuxVirtualFileMount>,
     mount_point: PathBuf,
+    file_path: PathBuf,
 }
 
 impl MountedVirtualFile {
     fn mount(file: LinuxVirtualFile) -> io::Result<Self> {
         let mount_point = create_mount_point()?;
         match LinuxVirtualFileMount::mount(&mount_point, file) {
-            Ok(mount) => Ok(Self {
-                mount: Some(mount),
-                mount_point,
-            }),
+            Ok(mount) => {
+                let file_path = mount.file_path().to_path_buf();
+                Ok(Self {
+                    mount: Some(mount),
+                    mount_point,
+                    file_path,
+                })
+            }
             Err(error) => {
                 let _ = fs::remove_dir(&mount_point);
                 Err(error)
             }
         }
-    }
-
-    fn file_path(&self) -> &Path {
-        self.mount
-            .as_ref()
-            .expect("mounted virtual file is present")
-            .file_path()
     }
 }
 
@@ -104,6 +154,50 @@ impl Drop for MountedVirtualFile {
         if let Err(error) = fs::remove_dir(&self.mount_point) {
             if error.kind() != io::ErrorKind::NotFound {
                 eprintln!("FUSE virtual file mount cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MountedVirtualTree {
+    mount: Option<LinuxVirtualFileTreeMount>,
+    mount_point: PathBuf,
+}
+
+impl MountedVirtualTree {
+    fn mount(tree: LinuxVirtualFileTree) -> io::Result<Self> {
+        let mount_point = create_mount_point()?;
+        match LinuxVirtualFileTreeMount::mount(&mount_point, tree) {
+            Ok(mount) => Ok(Self {
+                mount: Some(mount),
+                mount_point,
+            }),
+            Err(error) => {
+                let _ = fs::remove_dir(&mount_point);
+                Err(error)
+            }
+        }
+    }
+
+    fn root_paths(&self) -> &[PathBuf] {
+        self.mount
+            .as_ref()
+            .expect("mounted virtual tree is present")
+            .root_paths()
+    }
+}
+
+impl Drop for MountedVirtualTree {
+    fn drop(&mut self) {
+        if let Some(mount) = self.mount.take() {
+            if let Err(error) = mount.unmount() {
+                eprintln!("FUSE virtual tree unmount failed: {error}");
+            }
+        }
+        if let Err(error) = fs::remove_dir(&self.mount_point) {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!("FUSE virtual tree mount cleanup failed: {error}");
             }
         }
     }
@@ -151,6 +245,18 @@ mod tests {
             clipboard.read_file_list().unwrap(),
             vec![PathBuf::from("/tmp/m590bridge-fuse-test/file.bin")]
         );
+    }
+
+    #[test]
+    fn clipboard_tree_list_preserves_all_top_level_paths() {
+        let expected = vec![
+            PathBuf::from("/tmp/m590bridge-fuse-test/dir"),
+            PathBuf::from("/tmp/m590bridge-fuse-test/one.txt"),
+            PathBuf::from("/tmp/m590bridge-fuse-test/two.txt"),
+        ];
+        let mut clipboard = NullClipboard::new();
+        clipboard.write_file_list(&expected).unwrap();
+        assert_eq!(clipboard.read_file_list().unwrap(), expected);
     }
 
     #[test]

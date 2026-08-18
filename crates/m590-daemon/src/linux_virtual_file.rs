@@ -1,9 +1,10 @@
-//! Linux-only single-file FUSE mount used by task-051 and task-052.
+//! Linux-only read-only FUSE mounts used by task-051, task-052 and task-058.
 //!
 //! The mount deliberately exposes only metadata until the first FUSE `read`.
 //! The content factory can be backed by either a local probe source or the bounded
 //! network reader used by task-052 without changing the URI/clipboard boundary.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -173,6 +174,637 @@ impl LinuxVirtualFileMount {
             .expect("virtual file mount session already consumed")
             .umount_and_join()
     }
+}
+
+/// One entry in a read-only virtual directory tree.
+pub struct LinuxVirtualFileTreeEntry {
+    relative_path: String,
+    file: Option<LinuxVirtualFile>,
+}
+
+impl LinuxVirtualFileTreeEntry {
+    pub fn file(relative_path: impl Into<String>, file: LinuxVirtualFile) -> io::Result<Self> {
+        let relative_path = relative_path.into();
+        validate_relative_path(&relative_path)?;
+        if relative_path.rsplit('/').next() != Some(file.file_name()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtual tree file name does not match its relative path",
+            ));
+        }
+        Ok(Self {
+            relative_path,
+            file: Some(file),
+        })
+    }
+
+    pub fn directory(relative_path: impl Into<String>) -> io::Result<Self> {
+        let relative_path = relative_path.into();
+        validate_relative_path(&relative_path)?;
+        Ok(Self {
+            relative_path,
+            file: None,
+        })
+    }
+
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.file.is_none()
+    }
+}
+
+/// A validated set of files and directories exposed below one FUSE mount.
+pub struct LinuxVirtualFileTree {
+    entries: Vec<LinuxVirtualFileTreeEntry>,
+}
+
+impl LinuxVirtualFileTree {
+    pub fn new(entries: Vec<LinuxVirtualFileTreeEntry>) -> io::Result<Self> {
+        if entries.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtual tree must not be empty",
+            ));
+        }
+        let mut paths = HashSet::with_capacity(entries.len());
+        let mut kinds = HashMap::with_capacity(entries.len());
+        for entry in &entries {
+            if !paths.insert(entry.relative_path.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "virtual tree contains duplicate paths",
+                ));
+            }
+            kinds.insert(entry.relative_path.clone(), entry.is_directory());
+        }
+        for entry in &entries {
+            let components: Vec<&str> = entry.relative_path.split('/').collect();
+            for depth in 1..components.len() {
+                let parent = components[..depth].join("/");
+                if kinds.get(&parent) == Some(&false) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "virtual tree places an entry below a file",
+                    ));
+                }
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    fn into_entries(self) -> Vec<LinuxVirtualFileTreeEntry> {
+        self.entries
+    }
+}
+
+/// Handle for a mounted virtual directory tree.
+pub struct LinuxVirtualFileTreeMount {
+    session: Option<BackgroundSession>,
+    root_paths: Vec<PathBuf>,
+}
+
+impl fmt::Debug for LinuxVirtualFileTreeMount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LinuxVirtualFileTreeMount")
+            .field("root_paths", &self.root_paths)
+            .field("mounted", &self.session.is_some())
+            .finish()
+    }
+}
+
+impl LinuxVirtualFileTreeMount {
+    pub fn mount(mount_point: impl AsRef<Path>, tree: LinuxVirtualFileTree) -> io::Result<Self> {
+        let mount_point = mount_point.as_ref();
+        validate_mount_point(mount_point)?;
+        let filesystem = TreeFilesystem::new(tree)?;
+        let root_paths = filesystem
+            .root_names()
+            .iter()
+            .map(|name| mount_point.join(name))
+            .collect();
+        let mut config = Config::default();
+        config.mount_options = vec![
+            MountOption::RO,
+            MountOption::NoDev,
+            MountOption::NoSuid,
+            MountOption::NoExec,
+            MountOption::FSName("m590bridge-virtual-tree".into()),
+        ];
+        config.n_threads = Some(2);
+        let session = fuser::spawn_mount(filesystem, mount_point, &config)?;
+        Ok(Self {
+            session: Some(session),
+            root_paths,
+        })
+    }
+
+    pub fn root_paths(&self) -> &[PathBuf] {
+        &self.root_paths
+    }
+
+    pub fn unmount(mut self) -> io::Result<()> {
+        self.session
+            .take()
+            .expect("virtual tree mount session already consumed")
+            .umount_and_join()
+    }
+}
+
+struct TreeNode {
+    parent: INodeNo,
+    name: String,
+    kind: FileType,
+    size: u64,
+    children: Vec<INodeNo>,
+    file: Option<LinuxVirtualFile>,
+    reader: Mutex<ContentState>,
+    content_handle: AtomicU64,
+}
+
+struct TreeFilesystem {
+    nodes: HashMap<INodeNo, TreeNode>,
+    paths: HashMap<String, INodeNo>,
+    root_names: Vec<String>,
+    next_inode: AtomicU64,
+    next_handle: AtomicU64,
+}
+
+impl TreeFilesystem {
+    fn new(tree: LinuxVirtualFileTree) -> io::Result<Self> {
+        let mut filesystem = Self {
+            nodes: HashMap::new(),
+            paths: HashMap::new(),
+            root_names: Vec::new(),
+            next_inode: AtomicU64::new(2),
+            next_handle: AtomicU64::new(1),
+        };
+        filesystem.nodes.insert(
+            ROOT_INODE,
+            TreeNode {
+                parent: ROOT_INODE,
+                name: String::new(),
+                kind: FileType::Directory,
+                size: 0,
+                children: Vec::new(),
+                file: None,
+                reader: Mutex::new(ContentState::Unopened),
+                content_handle: AtomicU64::new(NO_CONTENT_HANDLE),
+            },
+        );
+        filesystem.paths.insert(String::new(), ROOT_INODE);
+
+        for entry in tree.into_entries() {
+            let components: Vec<&str> = entry.relative_path.split('/').collect();
+            let parent_path = components[..components.len() - 1].join("/");
+            let parent = filesystem.ensure_directory(&parent_path)?;
+            let path = entry.relative_path.clone();
+            let name = components
+                .last()
+                .expect("validated virtual tree path")
+                .to_string();
+            let kind = if entry.is_directory() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            if let Some(existing) = filesystem.paths.get(&path).copied() {
+                let node = filesystem
+                    .nodes
+                    .get(&existing)
+                    .expect("virtual tree path index");
+                if node.kind != kind {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "virtual tree entry changes file/directory kind",
+                    ));
+                }
+                continue;
+            }
+            let inode = INodeNo(filesystem.next_inode.fetch_add(1, Ordering::Relaxed));
+            let size = entry.file.as_ref().map_or(0, LinuxVirtualFile::size);
+            filesystem.paths.insert(path, inode);
+            filesystem.nodes.insert(
+                inode,
+                TreeNode {
+                    parent,
+                    name,
+                    kind,
+                    size,
+                    children: Vec::new(),
+                    file: entry.file,
+                    reader: Mutex::new(ContentState::Unopened),
+                    content_handle: AtomicU64::new(NO_CONTENT_HANDLE),
+                },
+            );
+            filesystem
+                .nodes
+                .get_mut(&parent)
+                .expect("virtual tree parent inode")
+                .children
+                .push(inode);
+        }
+        let names: HashMap<INodeNo, String> = filesystem
+            .nodes
+            .iter()
+            .map(|(inode, node)| (*inode, node.name.clone()))
+            .collect();
+        for node in filesystem.nodes.values_mut() {
+            node.children
+                .sort_by_key(|child| names.get(child).cloned().unwrap_or_default());
+        }
+        filesystem.root_names = filesystem
+            .nodes
+            .get(&ROOT_INODE)
+            .expect("virtual tree root")
+            .children
+            .iter()
+            .filter_map(|inode| filesystem.nodes.get(inode).map(|node| node.name.clone()))
+            .collect();
+        Ok(filesystem)
+    }
+
+    fn root_names(&self) -> &[String] {
+        &self.root_names
+    }
+
+    fn ensure_directory(&mut self, path: &str) -> io::Result<INodeNo> {
+        if path.is_empty() {
+            return Ok(ROOT_INODE);
+        }
+        let mut parent = ROOT_INODE;
+        let mut current = String::new();
+        for component in path.split('/') {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(component);
+            if let Some(inode) = self.paths.get(&current).copied() {
+                let node = self
+                    .nodes
+                    .get(&inode)
+                    .expect("virtual tree directory index");
+                if node.kind != FileType::Directory {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "virtual tree parent is a file",
+                    ));
+                }
+                parent = inode;
+                continue;
+            }
+            let inode = INodeNo(self.next_inode.fetch_add(1, Ordering::Relaxed));
+            self.paths.insert(current.clone(), inode);
+            self.nodes.insert(
+                inode,
+                TreeNode {
+                    parent,
+                    name: component.to_string(),
+                    kind: FileType::Directory,
+                    size: 0,
+                    children: Vec::new(),
+                    file: None,
+                    reader: Mutex::new(ContentState::Unopened),
+                    content_handle: AtomicU64::new(NO_CONTENT_HANDLE),
+                },
+            );
+            self.nodes
+                .get_mut(&parent)
+                .expect("virtual tree parent inode")
+                .children
+                .push(inode);
+            parent = inode;
+        }
+        Ok(parent)
+    }
+
+    fn attr_for(&self, inode: INodeNo, request: &Request) -> FileAttr {
+        let node = self.nodes.get(&inode).expect("virtual tree inode");
+        FileAttr {
+            ino: inode,
+            size: node.size,
+            blocks: node.size.div_ceil(BLOCK_SIZE),
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            kind: node.kind,
+            perm: if node.kind == FileType::Directory {
+                0o555
+            } else {
+                0o444
+            },
+            nlink: if node.kind == FileType::Directory {
+                2
+            } else {
+                1
+            },
+            uid: request.uid(),
+            gid: request.gid(),
+            rdev: 0,
+            blksize: BLOCK_SIZE as u32,
+            flags: 0,
+        }
+    }
+
+    fn read_range(
+        &self,
+        inode: INodeNo,
+        handle: FileHandle,
+        offset: u64,
+        requested: u32,
+    ) -> io::Result<Vec<u8>> {
+        let node = self.nodes.get(&inode).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "virtual tree inode not found")
+        })?;
+        if node.kind != FileType::RegularFile {
+            return Err(io::Error::from(io::ErrorKind::IsADirectory));
+        }
+        if offset >= node.size || requested == 0 {
+            return Ok(Vec::new());
+        }
+        let remaining = node.size - offset;
+        let length = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(usize::try_from(requested).unwrap_or(usize::MAX))
+            .min(MAX_READ_SIZE);
+        let mut state = node
+            .reader
+            .lock()
+            .map_err(|_| io::Error::other("virtual tree reader lock poisoned"))?;
+        if matches!(*state, ContentState::Unopened) {
+            let file = node.file.as_ref().expect("virtual tree file node");
+            match file.open_content() {
+                Ok(reader) => {
+                    node.content_handle.store(handle.0, Ordering::Release);
+                    *state = ContentState::Opened(reader);
+                }
+                Err(error) => {
+                    *state = ContentState::Failed {
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    };
+                }
+            }
+        }
+        let reader = match &mut *state {
+            ContentState::Opened(reader) => reader,
+            ContentState::Failed { kind, message } => {
+                return Err(io::Error::new(*kind, message.clone()));
+            }
+            ContentState::Unopened => unreachable!("virtual tree content is opened or failed"),
+        };
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut data = vec![0_u8; length];
+        let mut filled = 0;
+        while filled < data.len() {
+            match reader.read(&mut data[filled..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "virtual tree content ended before its declared size",
+                    ));
+                }
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(data)
+    }
+
+    fn open_empty_content(&self, inode: INodeNo, handle: FileHandle) -> io::Result<()> {
+        let node = self.nodes.get(&inode).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "virtual tree inode not found")
+        })?;
+        if node.kind != FileType::RegularFile || node.size != 0 {
+            return Ok(());
+        }
+        let mut state = node
+            .reader
+            .lock()
+            .map_err(|_| io::Error::other("virtual tree reader lock poisoned"))?;
+        if matches!(*state, ContentState::Unopened) {
+            let file = node.file.as_ref().expect("virtual tree file node");
+            match file.open_content() {
+                Ok(reader) => {
+                    node.content_handle.store(handle.0, Ordering::Release);
+                    *state = ContentState::Opened(reader);
+                }
+                Err(error) => {
+                    *state = ContentState::Failed {
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    };
+                }
+            }
+        }
+        match &mut *state {
+            ContentState::Opened(reader) => {
+                let mut probe = [0_u8; 1];
+                match reader.read(&mut probe) {
+                    Ok(0) => Ok(()),
+                    Ok(_) => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty virtual file produced content",
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            ContentState::Failed { kind, message } => Err(io::Error::new(*kind, message.clone())),
+            ContentState::Unopened => unreachable!("virtual tree content is opened or failed"),
+        }
+    }
+
+    fn release_handle(&self, inode: INodeNo, handle: FileHandle) {
+        let Some(node) = self.nodes.get(&inode) else {
+            return;
+        };
+        if node
+            .content_handle
+            .compare_exchange(
+                handle.0,
+                NO_CONTENT_HANDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            if let Some(file) = node.file.as_ref() {
+                file.release_content();
+            }
+        }
+    }
+}
+
+impl Filesystem for TreeFilesystem {
+    fn lookup(&self, request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let Some(parent_node) = self.nodes.get(&parent) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(inode) = parent_node
+            .children
+            .iter()
+            .copied()
+            .find(|inode| self.nodes.get(inode).is_some_and(|node| node.name == name))
+        else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        reply.entry(
+            &ATTRIBUTE_TTL,
+            &self.attr_for(inode, request),
+            fuser::Generation(0),
+        );
+    }
+
+    fn getattr(
+        &self,
+        request: &Request,
+        inode: INodeNo,
+        _fh: Option<FileHandle>,
+        reply: ReplyAttr,
+    ) {
+        if self.nodes.contains_key(&inode) {
+            reply.attr(&ATTRIBUTE_TTL, &self.attr_for(inode, request));
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn open(&self, _request: &Request, inode: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let Some(node) = self.nodes.get(&inode) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if node.kind != FileType::RegularFile {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        if let Err(_error) = self.open_empty_content(inode, FileHandle(handle)) {
+            self.release_handle(inode, FileHandle(handle));
+            reply.error(Errno::EIO);
+            return;
+        }
+        reply.opened(FileHandle(handle), FopenFlags::FOPEN_DIRECT_IO);
+    }
+
+    fn read(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyData,
+    ) {
+        match self.read_range(inode, fh, offset, size) {
+            Ok(data) => reply.data(&data),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn release(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if self
+            .nodes
+            .get(&inode)
+            .is_some_and(|node| node.kind == FileType::RegularFile)
+        {
+            self.release_handle(inode, fh);
+            reply.ok();
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn readdir(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        let Some(node) = self.nodes.get(&inode) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if node.kind != FileType::Directory {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+        let mut entries = vec![(inode, FileType::Directory, ".".to_string())];
+        let parent = if inode == ROOT_INODE {
+            ROOT_INODE
+        } else {
+            node.parent
+        };
+        entries.push((parent, FileType::Directory, "..".to_string()));
+        entries.extend(node.children.iter().filter_map(|child| {
+            self.nodes
+                .get(child)
+                .map(|item| (*child, item.kind, item.name.clone()))
+        }));
+        for (index, (entry_inode, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
+            if reply.add(*entry_inode, (index + 1) as u64, *kind, name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn access(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        _mask: fuser::AccessFlags,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if self.nodes.contains_key(&inode) {
+            reply.ok();
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+}
+
+fn validate_relative_path(path: &str) -> io::Result<()> {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "virtual tree path must be relative and use '/' separators",
+        ));
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtual tree path contains an unsafe component",
+            ));
+        }
+        validate_file_name(component)?;
+    }
+    Ok(())
 }
 
 struct SingleFileFilesystem {
@@ -498,6 +1130,7 @@ fn validate_mount_point(mount_point: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -571,5 +1204,229 @@ mod tests {
         filesystem.release_handle(FileHandle(7));
         filesystem.release_handle(FileHandle(7));
         assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tree_builds_explicit_implicit_and_empty_directories() {
+        let nested =
+            LinuxVirtualFile::new("nested.txt", 3, || Ok(Cursor::new(b"abc".to_vec()))).unwrap();
+        let root =
+            LinuxVirtualFile::new("root.txt", 4, || Ok(Cursor::new(b"root".to_vec()))).unwrap();
+        let tree = LinuxVirtualFileTree::new(vec![
+            LinuxVirtualFileTreeEntry::file("alpha/beta/nested.txt", nested).unwrap(),
+            LinuxVirtualFileTreeEntry::directory("alpha").unwrap(),
+            LinuxVirtualFileTreeEntry::directory("empty").unwrap(),
+            LinuxVirtualFileTreeEntry::file("root.txt", root).unwrap(),
+        ])
+        .unwrap();
+        let filesystem = TreeFilesystem::new(tree).unwrap();
+
+        assert_eq!(filesystem.root_names(), ["alpha", "empty", "root.txt"]);
+        for path in ["alpha", "alpha/beta", "empty"] {
+            let inode = filesystem.paths[path];
+            assert_eq!(filesystem.nodes[&inode].kind, FileType::Directory);
+        }
+        let nested_inode = filesystem.paths["alpha/beta/nested.txt"];
+        assert_eq!(filesystem.nodes[&nested_inode].kind, FileType::RegularFile);
+        assert_eq!(filesystem.nodes[&nested_inode].size, 3);
+        assert!(filesystem.nodes[&filesystem.paths["empty"]]
+            .children
+            .is_empty());
+    }
+
+    #[test]
+    fn tree_metadata_stays_lazy_and_files_open_independently() {
+        let first_opened = Arc::new(AtomicUsize::new(0));
+        let first_opened_for_factory = Arc::clone(&first_opened);
+        let first = LinuxVirtualFile::new("one.bin", 3, move || {
+            first_opened_for_factory.fetch_add(1, Ordering::SeqCst);
+            Ok(Cursor::new(b"one".to_vec()))
+        })
+        .unwrap();
+        let second_opened = Arc::new(AtomicUsize::new(0));
+        let second_opened_for_factory = Arc::clone(&second_opened);
+        let second = LinuxVirtualFile::new("two.bin", 3, move || {
+            second_opened_for_factory.fetch_add(1, Ordering::SeqCst);
+            Ok(Cursor::new(b"two".to_vec()))
+        })
+        .unwrap();
+        let tree = LinuxVirtualFileTree::new(vec![
+            LinuxVirtualFileTreeEntry::file("dir/one.bin", first).unwrap(),
+            LinuxVirtualFileTreeEntry::file("two.bin", second).unwrap(),
+        ])
+        .unwrap();
+        let filesystem = TreeFilesystem::new(tree).unwrap();
+
+        assert_eq!(first_opened.load(Ordering::SeqCst), 0);
+        assert_eq!(second_opened.load(Ordering::SeqCst), 0);
+        let first_inode = filesystem.paths["dir/one.bin"];
+        let second_inode = filesystem.paths["two.bin"];
+        assert_eq!(filesystem.nodes[&first_inode].size, 3);
+        assert_eq!(first_opened.load(Ordering::SeqCst), 0);
+        assert_eq!(second_opened.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            filesystem
+                .read_range(first_inode, FileHandle(11), 0, 3)
+                .unwrap(),
+            b"one"
+        );
+        assert_eq!(first_opened.load(Ordering::SeqCst), 1);
+        assert_eq!(second_opened.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            filesystem
+                .read_range(second_inode, FileHandle(22), 0, 3)
+                .unwrap(),
+            b"two"
+        );
+        assert_eq!(second_opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tree_release_callback_belongs_to_the_read_file() {
+        let first_released = Arc::new(AtomicUsize::new(0));
+        let first_released_for_callback = Arc::clone(&first_released);
+        let first = LinuxVirtualFile::new_with_release(
+            "one.bin",
+            1,
+            || Ok(Cursor::new(b"1".to_vec())),
+            move || {
+                first_released_for_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        let second_released = Arc::new(AtomicUsize::new(0));
+        let second_released_for_callback = Arc::clone(&second_released);
+        let second = LinuxVirtualFile::new_with_release(
+            "two.bin",
+            1,
+            || Ok(Cursor::new(b"2".to_vec())),
+            move || {
+                second_released_for_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        let tree = LinuxVirtualFileTree::new(vec![
+            LinuxVirtualFileTreeEntry::file("one.bin", first).unwrap(),
+            LinuxVirtualFileTreeEntry::file("two.bin", second).unwrap(),
+        ])
+        .unwrap();
+        let filesystem = TreeFilesystem::new(tree).unwrap();
+        let first_inode = filesystem.paths["one.bin"];
+        let second_inode = filesystem.paths["two.bin"];
+
+        filesystem
+            .read_range(first_inode, FileHandle(10), 0, 1)
+            .unwrap();
+        filesystem
+            .read_range(second_inode, FileHandle(20), 0, 1)
+            .unwrap();
+        filesystem.release_handle(first_inode, FileHandle(20));
+        assert_eq!(first_released.load(Ordering::SeqCst), 0);
+        assert_eq!(second_released.load(Ordering::SeqCst), 0);
+        filesystem.release_handle(first_inode, FileHandle(10));
+        assert_eq!(first_released.load(Ordering::SeqCst), 1);
+        assert_eq!(second_released.load(Ordering::SeqCst), 0);
+        filesystem.release_handle(second_inode, FileHandle(20));
+        assert_eq!(second_released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn opening_an_empty_tree_file_triggers_and_releases_its_content() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened_for_factory = Arc::clone(&opened);
+        let released = Arc::new(AtomicUsize::new(0));
+        let released_for_callback = Arc::clone(&released);
+        let empty = LinuxVirtualFile::new_with_release(
+            "empty.txt",
+            0,
+            move || {
+                opened_for_factory.fetch_add(1, Ordering::SeqCst);
+                Ok(Cursor::new(Vec::new()))
+            },
+            move || {
+                released_for_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        let tree =
+            LinuxVirtualFileTree::new(vec![
+                LinuxVirtualFileTreeEntry::file("empty.txt", empty).unwrap()
+            ])
+            .unwrap();
+        let filesystem = TreeFilesystem::new(tree).unwrap();
+        let inode = filesystem.paths["empty.txt"];
+
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        filesystem
+            .open_empty_content(inode, FileHandle(31))
+            .unwrap();
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        filesystem.release_handle(inode, FileHandle(31));
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[ignore = "requires a working /dev/fuse; run explicitly on a Linux desktop"]
+    fn mounted_tree_smoke_browses_and_reads_nested_content() {
+        let mount_point = std::env::temp_dir().join(format!(
+            "m590bridge-tree-smoke-{}-{}",
+            std::process::id(),
+            UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        fs::create_dir(&mount_point).unwrap();
+        let file =
+            LinuxVirtualFile::new("note.txt", 5, || Ok(Cursor::new(b"hello".to_vec()))).unwrap();
+        let tree = LinuxVirtualFileTree::new(vec![
+            LinuxVirtualFileTreeEntry::file("folder/note.txt", file).unwrap(),
+            LinuxVirtualFileTreeEntry::directory("folder/empty").unwrap(),
+        ])
+        .unwrap();
+        let mount = LinuxVirtualFileTreeMount::mount(&mount_point, tree).unwrap();
+
+        let root_names = fs::read_dir(&mount_point)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(root_names, vec![OsString::from("folder")]);
+        let names = fs::read_dir(mount_point.join("folder"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![OsString::from("empty"), OsString::from("note.txt")]
+        );
+        assert_eq!(
+            fs::read(mount_point.join("folder/note.txt")).unwrap(),
+            b"hello"
+        );
+
+        mount.unmount().unwrap();
+        fs::remove_dir(&mount_point).unwrap();
+    }
+
+    #[test]
+    fn tree_rejects_unsafe_paths_duplicates_and_file_parents() {
+        for path in ["", "/absolute", ".", "..", "a/../b", "a//b", "a\\b", "a\0b"] {
+            assert!(
+                LinuxVirtualFileTreeEntry::directory(path).is_err(),
+                "{path:?}"
+            );
+        }
+
+        let duplicate = LinuxVirtualFileTree::new(vec![
+            LinuxVirtualFileTreeEntry::directory("same").unwrap(),
+            LinuxVirtualFileTreeEntry::directory("same").unwrap(),
+        ]);
+        assert!(duplicate.is_err());
+
+        let parent = LinuxVirtualFile::new("parent", 0, || Ok(Cursor::new(Vec::new()))).unwrap();
+        let child = LinuxVirtualFile::new("child", 0, || Ok(Cursor::new(Vec::new()))).unwrap();
+        let file_parent = LinuxVirtualFileTree::new(vec![
+            LinuxVirtualFileTreeEntry::file("parent", parent).unwrap(),
+            LinuxVirtualFileTreeEntry::file("parent/child", child).unwrap(),
+        ]);
+        assert!(file_parent.is_err());
     }
 }
