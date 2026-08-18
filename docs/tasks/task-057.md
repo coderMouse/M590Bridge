@@ -73,7 +73,7 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   `CFSTR_FILECONTENTS` 索引格式；目录项不枚举内容格式，集合条目数限制到可表达的
   `FORMATETC.lindex` 范围。
 - 2026-08-18：Windows 10 首轮真机验收不通过：多文件只能粘贴其中一个，嵌套目录和
-  空目录无法粘贴。task-057 保持 `in_progress`。对照 Explorer 使用的成熟 `IDataObject`
+  空目录无法粘贴；当时 task-057 保持 `in_progress`。对照 Explorer 使用的成熟 `IDataObject`
   实现后确认，`EnumFormatEtc` 应只公开一个 `lindex=-1` 的 `CFSTR_FILECONTENTS` 通配格式，
   具体 descriptor 索引由后续 `GetData` 请求携带；目录集合也必须保留 descriptor/contents
   格式对，即使 Explorer 不会为目录请求内容流。
