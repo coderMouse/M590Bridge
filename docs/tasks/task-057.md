@@ -107,6 +107,11 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   `effective_mib_s=4.37`、首块后 `data_mib_s=4.38`，请求调度仅 2ms、首块 258ms；没有
   发现应用层请求间停顿。本轮未改分块、TCP 缓冲或 Session 泵，需用同方向 `iperf3`
   对照后判断是网络/磁盘环境还是传输管线吞吐。
+- 2026-08-18：针对发送端仍可能走文本回退的情况，新增 GNOME/Nautilus 多行
+  `text/uri-list` / `x-special/gnome-copied-files` 解析：保留所有现存文件与目录，多个根路径
+  或目录统一进入既有 `FileBatchOffer`，单个普通文件仍走原单文件 offer。Wayland 环境在
+  `arboard.file_list()` 返回至多一项时，以 500ms 节流直接读取两个原始 MIME，并选择条目数
+  更多的完整列表；无 data-control 时仍安全回退到 arboard 与文本路径分支。
 
 ## 修改文件
 
@@ -120,6 +125,8 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 - `crates/m590-daemon/Cargo.toml`、`src/hub.rs`：Windows 批次发布、逐文件惰性请求、串行
   调度、状态和清理；多路径/目录 file_list 自动生成批次并避免接收虚拟批次回传；向
   standalone 透传 task-057 诊断 feature。
+- `crates/m590-clipboard/src/file_paths.rs`、`src/linux.rs`：多行 GNOME 文件选择解析、
+  目录保留、Wayland 原始 MIME 补读与节流缓存。
 - `ui/scripts/prepare-standalone.mjs`：standalone 启动前检查固定 Hub 端口，拒绝与旧实例并行。
 - `ui/package.json`、`ui/src-tauri/Cargo.toml`、`ui/src-tauri/src/main.rs`：仅 standalone
   启用 task-057 诊断并在 Windows 显示控制台；正式构建继续使用 windowed subsystem。
@@ -181,6 +188,15 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   `m590-daemon --lib --bins --examples` 均通过。
 - 本轮 file_list 修复本机与 Windows GNU Clippy：通过，`-D warnings` 无 warning；
   `cargo fmt --all -- --check`、`git diff --check`：通过。
+- 本轮 Linux 发送端兼容修复 `cargo test -p m590-clipboard`：通过，24 passed（新增多行
+  文件/目录解析测试）。
+- 本轮 Linux 发送端兼容修复 `cargo test -p m590-daemon virtual_file_bridge`：通过，5 passed。
+- 本轮兼容修复 `cargo test --workspace`：通过；clipboard 24、core 37、daemon lib 55、
+  daemon bin 1、net 21、Tauri lib 8，共 146 个单元测试通过，doc-tests 无失败。
+- 本轮兼容修复 `cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --lib --examples`
+  与 `cargo check -p m590-daemon --target x86_64-pc-windows-gnu --examples`：通过，无 warning。
+- 本轮兼容修复 `cargo clippy -p m590-clipboard -p m590-daemon --lib --bins --no-deps -- -D warnings`、
+  `cargo fmt --all`：通过。
 
 ## 文档影响检查
 
@@ -195,6 +211,9 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   标记完成。
 - 失败日志已定位到发送端只发布第一项，并已改为 file_list 多路径/目录批次；Windows
   Explorer 端到端结果仍须真机复测，不能以本机 OLE 探针或交叉编译替代。
+- Linux Wayland 原始 MIME 补读依赖 compositor 的 data-control；没有该协议时只能依赖
+  arboard/X11 可见内容或多行文本回退，若发送端仍无 `clipboard_file_list_detected` /
+  `clipboard_text_paths_detected`，需保留 Linux 端诊断日志继续确认桌面剪贴板暴露的 MIME。
 - 大文件实测为 4.37 MiB/s，应用请求/首块等待只占约 0.26s；源码比较未发现本轮修改传输
   算法。需以同方向 `iperf3` 和本机磁盘读写对照后再决定是否需要吞吐修复。
 - 沿用 task-044 的一次性网络 offer：同一剪贴板 offer 完成后再次 `Ctrl+V` 仍不保证可重开

@@ -64,20 +64,20 @@ fn is_bare_filename(name: &str) -> bool {
     true
 }
 
-fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
-    if path.is_file() {
+fn resolve_existing_path(path: &Path) -> Option<PathBuf> {
+    if path.is_file() || path.is_dir() {
         return Some(path.to_path_buf());
     }
     let raw = path.to_str()?;
     let cleaned = scrub_path_string(raw);
     if cleaned != raw {
         let p = PathBuf::from(&cleaned);
-        if p.is_file() {
+        if p.is_file() || p.is_dir() {
             return Some(p);
         }
     }
     if let Some(p) = normalize_path_token(&cleaned) {
-        if p.is_file() {
+        if p.is_file() || p.is_dir() {
             return Some(p);
         }
         // Bare / relative single component → search desktop dirs.
@@ -85,7 +85,7 @@ fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
             let name = p.file_name()?.to_os_string();
             for dir in file_search_dirs() {
                 let candidate = dir.join(&name);
-                if candidate.is_file() {
+                if candidate.is_file() || candidate.is_dir() {
                     return Some(candidate);
                 }
             }
@@ -93,7 +93,7 @@ fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
     } else if is_bare_filename(&cleaned) {
         for dir in file_search_dirs() {
             let candidate = dir.join(&cleaned);
-            if candidate.is_file() {
+            if candidate.is_file() || candidate.is_dir() {
                 return Some(candidate);
             }
         }
@@ -101,9 +101,63 @@ fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn resolve_existing_file(path: &Path) -> Option<PathBuf> {
+    resolve_existing_path(path).filter(|path| path.is_file())
+}
+
 /// First existing regular file in `paths` (skips dirs / missing).
 pub fn first_regular_file(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find_map(|p| resolve_existing_file(p))
+}
+
+/// Return every existing local file or directory represented by clipboard text.
+///
+/// GNOME/Nautilus may expose a copied selection as a multi-line text payload
+/// (`text/uri-list` or `x-special/gnome-copied-files`) when the platform file-list
+/// API is unavailable. Keep all unique existing paths so callers can preserve
+/// multi-file and directory semantics instead of silently taking the first file.
+pub fn local_paths_from_text(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for candidate in candidate_paths(text) {
+        let Some(path) = resolve_existing_path(&candidate) else {
+            continue;
+        };
+        if !out.iter().any(|existing| existing == &path) {
+            out.push(path);
+        }
+    }
+
+    // GNOME desktop-icon copies can contain bare names rather than file:// URIs.
+    // Resolve those against the same desktop/search directories used by the
+    // single-file fallback, while retaining directory selections as well.
+    for line in text.lines() {
+        let line = scrub_path_string(line);
+        let lower = line.to_ascii_lowercase();
+        if lower == "copy" || lower == "cut" || lower.starts_with("x-special/") {
+            continue;
+        }
+        if !is_bare_filename(&line) {
+            continue;
+        }
+        for dir in file_search_dirs() {
+            let path = dir.join(&line);
+            if resolve_existing_path(&path).is_some()
+                && !out.iter().any(|existing| existing == &path)
+            {
+                out.push(path);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Parse URI-list/GNOME copied-files text without requiring the paths to exist.
+/// Used by the Linux Wayland MIME fallback; filesystem validation happens later
+/// during batch scanning or single-file offer creation.
+#[cfg(target_os = "linux")]
+pub(crate) fn paths_from_file_list_text(text: &str) -> Vec<PathBuf> {
+    candidate_paths(text)
 }
 
 /// If clipboard text is a local **non-image** file path/URI (or bare desktop name), return it.
@@ -237,6 +291,31 @@ mod tests {
         assert!(regular_file_from_text(img.to_str().unwrap()).is_none());
         let _ = fs::remove_dir_all(p.parent().unwrap());
         let _ = fs::remove_dir_all(img.parent().unwrap());
+    }
+
+    #[test]
+    fn local_paths_from_text_keeps_multiline_files_and_directories() {
+        let root = temp_file("placeholder.txt", b"placeholder")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let first = root.join("first.txt");
+        let second = root.join("second.csv");
+        let nested = root.join("nested");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::create_dir(&nested).unwrap();
+
+        let text = format!(
+            "copy\nfile://{}\nfile://{}\nfile://{}\n",
+            first.display(),
+            second.display(),
+            nested.display()
+        );
+        let paths = local_paths_from_text(&text);
+        assert_eq!(paths, vec![first, second, nested]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

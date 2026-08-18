@@ -3637,43 +3637,88 @@ fn run_session_loop(
                                 });
                             }
                         }
-                    } else if let Some(path) = m590_clipboard::regular_file_from_text(&text) {
-                        // Linux often exposes a copied file as plain path text only.
-                        match offer_local_file(session, &mut content_seq, &path.to_string_lossy()) {
-                            Ok((summary, transfer_id, file_name, bytes)) => {
-                                conn.send_all(session.take_outbox().iter())
-                                    .map_err(|e| e.to_string())?;
-                                latest_clipboard_file_offer_id = Some(transfer_id.clone());
-                                queue_or_mark_file_sending(
-                                    &shared,
-                                    session.outbound_file_progress().is_some(),
-                                    &mut queued_file_status,
-                                    QueuedFileStatus {
-                                        summary,
-                                        transfer_id,
-                                        file_name,
-                                        bytes,
-                                    },
-                                );
-                                clip.adopt_text_baseline();
-                            }
-                            Err(err) => {
-                                with_status(&shared, |s| {
-                                    s.last_error = Some(format!("path text skip: {err}"));
-                                });
+                    } else {
+                        // GNOME/Nautilus can expose a copied selection as a multi-line
+                        // text/uri-list or x-special/gnome-copied-files payload. If the
+                        // platform file-list API returned no complete list, recover every
+                        // existing path before falling back to the single-file offer.
+                        let text_paths = m590_clipboard::local_paths_from_text(&text);
+                        let mut handled_text_path = false;
+                        if file_list_requires_batch(&text_paths) {
+                            let file_count =
+                                text_paths.iter().filter(|path| path.is_file()).count();
+                            let directory_count =
+                                text_paths.iter().filter(|path| path.is_dir()).count();
+                            task_057_diagnostic(format_args!(
+                                "clipboard_text_paths_detected roots={} files={file_count} directories={directory_count} action=batch",
+                                text_paths.len()
+                            ));
+                            let batch_paths = text_paths
+                                .iter()
+                                .map(|path| path.to_string_lossy().into_owned())
+                                .collect::<Vec<_>>();
+                            match push_batch(&shared, batch_paths) {
+                                Ok(()) => {
+                                    handled_text_path = true;
+                                    task_057_diagnostic(format_args!(
+                                        "clipboard_batch_queued_from_text roots={} files={file_count} directories={directory_count}",
+                                        text_paths.len()
+                                    ));
+                                }
+                                Err(err) => {
+                                    with_status(&shared, |s| {
+                                        s.file_transfer_phase = Some("failed".into());
+                                        s.last_error = Some(format!("path text batch: {err}"));
+                                    });
+                                }
                             }
                         }
-                    } else {
-                        content_seq += 1;
-                        let cid = format!("ui-clip-{}-{content_seq}", std::process::id());
-                        if let Ok(QueueClipboardResult::Queued) =
-                            session.queue_clipboard_text(cid, text.clone())
-                        {
-                            conn.send_all(session.take_outbox().iter())
-                                .map_err(|e| e.to_string())?;
-                            with_status(&shared, |s| {
-                                s.last_sync_text = Some(text);
-                            });
+                        if !handled_text_path {
+                            if let Some(path) = m590_clipboard::regular_file_from_text(&text) {
+                                // Linux often exposes a copied file as plain path text only.
+                                match offer_local_file(
+                                    session,
+                                    &mut content_seq,
+                                    &path.to_string_lossy(),
+                                ) {
+                                    Ok((summary, transfer_id, file_name, bytes)) => {
+                                        conn.send_all(session.take_outbox().iter())
+                                            .map_err(|e| e.to_string())?;
+                                        latest_clipboard_file_offer_id = Some(transfer_id.clone());
+                                        queue_or_mark_file_sending(
+                                            &shared,
+                                            session.outbound_file_progress().is_some(),
+                                            &mut queued_file_status,
+                                            QueuedFileStatus {
+                                                summary,
+                                                transfer_id,
+                                                file_name,
+                                                bytes,
+                                            },
+                                        );
+                                        clip.adopt_text_baseline();
+                                        handled_text_path = true;
+                                    }
+                                    Err(err) => {
+                                        with_status(&shared, |s| {
+                                            s.last_error = Some(format!("path text skip: {err}"));
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        if !handled_text_path {
+                            content_seq += 1;
+                            let cid = format!("ui-clip-{}-{content_seq}", std::process::id());
+                            if let Ok(QueueClipboardResult::Queued) =
+                                session.queue_clipboard_text(cid, text.clone())
+                            {
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|e| e.to_string())?;
+                                with_status(&shared, |s| {
+                                    s.last_sync_text = Some(text);
+                                });
+                            }
                         }
                     }
                 }

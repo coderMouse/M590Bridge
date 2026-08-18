@@ -34,7 +34,9 @@ mod windows;
 mod windows_virtual_file;
 
 pub use error::ClipboardError;
-pub use file_paths::{first_regular_file, read_file_for_offer, regular_file_from_text};
+pub use file_paths::{
+    first_regular_file, local_paths_from_text, read_file_for_offer, regular_file_from_text,
+};
 pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
 pub use virtual_file::{VirtualFile, VirtualFileCollection, VirtualFileCollectionEntry};
 
