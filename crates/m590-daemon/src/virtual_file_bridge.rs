@@ -29,6 +29,7 @@ struct PipeState {
     bytes: VecDeque<u8>,
     #[allow(dead_code)]
     requested: bool,
+    started: bool,
     #[allow(dead_code)]
     reader_open: bool,
     consumed: bool,
@@ -81,6 +82,7 @@ impl VirtualFileBridge {
             state: Mutex::new(PipeState {
                 bytes: VecDeque::new(),
                 requested: false,
+                started: false,
                 reader_open: false,
                 consumed: false,
                 #[cfg(target_os = "linux")]
@@ -186,6 +188,14 @@ fn mark_consumed(inner: &PipeInner, state: &mut PipeState) {
 }
 
 impl PipeProducer {
+    /// Start the timeout window once the corresponding network request is on the wire.
+    pub fn start(&self) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.started = true;
+            self.inner.changed.notify_all();
+        }
+    }
+
     /// Push one verified network chunk, waiting for bounded capacity or cancellation.
     pub fn push(&self, data: &[u8]) -> io::Result<()> {
         self.push_with_timeout(data, WRITE_TIMEOUT)
@@ -199,6 +209,7 @@ impl PipeProducer {
         let mut offset = 0;
         while offset < data.len() {
             let mut state = self.inner.state.lock().map_err(poisoned)?;
+            state.started = true;
             while state.bytes.len() >= self.inner.capacity && !state.cancelled {
                 if started.elapsed() >= timeout {
                     state.cancelled = true;
@@ -232,6 +243,7 @@ impl PipeProducer {
 
     pub fn finish(&self) {
         if let Ok(mut state) = self.inner.state.lock() {
+            state.started = true;
             state.finished = true;
             self.inner.changed.notify_all();
         }
@@ -239,6 +251,7 @@ impl PipeProducer {
 
     pub fn fail(&self, message: impl Into<String>) {
         if let Ok(mut state) = self.inner.state.lock() {
+            state.started = true;
             state.error = Some(message.into());
             state.finished = true;
             self.inner.changed.notify_all();
@@ -259,7 +272,7 @@ impl Read for PipeReader {
         if output.is_empty() {
             return Ok(0);
         }
-        let started = Instant::now();
+        let mut started = None;
         loop {
             let mut state = self.inner.state.lock().map_err(poisoned)?;
             if state.cancelled {
@@ -289,7 +302,10 @@ impl Read for PipeReader {
                 }
                 return Ok(0);
             }
-            if started.elapsed() >= READ_TIMEOUT {
+            if state.started && started.is_none() {
+                started = Some(Instant::now());
+            }
+            if started.is_some_and(|started| started.elapsed() >= READ_TIMEOUT) {
                 state.cancelled = true;
                 let _ = self
                     .inner
@@ -301,9 +317,11 @@ impl Read for PipeReader {
                     "virtual file read timeout",
                 ));
             }
-            let wait = READ_TIMEOUT
-                .saturating_sub(started.elapsed())
-                .min(WAIT_STEP);
+            let wait = started.map_or(WAIT_STEP, |started| {
+                READ_TIMEOUT
+                    .saturating_sub(started.elapsed())
+                    .min(WAIT_STEP)
+            });
             state = self
                 .inner
                 .changed

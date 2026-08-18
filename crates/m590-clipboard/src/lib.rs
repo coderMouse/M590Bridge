@@ -36,11 +36,12 @@ mod windows_virtual_file;
 pub use error::ClipboardError;
 pub use file_paths::{first_regular_file, read_file_for_offer, regular_file_from_text};
 pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
-pub use virtual_file::VirtualFile;
+pub use virtual_file::{VirtualFile, VirtualFileCollection, VirtualFileCollectionEntry};
 
 #[cfg(target_os = "windows")]
 pub use windows_virtual_file::{
-    publish_virtual_file, pump_virtual_file_messages, VirtualFileClipboard,
+    publish_virtual_file, publish_virtual_file_collection, pump_virtual_file_messages,
+    VirtualFileClipboard,
 };
 
 /// Which OS/display backend is selected or available.

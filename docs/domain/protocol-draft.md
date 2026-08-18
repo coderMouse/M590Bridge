@@ -78,7 +78,7 @@
 **本刀取舍**：仍走**同一 TCP 控制/数据连接**串行帧（未开独立数据连接）；靠分批 pump 避免一次把整文件 chunk 堆进 outbox，心跳/剪贴板可在 pump 间隙处理。
 Windows 单文件 OS 文件剪贴板现已接入：OLE STA 仅持有虚拟 `IDataObject`，网络 Session 线程负责分片和校验，有界管道提供背压。读取端关闭、剪贴板被替换或已开始读取后 30 秒无进展时发送 `FileCancel`；尚未粘贴的 offer 保留到剪贴板被替换或会话断开。`IStream` 只支持当前位置 no-op seek；向前/向后移动均明确失败。
 
-### 批次运行时（task-056）
+### 批次运行时（task-056/057）
 
 1. Hub 的 `/api/send_batch` 接受多个本地文件/目录路径；目录按平台无关相对路径稳定排序，
    不跟随 symlink，扫描结果构造成一个 `FileBatchOffer`。
@@ -88,10 +88,16 @@ Windows 单文件 OS 文件剪贴板现已接入：OLE STA 仅持有虚拟 `IDat
    整批成功后才把单一顶层节点或多顶层容器发布到保存目录，同名目标使用后缀避让。
 4. 新批次替换旧批次；`/api/cancel_batch`、对端取消、条目失败和断线均清理未完成
    `.part` 与批次暂存树。status 同时暴露批次文件数/总字节和当前条目进度。
+5. Windows 接收端不创建上述暂存树，而是把完整 manifest 发布为一个 OLE
+   `FILEGROUPDESCRIPTORW`：目录条目携带 `FILE_ATTRIBUTE_DIRECTORY`，文件的
+   `FILECONTENTS.lindex` 对应 manifest 描述项。Explorer 打开文件流后才请求该 entry；
+   多个已打开流仍按现有单连接一次请求一个，排队等待不计入网络读超时。
+6. Windows 批次任一流取消/失败会取消剩余 entry；本机剪贴板替换时，已开始读取的流先
+   完成，未开始的 offer 可释放或由更新的远端 offer 替换。当前实现不预先写入接收目录。
 
-**仍未做**：Windows OLE 多文件 `IDataObject`、Linux FUSE 虚拟目录树、断点续传、
-多文件并行、独立数据连接。当前批次由 UI 手动选择/拖放后自动保存，OS 文件管理器
-“复制多个文件/文件夹后在对端直接粘贴”分别留给 task-057/task-058。
+**仍未做/验收**：Windows OLE 多文件代码尚待 Explorer 真机验收；Linux FUSE 虚拟目录
+树、断点续传、多文件并行和独立数据连接未实现。同一网络 offer 仍为一次性消费；需要
+再次粘贴时先重新发送批次，同一 offer 任意次数重复 `Ctrl+V` 需另行扩展生命周期。
 
 **hub**：单文件自动 request/虚拟剪贴板；`POST /api/send_file`（路径流式）；
 `send_file_bytes` 仍限内存 cap；`POST /api/send_batch` 扫描路径并串行传输；

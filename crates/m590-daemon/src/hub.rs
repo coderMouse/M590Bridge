@@ -53,6 +53,8 @@ const STALLED_FILE_LOOP_DELAY: Duration = Duration::from_millis(1);
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "windows")]
+const REPLACED_BATCH_REQUEST_GRACE: Duration = Duration::from_secs(2);
 
 #[cfg(target_os = "windows")]
 struct WindowsVirtualReceive {
@@ -62,6 +64,69 @@ struct WindowsVirtualReceive {
     requested: bool,
     completed: bool,
     clipboard_replaced: bool,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsVirtualBatchFile {
+    entry: BatchEntry,
+    bridge: VirtualFileBridge,
+    producer: PipeProducer,
+    requested: bool,
+    completed: bool,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsVirtualBatchReceive {
+    batch_id: String,
+    files: Vec<WindowsVirtualBatchFile>,
+    active_index: Option<usize>,
+    completed_files: u32,
+    completed_bytes: u64,
+    clipboard_replaced: bool,
+    clipboard_replaced_idle_since: Option<Instant>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsVirtualBatchReceive {
+    fn file_index(&self, transfer_id: &str) -> Option<usize> {
+        self.files
+            .iter()
+            .position(|file| file.entry.entry_id == transfer_id)
+    }
+
+    fn must_finish(&self) -> bool {
+        self.files
+            .iter()
+            .any(|file| file.requested && !file.completed)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.files.iter().all(|file| file.completed)
+    }
+
+    fn pending_ids(&self) -> impl Iterator<Item = String> + '_ {
+        self.files
+            .iter()
+            .filter(|file| !file.completed)
+            .map(|file| file.entry.entry_id.clone())
+    }
+
+    fn next_requested_index(&self) -> Option<usize> {
+        self.files
+            .iter()
+            .position(|file| file.requested && !file.completed)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsVirtualBatchReceive {
+    fn drop(&mut self) {
+        for file in &self.files {
+            if !file.completed {
+                file.producer.fail("virtual batch receiver stopped");
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -82,6 +147,24 @@ struct DeferredVirtualOffer {
     transfer_id: String,
     file_name: String,
     size: u64,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct DeferredVirtualBatchOffer {
+    batch_id: String,
+    display_name: String,
+    entries: Vec<BatchEntry>,
+}
+
+#[cfg(target_os = "windows")]
+impl DeferredVirtualBatchOffer {
+    fn file_ids(&self) -> impl Iterator<Item = String> + '_ {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind == BatchEntryKind::File)
+            .map(|entry| entry.entry_id.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1673,7 +1756,11 @@ fn run_session_loop(
     #[cfg(target_os = "windows")]
     let mut virtual_receive: Option<WindowsVirtualReceive> = None;
     #[cfg(target_os = "windows")]
+    let mut virtual_batch_receive: Option<WindowsVirtualBatchReceive> = None;
+    #[cfg(target_os = "windows")]
     let mut deferred_virtual_offer: Option<DeferredVirtualOffer> = None;
+    #[cfg(target_os = "windows")]
+    let mut deferred_virtual_batch_offer: Option<DeferredVirtualBatchOffer> = None;
     #[cfg(target_os = "linux")]
     let mut fuse_manager = LinuxVirtualFileManager::new();
     #[cfg(target_os = "linux")]
@@ -2035,6 +2122,115 @@ fn run_session_loop(
                     }
 
                     if let Some(file_event) = session.take_inbound_file() {
+                        #[cfg(target_os = "windows")]
+                        if let InboundFileResult::BatchOffered {
+                            batch_id,
+                            display_name,
+                            entries,
+                        } = &file_event
+                        {
+                            cancel_runtime_batch(
+                                &shared,
+                                session,
+                                conn,
+                                &mut outbound_batch,
+                                &mut inbound_batch,
+                                "replaced by a Windows virtual batch",
+                            )?;
+                            let next = DeferredVirtualBatchOffer {
+                                batch_id: batch_id.clone(),
+                                display_name: display_name.clone(),
+                                entries: entries.clone(),
+                            };
+                            let must_defer = virtual_receive.as_ref().is_some_and(|current| {
+                                active_virtual_receive_must_finish(
+                                    current.requested,
+                                    current.completed,
+                                )
+                            }) || virtual_batch_receive
+                                .as_ref()
+                                .is_some_and(WindowsVirtualBatchReceive::must_finish);
+                            if must_defer {
+                                if let Some(stale) = deferred_virtual_offer.take() {
+                                    session
+                                        .cancel_file(
+                                            stale.transfer_id,
+                                            "replaced by a newer deferred batch offer",
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                if let Some(stale) = deferred_virtual_batch_offer.take() {
+                                    cancel_deferred_windows_virtual_batch(
+                                        session,
+                                        conn,
+                                        stale,
+                                        "replaced by a newer deferred batch offer",
+                                    )?;
+                                }
+                                deferred_virtual_batch_offer = Some(next);
+                            } else {
+                                if let Some(previous) = virtual_receive.take() {
+                                    if !previous.completed {
+                                        previous.producer.fail("replaced by a newer batch offer");
+                                        session
+                                            .cancel_file(
+                                                previous.transfer_id,
+                                                "replaced by a newer batch offer",
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                        conn.send_all(session.take_outbox().iter())
+                                            .map_err(|error| error.to_string())?;
+                                    }
+                                }
+                                if let Some(previous) = virtual_batch_receive.take() {
+                                    cancel_windows_virtual_batch(
+                                        session,
+                                        conn,
+                                        &previous,
+                                        "replaced by a newer batch offer",
+                                    )?;
+                                }
+                                if let Some(stale) = deferred_virtual_offer.take() {
+                                    session
+                                        .cancel_file(
+                                            stale.transfer_id,
+                                            "replaced by a newer batch offer",
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                if let Some(stale) = deferred_virtual_batch_offer.take() {
+                                    cancel_deferred_windows_virtual_batch(
+                                        session,
+                                        conn,
+                                        stale,
+                                        "replaced by a newer batch offer",
+                                    )?;
+                                }
+                                ole_manager.clear();
+                                match publish_windows_virtual_batch_offer(&ole_manager, &next) {
+                                    Ok(receive) => {
+                                        virtual_batch_receive = Some(receive);
+                                        mark_windows_virtual_batch_offer(&shared, &next);
+                                    }
+                                    Err(error) => {
+                                        cancel_deferred_windows_virtual_batch(
+                                            session,
+                                            conn,
+                                            next,
+                                            "cannot publish Windows virtual batch",
+                                        )?;
+                                        with_status(&shared, |status| {
+                                            mark_batch_failed(status, batch_id, &error);
+                                        });
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         let failed_transfer_id = match &file_event {
                             InboundFileResult::Failed { transfer_id, .. } => {
                                 Some(transfer_id.clone())
@@ -2050,6 +2246,18 @@ fn run_session_loop(
                             }
                             _ => None,
                         };
+                        #[cfg(target_os = "windows")]
+                        if handle_windows_virtual_batch_stream_event(
+                            &shared,
+                            session,
+                            conn,
+                            &ole_manager,
+                            &file_event,
+                            &mut virtual_batch_receive,
+                            &mut deferred_virtual_batch_offer,
+                        )? {
+                            continue;
+                        }
                         let batch_handled = handle_batch_file_event(
                             &shared,
                             session,
@@ -2093,8 +2301,18 @@ fn run_session_loop(
                                                 current.requested,
                                                 current.completed,
                                             )
-                                        });
+                                        }) || virtual_batch_receive
+                                            .as_ref()
+                                            .is_some_and(WindowsVirtualBatchReceive::must_finish);
                                     if must_defer {
+                                        if let Some(stale) = deferred_virtual_batch_offer.take() {
+                                            cancel_deferred_windows_virtual_batch(
+                                                session,
+                                                conn,
+                                                stale,
+                                                "replaced by a newer deferred file offer",
+                                            )?;
+                                        }
                                         if let Some(stale) = deferred_virtual_offer.replace(next) {
                                             session
                                                 .cancel_file(
@@ -2121,6 +2339,14 @@ fn run_session_loop(
                                                     .map_err(|e| e.to_string())?;
                                             }
                                         }
+                                        if let Some(previous) = virtual_batch_receive.take() {
+                                            cancel_windows_virtual_batch(
+                                                session,
+                                                conn,
+                                                &previous,
+                                                "replaced by a newer file offer",
+                                            )?;
+                                        }
                                         if let Some(stale) = deferred_virtual_offer.take() {
                                             session
                                                 .cancel_file(
@@ -2130,6 +2356,14 @@ fn run_session_loop(
                                                 .map_err(|e| e.to_string())?;
                                             conn.send_all(session.take_outbox().iter())
                                                 .map_err(|e| e.to_string())?;
+                                        }
+                                        if let Some(stale) = deferred_virtual_batch_offer.take() {
+                                            cancel_deferred_windows_virtual_batch(
+                                                session,
+                                                conn,
+                                                stale,
+                                                "replaced by a newer file offer",
+                                            )?;
                                         }
                                         virtual_receive = Some(publish_windows_virtual_offer(
                                             &ole_manager,
@@ -2408,6 +2642,25 @@ fn run_session_loop(
                                 }
                             }
                         }
+                        #[cfg(target_os = "windows")]
+                        if let Some(batch) = virtual_batch_receive.as_ref() {
+                            if let Some(index) = batch.active_index {
+                                if let Some((tid, got, total)) = session.inbound_file_progress() {
+                                    if tid == batch.files[index].entry.entry_id {
+                                        with_status(&shared, |status| {
+                                            status.file_transfer_phase = Some("receiving".into());
+                                            status.last_file_transfer_id =
+                                                Some(batch.batch_id.clone());
+                                            status.file_batch_current_path = Some(
+                                                batch.files[index].entry.relative_path.clone(),
+                                            );
+                                            status.file_bytes_received = Some(got);
+                                            status.file_bytes_total = Some(total);
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         #[cfg(not(target_os = "windows"))]
                         if inbound_batch.is_none() {
                             if let Some((tid, got, total)) = session.inbound_file_progress() {
@@ -2449,6 +2702,7 @@ fn run_session_loop(
                                 Ok(QueueFileResult::Queued) => {
                                     conn.send_all(session.take_outbox().iter())
                                         .map_err(|e| e.to_string())?;
+                                    current.producer.start();
                                     with_status(&shared, |s| {
                                         s.file_transfer_phase = Some("receiving".into())
                                     });
@@ -2532,12 +2786,173 @@ fn run_session_loop(
                     )
                 {
                     keep_current = false;
-                } else if keep_current && current.completed && deferred_virtual_offer.is_some() {
+                } else if keep_current
+                    && current.completed
+                    && (deferred_virtual_offer.is_some() || deferred_virtual_batch_offer.is_some())
+                {
                     keep_current = false;
                     promote_deferred_if_current = true;
                 }
                 if keep_current {
                     virtual_receive = Some(current);
+                }
+            }
+            if let Some(mut current) = virtual_batch_receive.take() {
+                let mut keep_current = true;
+                let mut cancel_reason = None;
+                for index in 0..current.files.len() {
+                    while let Some(event) = current.files[index].bridge.take_event() {
+                        match event {
+                            BridgeEvent::Request => {
+                                current.files[index].requested = true;
+                                current.clipboard_replaced_idle_since = None;
+                                if current.files[index].completed {
+                                    current.files[index].producer.finish();
+                                }
+                            }
+                            BridgeEvent::Consumed | BridgeEvent::Released => {}
+                            BridgeEvent::Cancel(reason) => {
+                                cancel_reason = Some(reason);
+                                break;
+                            }
+                        }
+                    }
+                    if cancel_reason.is_some() {
+                        break;
+                    }
+                }
+
+                if let Some(reason) = cancel_reason {
+                    cancel_windows_virtual_batch(session, conn, &current, &reason)?;
+                    ole_manager.clear();
+                    with_status(&shared, |status| {
+                        mark_batch_failed(status, &current.batch_id, &reason);
+                    });
+                    keep_current = false;
+                    promote_deferred = true;
+                }
+
+                if keep_current && current.active_index.is_none() {
+                    if let Some(index) = current.next_requested_index() {
+                        let transfer_id = current.files[index].entry.entry_id.clone();
+                        let request_error = match session.request_file_stream(transfer_id) {
+                            Ok(QueueFileResult::Queued) => {
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|error| error.to_string())?;
+                                current.files[index].producer.start();
+                                current.active_index = Some(index);
+                                with_status(&shared, |status| {
+                                    status.file_transfer_phase = Some("receiving".into());
+                                    status.last_file_transfer_id = Some(current.batch_id.clone());
+                                    status.file_batch_current_path =
+                                        Some(current.files[index].entry.relative_path.clone());
+                                    status.file_bytes_received = Some(0);
+                                    status.file_bytes_total = Some(current.files[index].entry.size);
+                                    status.last_error = None;
+                                });
+                                None
+                            }
+                            Ok(other) => Some(format!("request failed: {other:?}")),
+                            Err(error) => Some(error.to_string()),
+                        };
+                        if let Some(error) = request_error {
+                            cancel_windows_virtual_batch(session, conn, &current, &error)?;
+                            ole_manager.clear();
+                            with_status(&shared, |status| {
+                                mark_batch_failed(status, &current.batch_id, &error);
+                            });
+                            keep_current = false;
+                            promote_deferred = true;
+                        }
+                    }
+                }
+
+                while keep_current {
+                    let Some(event) = ole_manager.take_event() else {
+                        break;
+                    };
+                    match event {
+                        ManagerEvent::PublishFailed(error) => {
+                            cancel_windows_virtual_batch(
+                                session,
+                                conn,
+                                &current,
+                                &format!("OLE publish failed: {error}"),
+                            )?;
+                            with_status(&shared, |status| {
+                                mark_batch_failed(status, &current.batch_id, &error);
+                            });
+                            keep_current = false;
+                            promote_deferred = true;
+                        }
+                        ManagerEvent::ClipboardReplaced => {
+                            if current.must_finish() {
+                                current.clipboard_replaced = true;
+                                current.clipboard_replaced_idle_since = None;
+                            } else {
+                                cancel_windows_virtual_batch(
+                                    session,
+                                    conn,
+                                    &current,
+                                    "clipboard replaced",
+                                )?;
+                                with_status(&shared, |status| {
+                                    status.file_transfer_phase = Some("cancelled".into());
+                                    status.file_batch_current_path = None;
+                                    status.file_bytes_received = None;
+                                    status.file_bytes_total = None;
+                                    status.last_error = None;
+                                });
+                                keep_current = false;
+                            }
+                            discard_deferred = true;
+                            latest_clipboard_file_offer_id = None;
+                        }
+                    }
+                }
+
+                if keep_current && current.clipboard_replaced {
+                    if current.is_complete() {
+                        keep_current = false;
+                    } else if current.must_finish() {
+                        current.clipboard_replaced_idle_since = None;
+                    } else {
+                        let idle_since = current
+                            .clipboard_replaced_idle_since
+                            .get_or_insert_with(Instant::now);
+                        if idle_since.elapsed() >= REPLACED_BATCH_REQUEST_GRACE {
+                            cancel_windows_virtual_batch(
+                                session,
+                                conn,
+                                &current,
+                                "clipboard replaced",
+                            )?;
+                            with_status(&shared, |status| {
+                                status.file_transfer_phase = Some("cancelled".into());
+                                status.file_batch_current_path = None;
+                                status.file_bytes_received = None;
+                                status.file_bytes_total = None;
+                                status.last_error = None;
+                            });
+                            keep_current = false;
+                        }
+                    }
+                }
+                if keep_current
+                    && !current.must_finish()
+                    && (deferred_virtual_offer.is_some() || deferred_virtual_batch_offer.is_some())
+                {
+                    cancel_windows_virtual_batch(
+                        session,
+                        conn,
+                        &current,
+                        "replaced after active batch streams completed",
+                    )?;
+                    keep_current = false;
+                    promote_deferred_if_current = true;
+                }
+                if keep_current {
+                    virtual_batch_receive = Some(current);
                 }
             }
             if discard_deferred {
@@ -2548,10 +2963,22 @@ fn run_session_loop(
                     conn.send_all(session.take_outbox().iter())
                         .map_err(|e| e.to_string())?;
                 }
+                if let Some(stale) = deferred_virtual_batch_offer.take() {
+                    cancel_deferred_windows_virtual_batch(
+                        session,
+                        conn,
+                        stale,
+                        "clipboard replaced",
+                    )?;
+                }
             } else if promote_deferred {
                 if let Some(next) = deferred_virtual_offer.take() {
                     virtual_receive = Some(publish_windows_virtual_offer(&ole_manager, &next)?);
                     mark_virtual_offer(&shared, &next);
+                } else if let Some(next) = deferred_virtual_batch_offer.take() {
+                    virtual_batch_receive =
+                        Some(publish_windows_virtual_batch_offer(&ole_manager, &next)?);
+                    mark_windows_virtual_batch_offer(&shared, &next);
                 }
             } else if promote_deferred_if_current {
                 if let Some(next) = deferred_virtual_offer.take() {
@@ -2570,6 +2997,33 @@ fn run_session_loop(
                             while ole_manager.take_event().is_some() {}
                         }
                     }
+                } else if let Some(next) = deferred_virtual_batch_offer.take() {
+                    match replace_windows_virtual_batch_offer_if_current(&ole_manager, &next)? {
+                        Some(receive) => {
+                            virtual_batch_receive = Some(receive);
+                            mark_windows_virtual_batch_offer(&shared, &next);
+                        }
+                        None => {
+                            cancel_deferred_windows_virtual_batch(
+                                session,
+                                conn,
+                                next,
+                                "clipboard replaced",
+                            )?;
+                            latest_clipboard_file_offer_id = None;
+                            while ole_manager.take_event().is_some() {}
+                        }
+                    }
+                }
+            }
+            if virtual_receive.is_none() && virtual_batch_receive.is_none() {
+                if let Some(next) = deferred_virtual_offer.take() {
+                    virtual_receive = Some(publish_windows_virtual_offer(&ole_manager, &next)?);
+                    mark_virtual_offer(&shared, &next);
+                } else if let Some(next) = deferred_virtual_batch_offer.take() {
+                    virtual_batch_receive =
+                        Some(publish_windows_virtual_batch_offer(&ole_manager, &next)?);
+                    mark_windows_virtual_batch_offer(&shared, &next);
                 }
             }
         }
@@ -2596,6 +3050,7 @@ fn run_session_loop(
                                 Ok(QueueFileResult::Queued) => {
                                     conn.send_all(session.take_outbox().iter())
                                         .map_err(|e| e.to_string())?;
+                                    current.producer.start();
                                     with_status(&shared, |s| {
                                         s.file_transfer_phase = Some("receiving".into())
                                     });
@@ -3873,6 +4328,285 @@ fn prepare_windows_virtual_offer(
             clipboard_replaced: false,
         },
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn publish_windows_virtual_batch_offer(
+    manager: &WindowsVirtualFileManager,
+    offer: &DeferredVirtualBatchOffer,
+) -> Result<WindowsVirtualBatchReceive, String> {
+    let (collection, receive) = prepare_windows_virtual_batch_offer(offer)?;
+    manager.publish_collection(collection)?;
+    Ok(receive)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_windows_virtual_batch_offer_if_current(
+    manager: &WindowsVirtualFileManager,
+    offer: &DeferredVirtualBatchOffer,
+) -> Result<Option<WindowsVirtualBatchReceive>, String> {
+    let (collection, receive) = prepare_windows_virtual_batch_offer(offer)?;
+    Ok(manager
+        .replace_collection_if_current(collection)?
+        .then_some(receive))
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_windows_virtual_batch_offer(
+    offer: &DeferredVirtualBatchOffer,
+) -> Result<
+    (
+        m590_clipboard::VirtualFileCollection,
+        WindowsVirtualBatchReceive,
+    ),
+    String,
+> {
+    let mut collection_entries = Vec::with_capacity(offer.entries.len());
+    let mut files = Vec::new();
+    for entry in &offer.entries {
+        match entry.kind {
+            BatchEntryKind::Directory => {
+                let descriptor =
+                    m590_clipboard::VirtualFileCollectionEntry::directory(&entry.relative_path)
+                        .map_err(|error| error.to_string())?;
+                collection_entries.push(descriptor);
+            }
+            BatchEntryKind::File => {
+                let file_name = entry
+                    .relative_path
+                    .rsplit('/')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| "batch file name missing".to_string())?;
+                let (bridge, producer) = VirtualFileBridge::new();
+                let file = bridge
+                    .virtual_file(file_name.to_string(), entry.size)
+                    .map_err(|error| error.to_string())?;
+                collection_entries.push(
+                    m590_clipboard::VirtualFileCollectionEntry::file(&entry.relative_path, file)
+                        .map_err(|error| error.to_string())?,
+                );
+                files.push(WindowsVirtualBatchFile {
+                    entry: entry.clone(),
+                    bridge,
+                    producer,
+                    requested: false,
+                    completed: false,
+                });
+            }
+        }
+    }
+    let collection = m590_clipboard::VirtualFileCollection::new(collection_entries)
+        .map_err(|error| error.to_string())?;
+    Ok((
+        collection,
+        WindowsVirtualBatchReceive {
+            batch_id: offer.batch_id.clone(),
+            files,
+            active_index: None,
+            completed_files: 0,
+            completed_bytes: 0,
+            clipboard_replaced: false,
+            clipboard_replaced_idle_since: None,
+        },
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_windows_virtual_batch(
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    batch: &WindowsVirtualBatchReceive,
+    reason: &str,
+) -> Result<(), String> {
+    for file in &batch.files {
+        if !file.completed {
+            file.producer.fail(reason);
+        }
+    }
+    cancel_transfer_ids(session, conn, batch.pending_ids(), reason)
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_deferred_windows_virtual_batch(
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    offer: DeferredVirtualBatchOffer,
+    reason: &str,
+) -> Result<(), String> {
+    let file_ids = offer.file_ids().collect::<Vec<_>>();
+    if file_ids.is_empty() {
+        session
+            .cancel_file(offer.batch_id, reason)
+            .map_err(|error| error.to_string())?;
+        return conn
+            .send_all(session.take_outbox().iter())
+            .map_err(|error| error.to_string());
+    }
+    cancel_transfer_ids(session, conn, file_ids, reason)
+}
+
+#[cfg(target_os = "windows")]
+fn mark_windows_virtual_batch_offer(shared: &SharedStatus, offer: &DeferredVirtualBatchOffer) {
+    let files = offer
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == BatchEntryKind::File)
+        .count() as u32;
+    let total_bytes = offer
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == BatchEntryKind::File)
+        .map(|entry| entry.size)
+        .sum::<u64>();
+    with_status(shared, |status| {
+        status.file_transfer_phase = Some("offered".into());
+        status.last_file_transfer_id = Some(offer.batch_id.clone());
+        status.last_file_name = Some(offer.display_name.clone());
+        status.last_file_bytes = Some(total_bytes);
+        status.last_file_saved_path = None;
+        status.file_bytes_received = Some(0);
+        status.file_bytes_total = Some(total_bytes);
+        status.file_batch_id = Some(offer.batch_id.clone());
+        status.file_batch_name = Some(offer.display_name.clone());
+        status.file_batch_files_completed = Some(0);
+        status.file_batch_files_total = Some(files);
+        status.file_batch_bytes_completed = Some(0);
+        status.file_batch_bytes_total = Some(total_bytes);
+        status.file_batch_current_path = offer
+            .entries
+            .iter()
+            .find(|entry| entry.kind == BatchEntryKind::File)
+            .map(|entry| entry.relative_path.clone());
+        status.last_sync_text = Some(format!(
+            "[batch file offer {} files {}B id={}]",
+            files, total_bytes, offer.batch_id
+        ));
+        status.last_error = None;
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn handle_windows_virtual_batch_stream_event(
+    shared: &SharedStatus,
+    session: &mut Session,
+    conn: &mut TcpFrameStream,
+    manager: &WindowsVirtualFileManager,
+    event: &InboundFileResult,
+    receive: &mut Option<WindowsVirtualBatchReceive>,
+    deferred: &mut Option<DeferredVirtualBatchOffer>,
+) -> Result<bool, String> {
+    match event {
+        InboundFileResult::Chunk { transfer_id, data }
+            if receive
+                .as_ref()
+                .is_some_and(|batch| batch.file_index(transfer_id).is_some()) =>
+        {
+            let batch = receive.as_mut().expect("matching Windows virtual batch");
+            let index = batch
+                .file_index(transfer_id)
+                .expect("matching Windows virtual batch file");
+            let push_error = batch.files[index]
+                .producer
+                .push(data)
+                .err()
+                .map(|error| format!("virtual batch stream: {error}"));
+            let (received, total) = session
+                .inbound_file_progress()
+                .filter(|(id, _, _)| id == transfer_id)
+                .map(|(_, received, total)| (received, total))
+                .unwrap_or_else(|| {
+                    let received =
+                        with_status(shared, |status| status.file_bytes_received.unwrap_or(0));
+                    (
+                        received.saturating_add(data.len() as u64),
+                        batch.files[index].entry.size,
+                    )
+                });
+            with_status(shared, |status| {
+                status.file_transfer_phase = Some("receiving".into());
+                status.last_file_transfer_id = Some(batch.batch_id.clone());
+                status.file_batch_current_path =
+                    Some(batch.files[index].entry.relative_path.clone());
+                status.file_bytes_received = Some(received);
+                status.file_bytes_total = Some(total);
+                status.last_error = push_error;
+            });
+            Ok(true)
+        }
+        InboundFileResult::StreamCompleted {
+            transfer_id, size, ..
+        } if receive
+            .as_ref()
+            .is_some_and(|batch| batch.file_index(transfer_id).is_some()) =>
+        {
+            let batch = receive.as_mut().expect("matching Windows virtual batch");
+            let index = batch
+                .file_index(transfer_id)
+                .expect("matching Windows virtual batch file");
+            if !batch.files[index].completed {
+                batch.files[index].producer.finish();
+                batch.files[index].completed = true;
+                batch.completed_files = batch.completed_files.saturating_add(1);
+                batch.completed_bytes = batch.completed_bytes.saturating_add(*size);
+            }
+            if batch.active_index == Some(index) {
+                batch.active_index = None;
+            }
+            let next = batch
+                .files
+                .iter()
+                .find(|file| !file.completed)
+                .map(|file| file.entry.relative_path.clone());
+            with_status(shared, |status| {
+                status.file_batch_files_completed = Some(batch.completed_files);
+                status.file_batch_bytes_completed = Some(batch.completed_bytes);
+                status.file_batch_current_path = next;
+                status.file_bytes_received = Some(*size);
+                status.file_bytes_total = Some(*size);
+                status.last_error = None;
+            });
+            if batch.is_complete() {
+                mark_batch_done(shared, &batch.batch_id, None);
+            }
+            Ok(true)
+        }
+        InboundFileResult::Failed {
+            transfer_id,
+            message,
+        } if receive.as_ref().is_some_and(|batch| {
+            batch.batch_id == *transfer_id || batch.file_index(transfer_id).is_some()
+        }) =>
+        {
+            let failed = receive.take().expect("matching Windows virtual batch");
+            let batch_id = failed.batch_id.clone();
+            cancel_windows_virtual_batch(session, conn, &failed, message)?;
+            manager.clear();
+            with_status(shared, |status| {
+                mark_batch_failed(status, &batch_id, message);
+            });
+            Ok(true)
+        }
+        InboundFileResult::Failed {
+            transfer_id,
+            message,
+        } if deferred.as_ref().is_some_and(|batch| {
+            batch.batch_id == *transfer_id
+                || batch.entries.iter().any(|entry| {
+                    entry.kind == BatchEntryKind::File && entry.entry_id == *transfer_id
+                })
+        }) =>
+        {
+            let failed = deferred.take().expect("matching deferred Windows batch");
+            let batch_id = failed.batch_id.clone();
+            cancel_deferred_windows_virtual_batch(session, conn, failed, message)?;
+            with_status(shared, |status| {
+                mark_batch_failed(status, &batch_id, message);
+            });
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[cfg(target_os = "linux")]

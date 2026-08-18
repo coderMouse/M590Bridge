@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -20,6 +21,142 @@ pub struct VirtualFile {
     file_name_utf16: Vec<u16>,
     size: u64,
     open_content: Arc<OpenContent>,
+}
+
+/// One descriptor in a Windows virtual-file clipboard collection.
+///
+/// Paths use `/` internally and are converted to `\` only when building the
+/// `FILEGROUPDESCRIPTORW` payload.
+#[derive(Clone)]
+pub struct VirtualFileCollectionEntry {
+    relative_path: String,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    relative_path_utf16: Vec<u16>,
+    file: Option<VirtualFile>,
+}
+
+impl VirtualFileCollectionEntry {
+    pub fn file(
+        relative_path: impl Into<String>,
+        file: VirtualFile,
+    ) -> Result<Self, ClipboardError> {
+        let relative_path = relative_path.into();
+        let relative_path_utf16 = validate_virtual_relative_path(&relative_path)?;
+        let base_name = relative_path.rsplit('/').next().unwrap_or_default();
+        if base_name != file.file_name() {
+            return Err(ClipboardError::Backend(
+                "virtual collection file name does not match its relative path".into(),
+            ));
+        }
+        Ok(Self {
+            relative_path,
+            relative_path_utf16,
+            file: Some(file),
+        })
+    }
+
+    pub fn directory(relative_path: impl Into<String>) -> Result<Self, ClipboardError> {
+        let relative_path = relative_path.into();
+        let relative_path_utf16 = validate_virtual_relative_path(&relative_path)?;
+        Ok(Self {
+            relative_path,
+            relative_path_utf16,
+            file: None,
+        })
+    }
+
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.file.is_none()
+    }
+
+    pub fn size(&self) -> u64 {
+        self.file.as_ref().map_or(0, VirtualFile::size)
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn relative_path_utf16(&self) -> &[u16] {
+        &self.relative_path_utf16
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn file_contents(&self) -> Option<&VirtualFile> {
+        self.file.as_ref()
+    }
+}
+
+impl fmt::Debug for VirtualFileCollectionEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtualFileCollectionEntry")
+            .field("relative_path", &self.relative_path)
+            .field("directory", &self.is_directory())
+            .field("size", &self.size())
+            .finish()
+    }
+}
+
+/// Ordered files and directories exposed through one OLE `IDataObject`.
+#[derive(Clone, Debug)]
+pub struct VirtualFileCollection {
+    entries: Vec<VirtualFileCollectionEntry>,
+}
+
+impl VirtualFileCollection {
+    pub fn new(entries: Vec<VirtualFileCollectionEntry>) -> Result<Self, ClipboardError> {
+        if entries.is_empty() {
+            return Err(ClipboardError::Backend(
+                "virtual file collection must not be empty".into(),
+            ));
+        }
+        if entries.len() > i32::MAX as usize {
+            return Err(ClipboardError::Backend(
+                "virtual file collection contains too many entries".into(),
+            ));
+        }
+
+        let mut normalized_paths = HashSet::with_capacity(entries.len());
+        let mut directory_by_path = HashMap::with_capacity(entries.len());
+        for entry in &entries {
+            let normalized = entry.relative_path.to_lowercase();
+            if !normalized_paths.insert(normalized.clone()) {
+                return Err(ClipboardError::Backend(
+                    "virtual file collection contains case-insensitive duplicate paths".into(),
+                ));
+            }
+            directory_by_path.insert(normalized, entry.is_directory());
+        }
+        for entry in &entries {
+            let components: Vec<&str> = entry.relative_path.split('/').collect();
+            for depth in 1..components.len() {
+                let parent = components[..depth].join("/").to_lowercase();
+                if directory_by_path.get(&parent) == Some(&false) {
+                    return Err(ClipboardError::Backend(
+                        "virtual file collection places an entry below a file".into(),
+                    ));
+                }
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn single(file: VirtualFile) -> Self {
+        let entry = VirtualFileCollectionEntry {
+            relative_path: file.file_name.clone(),
+            relative_path_utf16: file.file_name_utf16.clone(),
+            file: Some(file),
+        };
+        Self {
+            entries: vec![entry],
+        }
+    }
+
+    pub fn entries(&self) -> &[VirtualFileCollectionEntry] {
+        &self.entries
+    }
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -53,6 +190,7 @@ impl VirtualFile {
         self.size
     }
 
+    #[cfg(test)]
     pub(crate) fn file_name_utf16(&self) -> &[u16] {
         &self.file_name_utf16
     }
@@ -137,6 +275,34 @@ fn validate_virtual_file_name(file_name: &str) -> Result<Vec<u16>, ClipboardErro
     Ok(encoded)
 }
 
+fn validate_virtual_relative_path(relative_path: &str) -> Result<Vec<u16>, ClipboardError> {
+    if relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.contains('\0')
+        || relative_path.contains('\\')
+    {
+        return Err(ClipboardError::Backend(
+            "virtual collection path must be a safe slash-separated relative path".into(),
+        ));
+    }
+
+    let mut encoded = Vec::new();
+    for (index, component) in relative_path.split('/').enumerate() {
+        let component_utf16 = validate_virtual_file_name(component)?;
+        if index != 0 {
+            encoded.push('\\' as u16);
+        }
+        encoded.extend(component_utf16);
+    }
+    if encoded.len() >= WINDOWS_FILE_NAME_UTF16_CAPACITY {
+        return Err(ClipboardError::Backend(format!(
+            "virtual collection path exceeds {} UTF-16 code units",
+            WINDOWS_FILE_NAME_UTF16_CAPACITY - 1
+        )));
+    }
+    Ok(encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +346,55 @@ mod tests {
         let _first = file.open_content().unwrap();
         let _second = file.open_content().unwrap();
         assert_eq!(opened.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn collection_accepts_nested_files_and_directories_in_order() {
+        let file = VirtualFile::new("report.txt", 3, || Ok(Cursor::new(b"abc".to_vec()))).unwrap();
+        let collection = VirtualFileCollection::new(vec![
+            VirtualFileCollectionEntry::directory("folder").unwrap(),
+            VirtualFileCollectionEntry::directory("folder/empty").unwrap(),
+            VirtualFileCollectionEntry::file("folder/report.txt", file).unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(collection.entries().len(), 3);
+        assert!(collection.entries()[0].is_directory());
+        assert_eq!(collection.entries()[2].size(), 3);
+        assert_eq!(
+            String::from_utf16(collection.entries()[2].relative_path_utf16()).unwrap(),
+            "folder\\report.txt"
+        );
+    }
+
+    #[test]
+    fn collection_rejects_windows_collisions_and_file_parents() {
+        let first = VirtualFile::new("a.txt", 0, || Ok(Cursor::new(Vec::<u8>::new()))).unwrap();
+        let second = VirtualFile::new("A.TXT", 0, || Ok(Cursor::new(Vec::<u8>::new()))).unwrap();
+        assert!(VirtualFileCollection::new(vec![
+            VirtualFileCollectionEntry::file("folder/a.txt", first).unwrap(),
+            VirtualFileCollectionEntry::file("FOLDER/A.TXT", second).unwrap(),
+        ])
+        .is_err());
+
+        let parent = VirtualFile::new("folder", 0, || Ok(Cursor::new(Vec::<u8>::new()))).unwrap();
+        let child = VirtualFile::new("child.txt", 0, || Ok(Cursor::new(Vec::<u8>::new()))).unwrap();
+        assert!(VirtualFileCollection::new(vec![
+            VirtualFileCollectionEntry::file("folder", parent).unwrap(),
+            VirtualFileCollectionEntry::file("folder/child.txt", child).unwrap(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn collection_rejects_unsafe_or_mismatched_relative_paths() {
+        for path in ["", "/a.txt", "a\\b.txt", "a/../b.txt", "a/NUL.txt"] {
+            assert!(
+                VirtualFileCollectionEntry::directory(path).is_err(),
+                "accepted {path:?}"
+            );
+        }
+        let file = VirtualFile::new("a.txt", 0, || Ok(Cursor::new(Vec::<u8>::new()))).unwrap();
+        assert!(VirtualFileCollectionEntry::file("folder/b.txt", file).is_err());
     }
 }

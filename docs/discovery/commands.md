@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-17（task-054 增加 Linux / Windows 一键打包入口）
+> 更新日期：2026-08-18（task-057 增加 Windows Explorer 多文件验收入口）
 
 ## 桌面（推荐）
 
@@ -122,6 +122,23 @@ cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --examples
 cargo check -p m590-daemon --target x86_64-pc-windows-gnu
 ```
 
+### Windows Explorer 多文件/目录真机验收（task-057）
+
+先在 Windows 构建并运行当前代码，Linux 端运行同一提交。配对后从 Linux/发送端通过
+“选择文件”或“选择文件夹”发送一个包含多个顶层文件、嵌套目录、空目录、空文件和大文件
+的批次：
+
+1. Windows 接收端未在 Explorer 粘贴前，不应向网络请求文件内容，接收目录也不应出现
+   `.partial` 批次树。
+2. 在 Explorer 目标目录按 `Ctrl+V`；应显示系统复制进度，最终相对路径、文件大小和内容
+   与发送端一致，多个文件流按 entry 顺序串行完成。
+3. 分别在复制中取消、复制中替换 Windows 本机剪贴板、传输中断开连接；Explorer 不应
+   永久阻塞，Hub 不应保留活动批次或临时文件。
+4. 重新发送同一批输入后再次粘贴，并回归一个普通单文件的按需粘贴。
+
+同一剪贴板 offer 完成后直接再次 `Ctrl+V` 仍受一次性 offer 限制，不属于本 task 的重复
+发送验收；需要支持时应另建生命周期任务。
+
 ### Linux FUSE 单文件按需粘贴原型（task-051，Nautilus 真机已通过）
 
 构建不依赖系统 `fuse3.pc`，但运行时必须有 `/dev/fuse` 且当前用户可使用：
@@ -207,7 +224,8 @@ cargo run -p m590-clipboard --example set_file_and_read -- /path/to/test-file
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
 - **Linux 用户登录自启**：设置页显式启停，写当前用户 XDG autostart；正式/standalone 桌面端可用，开发壳拒绝开启（task-038/039）
 - **Windows NSIS/登录自启**：当前用户 NSIS、HKCU Run、卸载清理和 Windows↔Linux 回归均已真机验收通过（task-042）
-- **Windows OLE 虚拟文件**：单文件 `FILEDESCRIPTORW` + 延迟 `IStream` 已接入 `FileRequest`，由网络有界管道供给；task-044 的 Windows↔Linux 端到端已真机验收通过
+- **Windows OLE 虚拟文件**：单文件已完成真机验收；多文件/目录集合、按 entry 串行延迟
+  `IStream` 和批次清理已实现，task-057 尚待 Windows 10 Explorer 真机验收
 
 ## 文件 API（task-021+）
 
@@ -261,7 +279,7 @@ UI 加入页「局域网设备」旁有刷新图标。
 
 ## 未做
 
-- Windows Explorer 多文件/文件夹虚拟剪贴板（task-057）
+- Windows Explorer 多文件/文件夹虚拟剪贴板真机验收（task-057 代码已实现）
 - Linux FUSE 虚拟目录树与 Nautilus 多文件/文件夹粘贴（task-058）
 - 断点续传 / 多文件并行 / 独立数据连接
 - 设置页「发现方式」开关  

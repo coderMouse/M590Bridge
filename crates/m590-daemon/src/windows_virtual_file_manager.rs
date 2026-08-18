@@ -7,7 +7,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use m590_clipboard::{
-    publish_virtual_file, pump_virtual_file_messages, VirtualFile, VirtualFileClipboard,
+    publish_virtual_file_collection, pump_virtual_file_messages, VirtualFile, VirtualFileClipboard,
+    VirtualFileCollection,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,9 +18,9 @@ pub enum ManagerEvent {
 }
 
 enum Command {
-    Publish(VirtualFile),
+    Publish(VirtualFileCollection),
     ReplaceIfCurrent {
-        file: VirtualFile,
+        collection: VirtualFileCollection,
         result: Sender<bool>,
     },
     Clear,
@@ -48,8 +49,12 @@ impl WindowsVirtualFileManager {
     }
 
     pub fn publish(&self, file: VirtualFile) -> Result<(), String> {
+        self.publish_collection(VirtualFileCollection::single(file))
+    }
+
+    pub fn publish_collection(&self, collection: VirtualFileCollection) -> Result<(), String> {
         self.commands
-            .send(Command::Publish(file))
+            .send(Command::Publish(collection))
             .map_err(|_| "OLE STA stopped".into())
     }
 
@@ -58,10 +63,17 @@ impl WindowsVirtualFileManager {
     /// This keeps a deferred remote offer from overwriting a native copy that
     /// replaced the original virtual-file clipboard during an active stream.
     pub fn replace_if_current(&self, file: VirtualFile) -> Result<bool, String> {
+        self.replace_collection_if_current(VirtualFileCollection::single(file))
+    }
+
+    pub fn replace_collection_if_current(
+        &self,
+        collection: VirtualFileCollection,
+    ) -> Result<bool, String> {
         let (result_tx, result_rx) = mpsc::channel();
         self.commands
             .send(Command::ReplaceIfCurrent {
-                file,
+                collection,
                 result: result_tx,
             })
             .map_err(|_| "OLE STA stopped".to_string())?;
@@ -92,16 +104,16 @@ fn sta_loop(commands: Receiver<Command>, events: Sender<ManagerEvent>) {
     let mut guard: Option<VirtualFileClipboard> = None;
     loop {
         match commands.recv_timeout(Duration::from_millis(25)) {
-            Ok(Command::Publish(file)) => {
+            Ok(Command::Publish(collection)) => {
                 guard.take();
-                match publish_virtual_file(file) {
+                match publish_virtual_file_collection(collection) {
                     Ok(next) => guard = Some(next),
                     Err(err) => {
                         let _ = events.send(ManagerEvent::PublishFailed(err.to_string()));
                     }
                 }
             }
-            Ok(Command::ReplaceIfCurrent { file, result }) => {
+            Ok(Command::ReplaceIfCurrent { collection, result }) => {
                 let owns_clipboard = guard.as_ref().is_some_and(VirtualFileClipboard::is_current);
                 if !owns_clipboard {
                     guard.take();
@@ -109,7 +121,7 @@ fn sta_loop(commands: Receiver<Command>, events: Sender<ManagerEvent>) {
                     continue;
                 }
                 guard.take();
-                match publish_virtual_file(file) {
+                match publish_virtual_file_collection(collection) {
                     Ok(next) => guard = Some(next),
                     Err(err) => {
                         let _ = events.send(ManagerEvent::PublishFailed(err.to_string()));

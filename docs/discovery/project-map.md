@@ -1,22 +1,22 @@
 # 项目结构图 · M590Bridge
 
-> 更新日期：2026-08-17
-> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-056 批次扫描与串行运行时已实现
+> 更新日期：2026-08-18
+> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-057 Windows OLE 集合代码待真机验收
 
 ```text
 crates/
   m590-core/       # 协议 v3、Message File*/FileBatchOffer、批次路径校验、Session 批次条目串行收发/SHA-256
-  m590-clipboard/  # 文本/图片/file_list；Linux URI 探针；Windows 单文件 OLE 虚拟剪贴板
+  m590-clipboard/  # 文本/图片/file_list；Linux URI 探针；Windows 单/多文件 OLE 虚拟剪贴板
     examples/set_file_and_read.rs   # Linux text/uri-list 发布与 Nautilus 真机探针
-    src/virtual_file.rs          # 安全文件名、大小、惰性且可重复打开的内容工厂
-    src/windows_virtual_file.rs  # IDataObject / FILEDESCRIPTORW / 延迟 IStream / STA guard
+    src/virtual_file.rs          # 安全文件名/相对路径、虚拟文件集合、惰性内容工厂
+    src/windows_virtual_file.rs  # 多项 IDataObject / FILEGROUPDESCRIPTORW / 按索引延迟 IStream
     examples/windows_virtual_file.rs # Windows Explorer 真机原型
   m590-net/        # 帧 1..16、版本拒绝、批次清单字段校验、TCP
-  m590-daemon/     # hub：临时令牌/CORS、send_file/send_batch、批次暂存/串行调度、status、mDNS
+  m590-daemon/     # hub：send_file/send_batch、批次暂存或 Windows OLE 串行惰性流、status、mDNS
     src/linux_virtual_file.rs             # Linux-only 单文件 FUSE 元数据/惰性读取与句柄回收
     src/linux_virtual_file_manager.rs     # Linux FUSE 挂载、文件 URI 发布与生命周期
-    src/virtual_file_bridge.rs          # 有界网络字节管道、惰性请求、消费/释放、取消/超时
-    src/windows_virtual_file_manager.rs # Windows STA/OLE guard 生命周期（Windows-only）
+    src/virtual_file_bridge.rs          # 有界网络字节管道、请求启动/排队、消费/释放、取消/超时
+    src/windows_virtual_file_manager.rs # Windows STA/OLE 单文件或集合 guard 生命周期（Windows-only）
     examples/linux_virtual_file.rs      # Linux FUSE/Nautilus 按需读取与进度探针
 ui/
   src/             # React：OperableApp 配对/发现/多文件与目录批次发送/双层进度/登录自启

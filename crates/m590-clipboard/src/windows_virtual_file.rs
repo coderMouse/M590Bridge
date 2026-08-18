@@ -1,6 +1,6 @@
 use std::io::{Read, SeekFrom};
 use std::marker::PhantomData;
-use std::mem::{size_of, ManuallyDrop};
+use std::mem::{offset_of, size_of, ManuallyDrop};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::thread::ThreadId;
@@ -11,6 +11,7 @@ use windows::Win32::Foundation::{
     DV_E_TYMED, E_ACCESSDENIED, E_NOTIMPL, E_POINTER, OLE_E_ADVISENOTSUPPORTED, OLE_E_NOCONNECTION,
     S_FALSE, S_OK,
 };
+use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::{
     IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, ISequentialStream_Impl, IStream,
     IStream_Impl, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, LOCKTYPE, STATFLAG, STATSTG, STGC,
@@ -24,14 +25,14 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::UI::Shell::{
     SHCreateStdEnumFmtEtc, CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_PREFERREDDROPEFFECT,
-    FD_FILESIZE, FD_PROGRESSUI, FD_UNICODE, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW,
+    FD_ATTRIBUTES, FD_FILESIZE, FD_PROGRESSUI, FD_UNICODE, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
 };
 
 use crate::virtual_file::ReadSeek;
-use crate::{ClipboardError, VirtualFile};
+use crate::{ClipboardError, VirtualFile, VirtualFileCollection, VirtualFileCollectionEntry};
 
 const FORMAT_INDEX_NONE: i32 = -1;
 
@@ -51,30 +52,41 @@ impl ClipboardFormats {
         })
     }
 
-    fn as_format_etc(self) -> [FORMATETC; 3] {
-        [
-            FORMATETC {
-                cfFormat: self.descriptor,
-                ptd: std::ptr::null_mut(),
-                dwAspect: DVASPECT_CONTENT.0,
-                lindex: FORMAT_INDEX_NONE,
-                tymed: TYMED_HGLOBAL.0 as u32,
-            },
-            FORMATETC {
+    fn as_format_etc(self, collection: &VirtualFileCollection) -> Vec<FORMATETC> {
+        let mut formats = Vec::with_capacity(
+            2 + collection
+                .entries()
+                .iter()
+                .filter(|entry| !entry.is_directory())
+                .count(),
+        );
+        formats.push(FORMATETC {
+            cfFormat: self.descriptor,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: FORMAT_INDEX_NONE,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        });
+        for (index, entry) in collection.entries().iter().enumerate() {
+            if entry.is_directory() {
+                continue;
+            }
+            formats.push(FORMATETC {
                 cfFormat: self.contents,
                 ptd: std::ptr::null_mut(),
                 dwAspect: DVASPECT_CONTENT.0,
-                lindex: 0,
+                lindex: index as i32,
                 tymed: TYMED_ISTREAM.0 as u32,
-            },
-            FORMATETC {
-                cfFormat: self.preferred_drop_effect,
-                ptd: std::ptr::null_mut(),
-                dwAspect: DVASPECT_CONTENT.0,
-                lindex: FORMAT_INDEX_NONE,
-                tymed: TYMED_HGLOBAL.0 as u32,
-            },
-        ]
+            });
+        }
+        formats.push(FORMATETC {
+            cfFormat: self.preferred_drop_effect,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: FORMAT_INDEX_NONE,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        });
+        formats
     }
 }
 
@@ -89,13 +101,13 @@ fn register_format(name: windows::core::PCWSTR) -> Result<u16> {
 
 enum RequestedFormat {
     Descriptor,
-    Contents,
+    Contents(usize),
     PreferredDropEffect,
 }
 
 #[implement(IDataObject)]
 struct VirtualFileDataObject {
-    file: VirtualFile,
+    collection: VirtualFileCollection,
     formats: ClipboardFormats,
 }
 
@@ -115,27 +127,31 @@ impl VirtualFileDataObject {
             return Err(DV_E_DVASPECT);
         }
 
-        let (kind, expected_lindex, expected_tymed) = if format.cfFormat == self.formats.descriptor
-        {
-            (
-                RequestedFormat::Descriptor,
-                FORMAT_INDEX_NONE,
-                TYMED_HGLOBAL.0 as u32,
-            )
+        let (kind, expected_tymed) = if format.cfFormat == self.formats.descriptor {
+            if format.lindex != FORMAT_INDEX_NONE {
+                return Err(DV_E_LINDEX);
+            }
+            (RequestedFormat::Descriptor, TYMED_HGLOBAL.0 as u32)
         } else if format.cfFormat == self.formats.contents {
-            (RequestedFormat::Contents, 0, TYMED_ISTREAM.0 as u32)
+            let index = usize::try_from(format.lindex).map_err(|_| DV_E_LINDEX)?;
+            if self
+                .collection
+                .entries()
+                .get(index)
+                .and_then(VirtualFileCollectionEntry::file_contents)
+                .is_none()
+            {
+                return Err(DV_E_LINDEX);
+            }
+            (RequestedFormat::Contents(index), TYMED_ISTREAM.0 as u32)
         } else if format.cfFormat == self.formats.preferred_drop_effect {
-            (
-                RequestedFormat::PreferredDropEffect,
-                FORMAT_INDEX_NONE,
-                TYMED_HGLOBAL.0 as u32,
-            )
+            if format.lindex != FORMAT_INDEX_NONE {
+                return Err(DV_E_LINDEX);
+            }
+            (RequestedFormat::PreferredDropEffect, TYMED_HGLOBAL.0 as u32)
         } else {
             return Err(DV_E_CLIPFORMAT);
         };
-        if format.lindex != expected_lindex {
-            return Err(DV_E_LINDEX);
-        }
         if format.tymed & expected_tymed == 0 {
             return Err(DV_E_TYMED);
         }
@@ -143,21 +159,31 @@ impl VirtualFileDataObject {
     }
 
     fn descriptor_medium(&self) -> Result<STGMEDIUM> {
-        let mut descriptor = FILEDESCRIPTORW {
-            dwFlags: (FD_FILESIZE.0 | FD_PROGRESSUI.0 | FD_UNICODE.0) as u32,
-            nFileSizeHigh: (self.file.size() >> 32) as u32,
-            nFileSizeLow: self.file.size() as u32,
-            ..Default::default()
-        };
-        let name = self.file.file_name_utf16();
-        let mut file_name = [0_u16; 260];
-        file_name[..name.len()].copy_from_slice(name);
-        descriptor.cFileName = file_name;
-        let group = FILEGROUPDESCRIPTORW {
-            cItems: 1,
-            fgd: [descriptor],
-        };
-        hglobal_medium_from_copy(&group)
+        let descriptors: Vec<FILEDESCRIPTORW> = self
+            .collection
+            .entries()
+            .iter()
+            .map(file_descriptor)
+            .collect();
+        hglobal_medium_from_descriptors(&descriptors)
+    }
+
+    fn content_medium(&self, index: usize) -> Result<STGMEDIUM> {
+        let file = self.collection.entries()[index]
+            .file_contents()
+            .expect("requested format checked file entry");
+        let reader = file.open_content().map_err(|err| {
+            Error::new(windows::Win32::Foundation::STG_E_READFAULT, err.to_string())
+        })?;
+        let stream =
+            ComObject::new(ReadSeekStream::new(reader, file.size())).into_interface::<IStream>();
+        Ok(STGMEDIUM {
+            tymed: TYMED_ISTREAM.0 as u32,
+            u: STGMEDIUM_0 {
+                pstm: ManuallyDrop::new(Some(stream)),
+            },
+            pUnkForRelease: ManuallyDrop::new(None),
+        })
     }
 
     fn preferred_drop_effect_medium(&self) -> Result<STGMEDIUM> {
@@ -165,25 +191,70 @@ impl VirtualFileDataObject {
     }
 }
 
+fn file_descriptor(entry: &VirtualFileCollectionEntry) -> FILEDESCRIPTORW {
+    let mut descriptor = FILEDESCRIPTORW {
+        dwFlags: (FD_ATTRIBUTES.0 | FD_UNICODE.0) as u32,
+        dwFileAttributes: if entry.is_directory() {
+            FILE_ATTRIBUTE_DIRECTORY.0
+        } else {
+            FILE_ATTRIBUTE_NORMAL.0
+        },
+        ..Default::default()
+    };
+    if !entry.is_directory() {
+        descriptor.dwFlags |= (FD_FILESIZE.0 | FD_PROGRESSUI.0) as u32;
+        descriptor.nFileSizeHigh = (entry.size() >> 32) as u32;
+        descriptor.nFileSizeLow = entry.size() as u32;
+    }
+    let name = entry.relative_path_utf16();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!(descriptor.cFileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+    descriptor
+}
+
+fn hglobal_medium_from_descriptors(descriptors: &[FILEDESCRIPTORW]) -> Result<STGMEDIUM> {
+    let descriptor_offset = offset_of!(FILEGROUPDESCRIPTORW, fgd);
+    let bytes = descriptors
+        .len()
+        .checked_mul(size_of::<FILEDESCRIPTORW>())
+        .and_then(|descriptor_bytes| descriptor_offset.checked_add(descriptor_bytes))
+        .ok_or_else(|| Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY))?;
+    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) }?;
+    let destination = unsafe { GlobalLock(handle) };
+    if destination.is_null() {
+        let _ = unsafe { windows::Win32::Foundation::GlobalFree(Some(handle)) };
+        return Err(Error::from_win32());
+    }
+    unsafe {
+        destination.cast::<u32>().write(descriptors.len() as u32);
+        std::ptr::copy_nonoverlapping(
+            descriptors.as_ptr(),
+            destination
+                .cast::<u8>()
+                .add(descriptor_offset)
+                .cast::<FILEDESCRIPTORW>(),
+            descriptors.len(),
+        );
+        let _ = GlobalUnlock(handle);
+    }
+    Ok(STGMEDIUM {
+        tymed: TYMED_HGLOBAL.0 as u32,
+        u: STGMEDIUM_0 { hGlobal: handle },
+        pUnkForRelease: ManuallyDrop::new(None),
+    })
+}
+
 impl IDataObject_Impl for VirtualFileDataObject_Impl {
     fn GetData(&self, format: *const FORMATETC) -> Result<STGMEDIUM> {
         match self.requested_format(format).map_err(Error::from_hresult)? {
             RequestedFormat::Descriptor => self.descriptor_medium(),
             RequestedFormat::PreferredDropEffect => self.preferred_drop_effect_medium(),
-            RequestedFormat::Contents => {
-                let reader = self.file.open_content().map_err(|err| {
-                    Error::new(windows::Win32::Foundation::STG_E_READFAULT, err.to_string())
-                })?;
-                let stream = ComObject::new(ReadSeekStream::new(reader, self.file.size()))
-                    .into_interface::<IStream>();
-                Ok(STGMEDIUM {
-                    tymed: TYMED_ISTREAM.0 as u32,
-                    u: STGMEDIUM_0 {
-                        pstm: ManuallyDrop::new(Some(stream)),
-                    },
-                    pUnkForRelease: ManuallyDrop::new(None),
-                })
-            }
+            RequestedFormat::Contents(index) => self.content_medium(index),
         }
     }
 
@@ -226,7 +297,8 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
         if direction != DATADIR_GET.0 as u32 {
             return Err(Error::from_hresult(E_NOTIMPL));
         }
-        unsafe { SHCreateStdEnumFmtEtc(&self.formats.as_format_etc()) }
+        let formats = self.formats.as_format_etc(&self.collection);
+        unsafe { SHCreateStdEnumFmtEtc(&formats) }
     }
 
     fn DAdvise(
@@ -483,6 +555,12 @@ fn clipboard_sequence() -> Option<u32> {
 pub fn publish_virtual_file(
     file: VirtualFile,
 ) -> std::result::Result<VirtualFileClipboard, ClipboardError> {
+    publish_virtual_file_collection(VirtualFileCollection::single(file))
+}
+
+pub fn publish_virtual_file_collection(
+    collection: VirtualFileCollection,
+) -> std::result::Result<VirtualFileClipboard, ClipboardError> {
     unsafe { OleInitialize(None) }.map_err(|err| ClipboardError::Backend(err.to_string()))?;
     let formats = match ClipboardFormats::register() {
         Ok(formats) => formats,
@@ -491,8 +569,11 @@ pub fn publish_virtual_file(
             return Err(ClipboardError::Backend(err.to_string()));
         }
     };
-    let object =
-        ComObject::new(VirtualFileDataObject { file, formats }).into_interface::<IDataObject>();
+    let object = ComObject::new(VirtualFileDataObject {
+        collection,
+        formats,
+    })
+    .into_interface::<IDataObject>();
     if let Err(err) = unsafe { OleSetClipboard(&object) } {
         drop(object);
         unsafe { OleUninitialize() };
