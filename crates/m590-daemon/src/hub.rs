@@ -161,6 +161,27 @@ struct LinuxVirtualReceive {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PendingLinuxVirtualChunk {
+    transfer_id: String,
+    data: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxVirtualChunkPush {
+    Accepted,
+    Backpressured,
+    NoReceiver,
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxVirtualBatchStreamEvent {
+    Unhandled,
+    Handled(Option<PendingLinuxVirtualChunk>),
+}
+
+#[cfg(target_os = "linux")]
 struct LinuxVirtualBatchFile {
     entry: BatchEntry,
     bridge: VirtualFileBridge,
@@ -1863,6 +1884,8 @@ fn run_session_loop(
     let mut deferred_virtual_offer: Option<DeferredVirtualOffer> = None;
     #[cfg(target_os = "linux")]
     let mut deferred_virtual_batch_offer: Option<DeferredVirtualBatchOffer> = None;
+    #[cfg(target_os = "linux")]
+    let mut pending_virtual_chunk: Option<PendingLinuxVirtualChunk> = None;
     while session.state() != ConnectionState::Connected {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             let _ = session.handle(SessionEvent::Disconnect);
@@ -1992,6 +2015,27 @@ fn run_session_loop(
                         status.file_bytes_total = None;
                         status.last_error = None;
                     });
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(pending) = pending_virtual_chunk.take() {
+            match try_push_linux_virtual_chunk(
+                &pending.transfer_id,
+                &pending.data,
+                virtual_receive.as_ref(),
+                virtual_batch_receive.as_ref(),
+            ) {
+                Ok(LinuxVirtualChunkPush::Accepted | LinuxVirtualChunkPush::NoReceiver) => {}
+                Ok(LinuxVirtualChunkPush::Backpressured) => {
+                    pending_virtual_chunk = Some(pending);
+                }
+                Err(error) => {
+                    with_status(&shared, |status| {
+                        status.last_error = Some(format!("virtual file stream: {error}"));
+                    });
+                    pending_virtual_chunk = Some(pending);
                 }
             }
         }
@@ -2189,6 +2233,10 @@ fn run_session_loop(
         }
 
         loop {
+            #[cfg(target_os = "linux")]
+            if pending_virtual_chunk.is_some() {
+                break;
+            }
             match conn.try_recv() {
                 Ok(Some(msg)) => {
                     file_progressed |=
@@ -2550,7 +2598,7 @@ fn run_session_loop(
                             continue;
                         }
                         #[cfg(target_os = "linux")]
-                        if handle_linux_virtual_batch_stream_event(
+                        match handle_linux_virtual_batch_stream_event(
                             &shared,
                             session,
                             conn,
@@ -2559,7 +2607,11 @@ fn run_session_loop(
                             &mut virtual_batch_receive,
                             &mut deferred_virtual_batch_offer,
                         )? {
-                            continue;
+                            LinuxVirtualBatchStreamEvent::Unhandled => {}
+                            LinuxVirtualBatchStreamEvent::Handled(pending) => {
+                                pending_virtual_chunk = pending;
+                                continue;
+                            }
                         }
                         let batch_handled = handle_batch_file_event(
                             &shared,
@@ -2592,11 +2644,34 @@ fn run_session_loop(
                                                 .unwrap_or(0)
                                         ));
                                     }
-                                    if let Err(err) = current.producer.push(data) {
-                                        with_status(&shared, |s| {
-                                            s.last_error =
-                                                Some(format!("virtual file stream: {err}"));
+                                    #[cfg(target_os = "windows")]
+                                    if let Err(error) = current.producer.push(data) {
+                                        with_status(&shared, |status| {
+                                            status.last_error =
+                                                Some(format!("virtual file stream: {error}"));
                                         });
+                                    }
+                                    #[cfg(target_os = "linux")]
+                                    match current.producer.try_push(data) {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            pending_virtual_chunk =
+                                                Some(PendingLinuxVirtualChunk {
+                                                    transfer_id: transfer_id.clone(),
+                                                    data: data.clone(),
+                                                });
+                                        }
+                                        Err(error) => {
+                                            with_status(&shared, |status| {
+                                                status.last_error =
+                                                    Some(format!("virtual file stream: {error}"));
+                                            });
+                                            pending_virtual_chunk =
+                                                Some(PendingLinuxVirtualChunk {
+                                                    transfer_id: transfer_id.clone(),
+                                                    data: data.clone(),
+                                                });
+                                        }
                                     }
                                 }
                             }
@@ -5694,7 +5769,7 @@ fn handle_linux_virtual_batch_stream_event(
     event: &InboundFileResult,
     receive: &mut Option<LinuxVirtualBatchReceive>,
     deferred: &mut Option<DeferredVirtualBatchOffer>,
-) -> Result<bool, String> {
+) -> Result<LinuxVirtualBatchStreamEvent, String> {
     match event {
         InboundFileResult::Chunk { transfer_id, data }
             if receive
@@ -5705,11 +5780,26 @@ fn handle_linux_virtual_batch_stream_event(
             let index = batch
                 .file_index(transfer_id)
                 .expect("matching Linux virtual batch file");
-            let push_error = batch.files[index]
-                .producer
-                .push(data)
-                .err()
-                .map(|error| format!("virtual batch stream: {error}"));
+            let (push_error, pending_chunk) = match batch.files[index].producer.try_push(data) {
+                Ok(true) => (None, None),
+                Ok(false) => {
+                    let pending = PendingLinuxVirtualChunk {
+                        transfer_id: transfer_id.clone(),
+                        data: data.clone(),
+                    };
+                    (None, Some(pending))
+                }
+                Err(error) => {
+                    let pending = PendingLinuxVirtualChunk {
+                        transfer_id: transfer_id.clone(),
+                        data: data.clone(),
+                    };
+                    (
+                        Some(format!("virtual batch stream: {error}")),
+                        Some(pending),
+                    )
+                }
+            };
             let (received, total) = session
                 .inbound_file_progress()
                 .filter(|(id, _, _)| id == transfer_id)
@@ -5731,7 +5821,7 @@ fn handle_linux_virtual_batch_stream_event(
                 status.file_bytes_total = Some(total);
                 status.last_error = push_error;
             });
-            Ok(true)
+            Ok(LinuxVirtualBatchStreamEvent::Handled(pending_chunk))
         }
         InboundFileResult::StreamCompleted {
             transfer_id, size, ..
@@ -5768,7 +5858,7 @@ fn handle_linux_virtual_batch_stream_event(
             if batch.is_complete() {
                 mark_batch_done(shared, &batch.batch_id, None);
             }
-            Ok(true)
+            Ok(LinuxVirtualBatchStreamEvent::Handled(None))
         }
         InboundFileResult::Failed {
             transfer_id,
@@ -5784,7 +5874,7 @@ fn handle_linux_virtual_batch_stream_event(
             with_status(shared, |status| {
                 mark_batch_failed(status, &batch_id, message);
             });
-            Ok(true)
+            Ok(LinuxVirtualBatchStreamEvent::Handled(None))
         }
         InboundFileResult::Failed {
             transfer_id,
@@ -5802,10 +5892,42 @@ fn handle_linux_virtual_batch_stream_event(
             with_status(shared, |status| {
                 mark_batch_failed(status, &batch_id, message);
             });
-            Ok(true)
+            Ok(LinuxVirtualBatchStreamEvent::Handled(None))
         }
-        _ => Ok(false),
+        _ => Ok(LinuxVirtualBatchStreamEvent::Unhandled),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn try_push_linux_virtual_chunk(
+    transfer_id: &str,
+    data: &[u8],
+    single: Option<&LinuxVirtualReceive>,
+    batch: Option<&LinuxVirtualBatchReceive>,
+) -> Result<LinuxVirtualChunkPush, String> {
+    let producer = single
+        .filter(|receive| receive.transfer_id == transfer_id)
+        .map(|receive| &receive.producer)
+        .or_else(|| {
+            batch.and_then(|receive| {
+                receive
+                    .file_index(transfer_id)
+                    .map(|index| &receive.files[index].producer)
+            })
+        });
+    let Some(producer) = producer else {
+        return Ok(LinuxVirtualChunkPush::NoReceiver);
+    };
+    producer
+        .try_push(data)
+        .map(|accepted| {
+            if accepted {
+                LinuxVirtualChunkPush::Accepted
+            } else {
+                LinuxVirtualChunkPush::Backpressured
+            }
+        })
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -6369,6 +6491,37 @@ mod tests {
         assert!(linux_completed_replaced_virtual_receive_can_detach(
             true, true, true, true
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_virtual_chunk_routing_backpressures_without_waiting() {
+        let (bridge, producer) = VirtualFileBridge::with_capacity(1);
+        let receive = LinuxVirtualReceive {
+            transfer_id: "large-file".into(),
+            bridge,
+            producer,
+            requested: true,
+            completed: false,
+            consumed: false,
+            released: false,
+            clipboard_replaced: false,
+        };
+
+        assert_eq!(
+            try_push_linux_virtual_chunk("large-file", b"a", Some(&receive), None).unwrap(),
+            LinuxVirtualChunkPush::Accepted
+        );
+        let started = Instant::now();
+        assert_eq!(
+            try_push_linux_virtual_chunk("large-file", b"b", Some(&receive), None).unwrap(),
+            LinuxVirtualChunkPush::Backpressured
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            try_push_linux_virtual_chunk("other", b"b", Some(&receive), None).unwrap(),
+            LinuxVirtualChunkPush::NoReceiver
+        );
     }
 
     #[cfg(target_os = "linux")]

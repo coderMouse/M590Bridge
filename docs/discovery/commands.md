@@ -209,19 +209,22 @@ URI，Nautilus `Ctrl+V` 后才发起网络请求并显示系统进度，完成�
 cargo test -p m590-daemon virtual_file
 cargo test -p m590-daemon linux_virtual
 cargo test -p m590-daemon mounted_tree_smoke_browses_and_reads_nested_content -- --ignored --nocapture
+cargo test -p m590-daemon mounted_single_and_tree_stream_large_files_with_nonblocking_backpressure -- --ignored --nocapture
 cargo check --workspace
 cargo clippy -p m590-daemon --lib --no-deps -- -D warnings
 ```
 
-第三条命令需要可用的 `/dev/fuse`，会创建临时只读 tree，浏览嵌套/空目录、读取一个嵌套
-文件并正常卸载；它不连接网络，也不代替 Nautilus。当前本地 smoke 已通过。
+第三、四条命令需要可用的 `/dev/fuse`。前者浏览临时只读 tree 的嵌套/空目录；后者按
+256 KiB 网络块分别读取并逐字节校验 24 MiB 单文件和 tree 文件。它们不连接跨机网络，也
+不代替 Nautilus。当前两项本地 smoke 均已通过。
 
 Linux GNOME Wayland + Nautilus 与同一局域网 Windows 真机验收：
 
 1. 两端退出旧托盘实例后运行同一提交的 `cd ui && npm run desktop:standalone` 并配对。
-2. Windows 复制或发送一个批次，固定包含两个顶层文件、一个嵌套目录、空目录、空文件和
-   一个可观察进度的大文件。Linux 收到 offer 后、Nautilus 粘贴前不应下载文件内容，也不应
-   在接收目录创建 `.partial` 批次树。
+2. 先由 Windows 复制一个几十 MiB 普通文件到 Linux，确认完整粘贴，并在另一次传输中点击
+   断开，确认 Hub 立即恢复可操作。随后发送一个批次，固定包含两个顶层文件、一个嵌套目录、
+   空目录、空文件和一个可观察进度的大文件。Linux 收到 offer 后、Nautilus 粘贴前不应下载
+   文件内容，也不应在接收目录创建 `.partial` 批次树。
 3. Linux 在 Nautilus 目标目录按 `Ctrl+V`。应显示系统复制进度；最终所有顶层项、相对路径、
    空目录、文件大小和哈希均与 Windows 一致，网络文件请求保持串行。
 4. 分别复测 Nautilus 取消、传输中替换 Linux 本机剪贴板、传输中断开连接。Hub 不应残留
@@ -230,8 +233,9 @@ Linux GNOME Wayland + Nautilus 与同一局域网 Windows 真机验收：
    同一 clipboard offer 完成后直接第二次 `Ctrl+V` 不属于已保证能力，若产品要求任意次重开
    需另建协议生命周期任务。
 
-task-058 目前只完成代码、自动化和本地真实挂载，尚不能宣称 Linux Nautilus 多文件/目录
-跨机粘贴已通过。
+task-058 首轮跨机发现几十 MiB 单文件在接收数百 KiB 后卡住且 Hub 无法及时断开；Linux
+接收路径已改为非阻塞背压并通过大文件本地挂载校验，但尚不能宣称 Linux Nautilus 单文件
+回归或多文件/目录跨机粘贴已通过。
 
 ## Rust 测试 / CLI
 

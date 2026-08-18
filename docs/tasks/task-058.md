@@ -21,6 +21,7 @@ task-052 已验证 Linux FUSE 单文件按需读取和 Nautilus 系统进度。�
 - `crates/m590-daemon/src/linux_virtual_file.rs`
 - `crates/m590-daemon/src/linux_virtual_file_manager.rs`
 - `crates/m590-daemon/src/hub.rs` 的 Linux 批次接线
+- `crates/m590-daemon/src/virtual_file_bridge.rs` 的 Linux 非阻塞背压入口与回归测试
 - 必要的剪贴板 URI 发布辅助代码
 - 本 task 及必要文档
 
@@ -35,6 +36,7 @@ task-052 已验证 Linux FUSE 单文件按需读取和 Nautilus 系统进度。�
 ```bash
 cargo test -p m590-daemon virtual_file
 cargo test -p m590-daemon linux_virtual
+cargo test -p m590-daemon mounted_single_and_tree_stream_large_files_with_nonblocking_backpressure -- --ignored --nocapture
 cargo check --workspace
 cargo clippy -p m590-daemon --lib --no-deps -- -D warnings
 ```
@@ -50,8 +52,8 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 
 ## 下一步
 
-- 在 Linux GNOME Wayland + Nautilus 与同一局域网 Windows 端执行多文件/目录真机验收，
-  根据日志修复实际 Shell 行为后再决定是否完成本 task。
+- 两端更新到本次非阻塞背压修复后，先复测 Windows→Linux 的几十 MiB 单文件完整粘贴与
+  传输中断开，再执行多文件/目录、取消、替换和断线验收；通过前不完成本 task。
 
 ## 实施记录
 
@@ -73,6 +75,16 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
   reader 取消、远端失败、断线和运行态析构都会唤醒 producer 并清理挂载。
 - 2026-08-18：清理了两个没有对应进程且返回 `ENOTCONN` 的旧 m590bridge 临时 FUSE
   挂载；随后用新挂载执行本地 tree smoke，成功浏览顶层/嵌套目录、读取内容并正常卸载。
+- 2026-08-18：首轮跨机反馈 Linux 接收几十 MiB 单文件也会在数百 KiB 后卡住，Hub 此时
+  无法及时断开，多文件更严重。检查确认单文件 FUSE 实现未随 tree 改动，但 Hub 仍在网络
+  session loop 内同步调用有界管道 `push`；消费者停读或变慢、管道写满时该调用最长阻塞
+  30 秒，使取消、断开和心跳无法被同一循环处理。
+- 2026-08-18：为管道增加整块 `try_push`。Linux Hub 在容量不足时最多保留一个网络块并
+  暂停继续读取 socket，每轮继续处理控制命令、FUSE release/cancel 和生命周期事件；容量
+  恢复后按原顺序写入，不部分入队。持续背压仍累计原有 30 秒超时并发出 cancel，但每次
+  Hub 调用都会立即返回；不改变 Windows OLE 路径和 wire 协议。
+- 2026-08-18：新增单文件/tree 大流量真实挂载 smoke，分别把 24 MiB+123 B 模式内容按
+  256 KiB 网络块送入有界管道，两个入口均完成逐字节一致性校验并正常卸载。
 
 ## 修改文件
 
@@ -81,7 +93,10 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 - `crates/m590-daemon/src/linux_virtual_file_manager.rs`：单文件/tree 统一挂载所有权、顶层
   路径列表发布、条件替换与卸载清理。
 - `crates/m590-daemon/src/hub.rs`：Linux 虚拟批次发布、串行请求、进度、取消、替换、失败
-  和延迟 offer 生命周期；Windows OLE 分支未改变行为。
+  和延迟 offer 生命周期；本轮新增单文件/批次的非阻塞暂存块与 socket 背压，Windows OLE
+  分支未改变行为。
+- `crates/m590-daemon/src/virtual_file_bridge.rs`：新增整块非阻塞 `try_push`，覆盖容量不足、
+  取消即时返回和单文件/tree 24 MiB 真实 FUSE 流测试；原同步 `push` 继续供 Windows 使用。
 - `docs/tasks/task-058.md`、`docs/plans/current.md`、`docs/discovery/project-map.md`、
   `docs/discovery/commands.md`、`AGENTS.md`、`项目说明.md`：同步实现状态、验证命令和真机边界。
 
@@ -102,17 +117,35 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
   破坏 Windows daemon 编译。
 - `cargo clippy -p m590-daemon --lib --no-deps -- -D warnings`：通过，无 warning。
 - `cargo fmt --all -- --check`、`git diff --check`：通过。
-- Linux GNOME Wayland + Nautilus 跨机：尚未执行，不能以本地 FUSE smoke 代替。
+- 初次实现阶段尚未执行 Linux GNOME Wayland + Nautilus 跨机，且本地 FUSE smoke 不能
+  代替跨机验收；随后首轮结果见下一项。
+- 首轮 Linux GNOME Wayland + Nautilus 跨机：失败；几十 MiB 单文件在接收数百 KiB 后
+  卡住且无法及时断开，多文件不能完成。本轮修复后仍待用户跨机复测。
+- `cargo test -p m590-daemon virtual_file -- --nocapture`：本轮通过，21 passed、2 ignored，
+  0 failed；新增非阻塞整块入队、容量恢复、取消即时返回和非阻塞 30 秒累计超时覆盖。
+- `cargo test -p m590-daemon linux_virtual -- --nocapture`：本轮通过，16 passed、1 ignored，
+  0 failed；新增 Hub 管道满时立即返回背压的路由测试。
+- `cargo test -p m590-daemon`：本轮通过，daemon lib 68 passed、2 ignored，bin 1 passed，
+  0 failed。
+- `cargo test -p m590-daemon mounted_single_and_tree_stream_large_files_with_nonblocking_backpressure
+  -- --ignored --nocapture`：通过；真实 FUSE 单文件和 tree 各读取 24 MiB+123 B，逐字节一致，
+  0 failed。
+- `cargo check --workspace`、`cargo check -p m590-daemon --target x86_64-pc-windows-gnu --lib`：
+  本轮通过。
+- `cargo clippy -p m590-daemon --lib --no-deps -- -D warnings`、`cargo fmt --all -- --check`、
+  `git diff --check`：本轮通过。
 
 ## 文档影响检查
 
-- 已更新：本 task、当前计划、项目结构图、常用命令、Agent 当前阶段与项目说明。
+- 已更新：本 task、当前计划、项目结构图、常用命令、Agent 当前阶段与项目说明；记录首轮
+  真机失败、非阻塞背压修复和大文件 smoke。
 - 无需更新：协议 wire 字段、Hub HTTP API、UI 交互、Windows OLE、安装器与自启均未改变。
 
 ## 风险 / blocker
 
 - 仍需 Linux GNOME Wayland + Nautilus 真机确认：粘贴多个顶层文件、嵌套/空目录、空文件、
-  大文件、系统进度、取消、替换、断线及重新发送同批输入后再次粘贴。
+  大文件、系统进度、取消、替换、断线及重新发送同批输入后再次粘贴；尤其要先确认本轮
+  单文件卡住和无法断开的回归已经消失。
 - 沿用 task-044 的一次性网络 offer/reader：同一个 clipboard offer 完成后直接再次
   `Ctrl+V` 不保证能重开已消费的网络流。若产品要求同一 offer 任意次粘贴，需要另建协议
   生命周期任务，不能在 task-058 内暗改 task-055 wire 字段。

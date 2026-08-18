@@ -38,6 +38,7 @@ struct PipeState {
     finished: bool,
     cancelled: bool,
     error: Option<String>,
+    write_blocked_since: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -90,6 +91,7 @@ impl VirtualFileBridge {
                 finished: false,
                 cancelled: false,
                 error: None,
+                write_blocked_since: None,
             }),
             changed: Condvar::new(),
             capacity,
@@ -199,6 +201,50 @@ impl PipeProducer {
     /// Push one verified network chunk, waiting for bounded capacity or cancellation.
     pub fn push(&self, data: &[u8]) -> io::Result<()> {
         self.push_with_timeout(data, WRITE_TIMEOUT)
+    }
+
+    /// Try to enqueue one complete network chunk without waiting for the reader.
+    ///
+    /// Returning `Ok(false)` leaves the pipe unchanged. The hub can retain that
+    /// one chunk and keep servicing cancellation/lifecycle events until capacity
+    /// becomes available.
+    pub fn try_push(&self, data: &[u8]) -> io::Result<bool> {
+        self.try_push_with_timeout(data, WRITE_TIMEOUT)
+    }
+
+    fn try_push_with_timeout(&self, data: &[u8], timeout: Duration) -> io::Result<bool> {
+        if data.is_empty() {
+            return Ok(true);
+        }
+        if data.len() > self.inner.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "virtual file chunk exceeds pipe capacity",
+            ));
+        }
+        let mut state = self.inner.state.lock().map_err(poisoned)?;
+        if state.cancelled {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transfer cancelled",
+            ));
+        }
+        if self.inner.capacity - state.bytes.len() < data.len() {
+            let blocked_since = *state.write_blocked_since.get_or_insert_with(Instant::now);
+            if blocked_since.elapsed() >= timeout {
+                state.cancelled = true;
+                let message = "virtual file consumer stalled".to_string();
+                let _ = self.inner.events.send(BridgeEvent::Cancel(message.clone()));
+                self.inner.changed.notify_all();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, message));
+            }
+            return Ok(false);
+        }
+        state.write_blocked_since = None;
+        state.started = true;
+        state.bytes.extend(data);
+        self.inner.changed.notify_all();
+        Ok(true)
     }
 
     fn push_with_timeout(&self, data: &[u8], timeout: Duration) -> io::Result<()> {
@@ -384,6 +430,19 @@ mod tests {
     use super::*;
     use std::thread;
 
+    #[cfg(target_os = "linux")]
+    use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::time::UNIX_EPOCH;
+
+    #[cfg(target_os = "linux")]
+    use crate::linux_virtual_file::{
+        LinuxVirtualFileMount, LinuxVirtualFileTree, LinuxVirtualFileTreeEntry,
+        LinuxVirtualFileTreeMount,
+    };
+
     #[test]
     fn reader_requests_lazily_and_streams_with_backpressure() {
         let (bridge, producer) = VirtualFileBridge::with_capacity(3);
@@ -437,6 +496,171 @@ mod tests {
             bridge.take_event(),
             Some(BridgeEvent::Cancel("virtual file consumer stalled".into()))
         );
+    }
+
+    #[test]
+    fn try_push_applies_backpressure_without_partial_enqueue() {
+        let (bridge, producer) = VirtualFileBridge::with_capacity(3);
+        let mut reader = open_reader(&bridge.inner, 5).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+
+        assert!(producer.try_push(b"abc").unwrap());
+        assert!(!producer.try_push(b"de").unwrap());
+        let mut prefix = [0_u8; 2];
+        reader.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"ab");
+        assert!(producer.try_push(b"de").unwrap());
+        producer.finish();
+
+        let mut suffix = Vec::new();
+        reader.read_to_end(&mut suffix).unwrap();
+        assert_eq!(suffix, b"cde");
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Consumed));
+    }
+
+    #[test]
+    fn try_push_rejects_a_chunk_larger_than_capacity() {
+        let (_bridge, producer) = VirtualFileBridge::with_capacity(2);
+        let error = producer.try_push(b"abc").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn cancelled_try_push_returns_without_waiting() {
+        let (bridge, producer) = VirtualFileBridge::with_capacity(1);
+        let reader = open_reader(&bridge.inner, 2).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        assert!(producer.try_push(b"a").unwrap());
+        drop(reader);
+
+        let started = Instant::now();
+        let error = producer.try_push(b"b").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn stalled_try_push_times_out_without_blocking_the_caller() {
+        let (bridge, producer) = VirtualFileBridge::with_capacity(1);
+        let _reader = open_reader(&bridge.inner, 2).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        assert!(producer.try_push(b"a").unwrap());
+        assert!(!producer
+            .try_push_with_timeout(b"b", Duration::from_millis(5))
+            .unwrap());
+        thread::sleep(Duration::from_millis(10));
+
+        let started = Instant::now();
+        let error = producer
+            .try_push_with_timeout(b"b", Duration::from_millis(5))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            bridge.take_event(),
+            Some(BridgeEvent::Cancel("virtual file consumer stalled".into()))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a working /dev/fuse; run explicitly on a Linux desktop"]
+    fn mounted_single_and_tree_stream_large_files_with_nonblocking_backpressure() {
+        const FILE_SIZE: usize = 24 * 1024 * 1024 + 123;
+
+        let single_mount_point = fuse_smoke_mount_point("large-single");
+        fs::create_dir(&single_mount_point).unwrap();
+        let (single_bridge, single_producer) = VirtualFileBridge::new();
+        let single_file = single_bridge
+            .linux_virtual_file("large-single.bin", FILE_SIZE as u64)
+            .unwrap();
+        let single_mount = LinuxVirtualFileMount::mount(&single_mount_point, single_file).unwrap();
+        stream_and_verify_pattern(
+            &single_bridge,
+            single_producer,
+            single_mount.file_path().to_path_buf(),
+            FILE_SIZE,
+        );
+        single_mount.unmount().unwrap();
+        fs::remove_dir(&single_mount_point).unwrap();
+
+        let tree_mount_point = fuse_smoke_mount_point("large-tree");
+        fs::create_dir(&tree_mount_point).unwrap();
+        let (tree_bridge, tree_producer) = VirtualFileBridge::new();
+        let tree_file = tree_bridge
+            .linux_virtual_file("large-tree.bin", FILE_SIZE as u64)
+            .unwrap();
+        let tree = LinuxVirtualFileTree::new(vec![LinuxVirtualFileTreeEntry::file(
+            "folder/large-tree.bin",
+            tree_file,
+        )
+        .unwrap()])
+        .unwrap();
+        let tree_mount = LinuxVirtualFileTreeMount::mount(&tree_mount_point, tree).unwrap();
+        stream_and_verify_pattern(
+            &tree_bridge,
+            tree_producer,
+            tree_mount_point.join("folder/large-tree.bin"),
+            FILE_SIZE,
+        );
+        tree_mount.unmount().unwrap();
+        fs::remove_dir(&tree_mount_point).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fuse_smoke_mount_point(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "m590bridge-{label}-{}-{}",
+            std::process::id(),
+            UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stream_and_verify_pattern(
+        bridge: &VirtualFileBridge,
+        producer: PipeProducer,
+        file_path: PathBuf,
+        file_size: usize,
+    ) {
+        const NETWORK_CHUNK_SIZE: usize = 256 * 1024;
+
+        let reader = thread::spawn(move || fs::read(file_path).unwrap());
+        let request_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if bridge.take_event() == Some(BridgeEvent::Request) {
+                break;
+            }
+            assert!(
+                Instant::now() < request_deadline,
+                "mounted file did not request its content"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        producer.start();
+        let mut offset = 0;
+        while offset < file_size {
+            let length = NETWORK_CHUNK_SIZE.min(file_size - offset);
+            let chunk = (offset..offset + length)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            loop {
+                if producer.try_push(&chunk).unwrap() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            offset += length;
+        }
+        producer.finish();
+
+        let received = reader.join().unwrap();
+        assert_eq!(received.len(), file_size);
+        assert!(received
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte == (index % 251) as u8));
     }
 
     #[test]

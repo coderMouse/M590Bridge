@@ -16,7 +16,7 @@ crates/
   m590-daemon/     # hub：send_file/send_batch、批次暂存或 Windows OLE/Linux FUSE tree 串行惰性流、status、mDNS
     src/linux_virtual_file.rs             # Linux-only 单文件/tree FUSE 元数据、路径安全、逐文件惰性读取与句柄回收
     src/linux_virtual_file_manager.rs     # Linux 单文件/tree 挂载、顶层文件 URI 列表发布、条件替换与清理
-    src/virtual_file_bridge.rs          # 有界网络字节管道、请求启动/排队、消费/释放、取消/超时
+    src/virtual_file_bridge.rs          # 有界网络字节管道、非阻塞背压、请求/消费/释放、取消/超时
     src/windows_virtual_file_manager.rs # Windows STA/OLE 单文件或集合 guard 生命周期（Windows-only）
     examples/linux_virtual_file.rs      # Linux FUSE/Nautilus 按需读取与进度探针
 ui/
