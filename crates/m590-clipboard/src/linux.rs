@@ -10,8 +10,8 @@ use crate::arboard_text::{
     write_text_raw,
 };
 use crate::{
-    file_paths::paths_from_file_list_text, ClipboardBackend, ClipboardError, ClipboardService,
-    ImageClipboard,
+    file_paths::{normalize_file_list_paths, paths_from_file_list_text},
+    ClipboardBackend, ClipboardError, ClipboardService, ImageClipboard,
 };
 use std::io::Read;
 use std::path::PathBuf;
@@ -55,7 +55,8 @@ impl LinuxClipboard {
         let last_image_fp = read_image_raw(&mut clipboard)?
             .as_ref()
             .map(|img| img.fingerprint());
-        let last_files = read_file_list_raw(&mut clipboard).unwrap_or_default();
+        let last_files =
+            normalize_file_list_paths(read_file_list_raw(&mut clipboard).unwrap_or_default());
         Ok(Self {
             backend,
             clipboard,
@@ -161,7 +162,7 @@ impl ClipboardService for LinuxClipboard {
 
 impl LinuxClipboard {
     fn read_file_list_current(&mut self) -> Result<Vec<PathBuf>, ClipboardError> {
-        let arboard_paths = read_file_list_raw(&mut self.clipboard)?;
+        let arboard_paths = normalize_file_list_paths(read_file_list_raw(&mut self.clipboard)?);
         if arboard_paths.len() > 1 || std::env::var_os("WAYLAND_DISPLAY").is_none() {
             return Ok(arboard_paths);
         }

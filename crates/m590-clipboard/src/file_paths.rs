@@ -15,6 +15,33 @@ fn scrub_path_string(s: &str) -> String {
         .to_string()
 }
 
+/// Clean transport artifacts from platform file-list paths without rewriting a
+/// valid path whose name intentionally contains whitespace or control bytes.
+#[cfg(target_os = "linux")]
+pub(crate) fn normalize_file_list_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .map(|path| {
+            if path.exists() {
+                return path;
+            }
+            let Some(raw) = path.to_str() else {
+                return path;
+            };
+            let cleaned = scrub_path_string(raw);
+            if cleaned == raw {
+                return path;
+            }
+            let cleaned_path = PathBuf::from(cleaned);
+            if cleaned_path.exists() {
+                cleaned_path
+            } else {
+                path
+            }
+        })
+        .collect()
+}
+
 /// Directories where bare clipboard filenames (GNOME desktop icon copy) may resolve.
 pub fn file_search_dirs() -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -278,6 +305,24 @@ mod tests {
         let dirty = PathBuf::from(&s);
         assert!(!dirty.is_file());
         assert_eq!(resolve_existing_file(&dirty).as_ref(), Some(&p));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_list_normalization_trims_cr_from_existing_files_and_directories() {
+        let p = temp_file("file-list-cr.txt", b"x");
+        let dir = p.parent().unwrap().join("folder");
+        fs::create_dir(&dir).unwrap();
+        let missing = p.parent().unwrap().join("missing\r");
+        let dirty_file = PathBuf::from(format!("{}\r", p.display()));
+        let dirty_dir = PathBuf::from(format!("{}\r", dir.display()));
+
+        assert_eq!(
+            normalize_file_list_paths(vec![dirty_file, dirty_dir, missing.clone()]),
+            vec![p.clone(), dir, missing]
+        );
+
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 

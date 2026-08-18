@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-18
-> 阶段：task-057 已补齐 Linux GNOME 多路径文本/Wayland MIME 回退，等待 Windows 批次粘贴复测
+> 阶段：task-057 已修复 Linux 多路径末尾 CR 残留及批次失败单文件降级，等待 Windows 批次粘贴复测
 
 ## 目标（近期）
 
@@ -52,7 +52,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 - [ ] **task-057** Windows Explorer 多文件剪贴板粘贴（诊断确认失败样本从未收到批次；
   已将文件管理器多路径/目录 file_list、GNOME 多行文本及 Wayland 原始 MIME 回退改走
-  `FileBatchOffer`，等待端到端复测）
+  `FileBatchOffer`，并修复多路径末尾 `\r` 导致批次扫描失败及错误单文件降级，等待端到端复测）
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
@@ -106,10 +106,11 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 两端拉取同一提交，从发送端文件管理器复制多路径/目录，在 Windows Explorer 粘贴；
-   确认发送端出现 `clipboard_file_list_detected` 或 `clipboard_text_paths_detected` 且随后
-   出现 `clipboard_batch_queued` / `clipboard_batch_queued_from_text`，接收端出现
-   `batch_received entries>1` 及多个 `GetData.lindex`
+1. 两端拉取同一提交，从 Linux 文件管理器复制多路径/目录，在 Windows Explorer 粘贴；
+   确认发送端路径不再带 `\r`，出现 `clipboard_file_list_detected` 或
+   `clipboard_text_paths_detected` 且随后出现 `clipboard_batch_queued` /
+   `clipboard_batch_queued_from_text`，接收端出现 `batch_received entries>1` 及多个
+   `GetData.lindex`
 2. task-057 完成后执行 **task-058**：Linux FUSE 虚拟目录树
 3. 完成 OS 文件管理器多文件/文件夹直接粘贴端到端真机验收
 4. （可选）设置页发现开关 / 本机显示名

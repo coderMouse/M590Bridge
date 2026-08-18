@@ -19,6 +19,8 @@ task-043/044 已验证 Windows 单文件 OLE 虚拟剪贴板与按需网络读�
 
 - `crates/m590-clipboard/src/virtual_file.rs`、`src/windows_virtual_file.rs`、`src/lib.rs`：
   虚拟文件集合描述、OLE `IDataObject` 与公开 API
+- `crates/m590-clipboard/src/file_paths.rs`、`src/linux.rs`：Linux 发送端多路径文件列表解析与
+  Wayland MIME 回退
 - `crates/m590-daemon/src/windows_virtual_file_manager.rs`、`src/virtual_file_bridge.rs`：
   Windows STA 发布与逐文件惰性流桥
 - `crates/m590-daemon/src/hub.rs` 的 Windows 批次接线
@@ -50,9 +52,10 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 
 ## 下一步
 
-- 两端拉取当前提交并运行 `desktop:standalone`；从发送端文件管理器复制包含 2 个顶层
-  文件、嵌套文件和空目录的选择，在 Windows Explorer 粘贴。确认发送端出现
-  `clipboard_batch_queued`，接收端出现 `batch_received entries>1` 和多个 `GetData.lindex`。
+- 两端拉取当前提交并运行 `desktop:standalone`；从 Linux 文件管理器复制包含多个顶层
+  文件和目录的选择，在 Windows Explorer 粘贴。确认发送端路径不再带 `\r` 并出现
+  `clipboard_batch_queued`，接收端出现 `batch_received entries>1` 和多个 `GetData.lindex`；
+  再覆盖嵌套/空目录、取消、替换、断线及重新发送后的再次粘贴。
 
 ## 实施记录
 
@@ -112,6 +115,12 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   或目录统一进入既有 `FileBatchOffer`，单个普通文件仍走原单文件 offer。Wayland 环境在
   `arboard.file_list()` 返回至多一项时，以 500ms 节流直接读取两个原始 MIME，并选择条目数
   更多的完整列表；无 data-control 时仍安全回退到 arboard 与文本路径分支。
+- 2026-08-18：用户提供的 Linux/Windows 同次复测日志确认四根路径被检测到，但
+  `arboard.file_list()` 的各路径末尾残留 `\r`，导致文件/目录计数均为 0、批次首个 `stat`
+  失败；Hub 随后又错误降级为第一个可解析普通文件，所以 Windows 只发布并粘贴了一个
+  空文本文件。Linux 现会在初始化与每次轮询时保守清洗文件列表：仅当原路径不存在、清洗
+  后路径确实存在时替换，避免改写合法路径；需要批次的选择即使扫描失败也不再降级为部分
+  单文件 offer。
 
 ## 修改文件
 
@@ -126,7 +135,7 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   调度、状态和清理；多路径/目录 file_list 自动生成批次并避免接收虚拟批次回传；向
   standalone 透传 task-057 诊断 feature。
 - `crates/m590-clipboard/src/file_paths.rs`、`src/linux.rs`：多行 GNOME 文件选择解析、
-  目录保留、Wayland 原始 MIME 补读与节流缓存。
+  目录保留、Wayland 原始 MIME 补读与节流缓存；清洗 `arboard` 文件列表末尾 CR 残留。
 - `ui/scripts/prepare-standalone.mjs`：standalone 启动前检查固定 Hub 端口，拒绝与旧实例并行。
 - `ui/package.json`、`ui/src-tauri/Cargo.toml`、`ui/src-tauri/src/main.rs`：仅 standalone
   启用 task-057 诊断并在 Windows 显示控制台；正式构建继续使用 windowed subsystem。
@@ -197,23 +206,34 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   与 `cargo check -p m590-daemon --target x86_64-pc-windows-gnu --examples`：通过，无 warning。
 - 本轮兼容修复 `cargo clippy -p m590-clipboard -p m590-daemon --lib --bins --no-deps -- -D warnings`、
   `cargo fmt --all`：通过。
+- 本轮 CR 路径修复 `cargo test -p m590-clipboard`：通过，25 passed；新增测试确认存在的
+  文件/目录会清除末尾 `\r`，不存在的路径保持原样。
+- 本轮 CR 路径修复 `cargo test -p m590-daemon virtual_file_bridge`：通过，5 passed。
+- 本轮 CR 路径修复 `cargo test --workspace`：通过；共 147 个单元测试通过，doc-tests 无失败。
+- 本轮 CR 路径修复 `cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --lib
+  --examples` 与 `cargo check -p m590-daemon --target x86_64-pc-windows-gnu --examples`：通过，
+  无 warning。
+- 本轮 CR 路径修复 `cargo clippy -p m590-clipboard -p m590-daemon --lib --bins --no-deps --
+  -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
 
 ## 文档影响检查
 
-- 已更新：本 task、当前计划、项目入口、协议草案、UI 规格和 Windows 验收命令；
-  本轮为新增 OLE 集合探针同步了项目结构图和真机命令，并补充 standalone 旧实例预检及
-  feature-gated 诊断说明。
-- 无需更新：协议字段、Hub HTTP API、UI 交互、安装器和 Linux FUSE 均未改变。
+- 已更新：本 task、当前计划、`AGENTS.md` 与项目说明，记录 CR 路径根因、禁止批次失败后
+  部分降级及新的真机复测门槛。
+- 历史已更新：协议草案、项目结构图、UI 规格、Windows 验收命令、standalone 旧实例预检
+  与 feature-gated 诊断说明。
+- 无需更新：本轮未改变协议字段、Hub HTTP API、UI 交互、安装器、模块职责或 Linux FUSE。
 
 ## 风险 / blocker
 
 - Windows 10 首轮真机验收已确认多文件/目录行为失败；修复后仍需 Explorer 复测才能
   标记完成。
-- 失败日志已定位到发送端只发布第一项，并已改为 file_list 多路径/目录批次；Windows
-  Explorer 端到端结果仍须真机复测，不能以本机 OLE 探针或交叉编译替代。
+- 失败日志先后定位到发送端只发布第一项，以及多路径末尾 `\r` 使批次扫描失败后又降级为
+  单文件；两处均已修复。Windows Explorer 端到端结果仍须真机复测，不能以本机 OLE 探针
+  或交叉编译替代。
 - Linux Wayland 原始 MIME 补读依赖 compositor 的 data-control；没有该协议时只能依赖
-  arboard/X11 可见内容或多行文本回退，若发送端仍无 `clipboard_file_list_detected` /
-  `clipboard_text_paths_detected`，需保留 Linux 端诊断日志继续确认桌面剪贴板暴露的 MIME。
+  arboard/X11 可见内容或多行文本回退。本轮已修复 arboard 多路径末尾 `\r`，但仍需真机
+  确认发送端进入 `clipboard_batch_queued`，不能用单元测试替代桌面剪贴板行为。
 - 大文件实测为 4.37 MiB/s，应用请求/首块等待只占约 0.26s；源码比较未发现本轮修改传输
   算法。需以同方向 `iperf3` 和本机磁盘读写对照后再决定是否需要吞吐修复。
 - 沿用 task-044 的一次性网络 offer：同一剪贴板 offer 完成后再次 `Ctrl+V` 仍不保证可重开

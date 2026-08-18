@@ -3452,12 +3452,13 @@ fn run_session_loop(
                 if let Ok(Some(paths)) = clip.poll_file_list_change() {
                     latest_clipboard_file_offer_id = None;
                     let mut handled = false;
+                    let requires_batch = file_list_requires_batch(&paths);
                     let file_count = paths.iter().filter(|path| path.is_file()).count();
                     let directory_count = paths.iter().filter(|path| path.is_dir()).count();
                     task_057_diagnostic(format_args!(
                         "clipboard_file_list_detected roots={} files={file_count} directories={directory_count} action={}",
                         paths.len(),
-                        if file_list_requires_batch(&paths) {
+                        if requires_batch {
                             "batch"
                         } else {
                             "single"
@@ -3467,7 +3468,10 @@ fn run_session_loop(
                     // Multiple roots or any directory need a manifest. Keep the existing
                     // bitmap promotion only for one copied image, so mixed/image batches
                     // retain their original file semantics.
-                    if file_list_requires_batch(&paths) {
+                    if requires_batch {
+                        // A batch selection must never degrade into a partial single-file
+                        // offer when scanning fails. Preserve the error and wait for a new copy.
+                        handled = true;
                         let batch_paths = paths
                             .iter()
                             .map(|path| path.to_string_lossy().into_owned())
@@ -3478,7 +3482,6 @@ fn run_session_loop(
                                     "clipboard_batch_queued roots={} files={file_count} directories={directory_count}",
                                     paths.len()
                                 ));
-                                handled = true;
                             }
                             Err(err) => {
                                 task_057_diagnostic(format_args!(
