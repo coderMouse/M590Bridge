@@ -18,6 +18,10 @@ npm run desktop:standalone
 standalone 启动前会检查 Hub 的 `127.0.0.1:5910`，若旧进程仍占用端口则明确失败，避免
 新窗口误连旧版本 Hub 而造成源码修改看似无效。
 
+task-057 排障期间，`desktop:standalone` 会启用同名诊断 feature；Windows 源码运行保留
+控制台并输出 `[task-057]` 批次、OLE 索引和实测速率。NSIS/`desktop:build` 不启用该
+feature，仍保持正式的无控制台行为。
+
 在 Linux 上，该命令还会在用户数据目录刷新隐藏的 `m590-ui.desktop` 应用身份与
 M590Bridge 图标，供 GNOME/Wayland 正确匹配 standalone 窗口。它不会显示新的应用
 菜单入口；不再使用仓库 standalone 时，可删除用户数据目录下的

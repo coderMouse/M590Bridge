@@ -13,6 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 default = []
 custom-protocol = ["tauri/custom-protocol"]
+task-057-diagnostics = ["m590-daemon/task-057-diagnostics"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }

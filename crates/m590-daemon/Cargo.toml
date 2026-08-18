@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "M590Bridge background service binary and embeddable hub"
 
+[features]
+default = []
+task-057-diagnostics = ["m590-clipboard/task-057-diagnostics"]
+
 [lib]
 name = "m590_daemon"
 path = "src/lib.rs"

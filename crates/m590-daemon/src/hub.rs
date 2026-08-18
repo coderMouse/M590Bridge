@@ -56,29 +56,48 @@ const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "windows")]
 const REPLACED_BATCH_REQUEST_GRACE: Duration = Duration::from_secs(2);
 
+#[cfg(all(target_os = "windows", feature = "task-057-diagnostics"))]
+fn task_057_diagnostic(args: std::fmt::Arguments<'_>) {
+    eprintln!("[task-057][hub] {args}");
+}
+
+#[cfg(all(target_os = "windows", not(feature = "task-057-diagnostics")))]
+fn task_057_diagnostic(_args: std::fmt::Arguments<'_>) {}
+
 #[cfg(target_os = "windows")]
 struct WindowsVirtualReceive {
     transfer_id: String,
+    file_name: String,
+    size: u64,
     bridge: VirtualFileBridge,
     producer: PipeProducer,
     requested: bool,
     completed: bool,
     clipboard_replaced: bool,
+    published_at: Instant,
+    requested_at: Option<Instant>,
+    network_started_at: Option<Instant>,
+    first_chunk_at: Option<Instant>,
 }
 
 #[cfg(target_os = "windows")]
 struct WindowsVirtualBatchFile {
+    descriptor_index: usize,
     entry: BatchEntry,
     bridge: VirtualFileBridge,
     producer: PipeProducer,
     requested: bool,
     completed: bool,
+    requested_at: Option<Instant>,
+    network_started_at: Option<Instant>,
+    first_chunk_at: Option<Instant>,
 }
 
 #[cfg(target_os = "windows")]
 struct WindowsVirtualBatchReceive {
     batch_id: String,
     files: Vec<WindowsVirtualBatchFile>,
+    published_at: Instant,
     active_index: Option<usize>,
     completed_files: u32,
     completed_bytes: u64,
@@ -2129,6 +2148,32 @@ fn run_session_loop(
                             entries,
                         } = &file_event
                         {
+                            #[cfg(feature = "task-057-diagnostics")]
+                            {
+                                let file_count = entries
+                                    .iter()
+                                    .filter(|entry| entry.kind == BatchEntryKind::File)
+                                    .count();
+                                let directory_count = entries.len().saturating_sub(file_count);
+                                let total_bytes = entries
+                                    .iter()
+                                    .filter(|entry| entry.kind == BatchEntryKind::File)
+                                    .map(|entry| entry.size)
+                                    .sum::<u64>();
+                                task_057_diagnostic(format_args!(
+                                    "batch_received batch_id={batch_id:?} display_name={display_name:?} entries={} files={file_count} directories={directory_count} total_bytes={total_bytes}",
+                                    entries.len()
+                                ));
+                                for (descriptor_index, entry) in entries.iter().enumerate() {
+                                    task_057_diagnostic(format_args!(
+                                        "batch_entry batch_id={batch_id:?} lindex={descriptor_index} kind={:?} entry_id={:?} path={:?} size={}",
+                                        entry.kind,
+                                        entry.entry_id,
+                                        entry.relative_path,
+                                        entry.size
+                                    ));
+                                }
+                            }
                             cancel_runtime_batch(
                                 &shared,
                                 session,
@@ -2273,6 +2318,22 @@ fn run_session_loop(
                         if let Some(current) = virtual_receive.as_mut() {
                             if let InboundFileResult::Chunk { transfer_id, data } = &file_event {
                                 if current.transfer_id == *transfer_id {
+                                    #[cfg(target_os = "windows")]
+                                    if current.first_chunk_at.is_none() {
+                                        let first_chunk_at = Instant::now();
+                                        current.first_chunk_at = Some(first_chunk_at);
+                                        task_057_diagnostic(format_args!(
+                                            "single_network_first_chunk entry_id={transfer_id:?} path={:?} bytes={} first_byte_ms={}",
+                                            current.file_name,
+                                            data.len(),
+                                            current
+                                                .network_started_at
+                                                .map(|started| first_chunk_at
+                                                    .saturating_duration_since(started)
+                                                    .as_millis())
+                                                .unwrap_or(0)
+                                        ));
+                                    }
                                     if let Err(err) = current.producer.push(data) {
                                         with_status(&shared, |s| {
                                             s.last_error =
@@ -2387,6 +2448,13 @@ fn run_session_loop(
                                         .is_some_and(|v| v.transfer_id == *transfer_id)
                                     {
                                         if let Some(current) = virtual_receive.take() {
+                                            task_057_diagnostic(format_args!(
+                                                "single_network_stream_failed entry_id={transfer_id:?} path={:?} message={message:?} since_publish_ms={}",
+                                                current.file_name,
+                                                Instant::now()
+                                                    .saturating_duration_since(current.published_at)
+                                                    .as_millis()
+                                            ));
                                             current.producer.fail(message.clone());
                                         }
                                         ole_manager.clear();
@@ -2402,6 +2470,36 @@ fn run_session_loop(
                                         .as_mut()
                                         .filter(|current| current.transfer_id == *transfer_id)
                                     {
+                                        let completed_at = Instant::now();
+                                        let network_elapsed =
+                                            current.network_started_at.map(|started| {
+                                                completed_at.saturating_duration_since(started)
+                                            });
+                                        let data_elapsed = current.first_chunk_at.map(|started| {
+                                            completed_at.saturating_duration_since(started)
+                                        });
+                                        let effective_mib_per_second = network_elapsed
+                                            .filter(|elapsed| !elapsed.is_zero())
+                                            .map(|elapsed| {
+                                                *size as f64 / 1_048_576.0 / elapsed.as_secs_f64()
+                                            })
+                                            .unwrap_or(0.0);
+                                        let data_mib_per_second = data_elapsed
+                                            .filter(|elapsed| !elapsed.is_zero())
+                                            .map(|elapsed| {
+                                                *size as f64 / 1_048_576.0 / elapsed.as_secs_f64()
+                                            })
+                                            .unwrap_or(0.0);
+                                        task_057_diagnostic(format_args!(
+                                            "single_network_stream_completed entry_id={transfer_id:?} path={:?} size={size} network_ms={} data_ms={} effective_mib_s={effective_mib_per_second:.2} data_mib_s={data_mib_per_second:.2} since_publish_ms={}",
+                                            current.file_name,
+                                            network_elapsed
+                                                .map_or(0, |elapsed| elapsed.as_millis()),
+                                            data_elapsed.map_or(0, |elapsed| elapsed.as_millis()),
+                                            completed_at
+                                                .saturating_duration_since(current.published_at)
+                                                .as_millis()
+                                        ));
                                         current.producer.finish();
                                         current.completed = true;
                                         with_status(&shared, |s| {
@@ -2693,16 +2791,44 @@ fn run_session_loop(
                     }
                     match event {
                         BridgeEvent::Request => {
+                            let requested_at = Instant::now();
                             current.requested = true;
+                            current.requested_at.get_or_insert(requested_at);
+                            task_057_diagnostic(format_args!(
+                                "single_ole_stream_request entry_id={:?} path={:?} size={} since_publish_ms={}",
+                                current.transfer_id,
+                                current.file_name,
+                                current.size,
+                                requested_at
+                                    .saturating_duration_since(current.published_at)
+                                    .as_millis()
+                            ));
                             if current.completed {
                                 current.producer.finish();
                                 continue;
                             }
+                            let dispatch_started = Instant::now();
                             match session.request_file_stream(current.transfer_id.clone()) {
                                 Ok(QueueFileResult::Queued) => {
                                     conn.send_all(session.take_outbox().iter())
                                         .map_err(|e| e.to_string())?;
+                                    let network_started = Instant::now();
                                     current.producer.start();
+                                    current.network_started_at = Some(network_started);
+                                    task_057_diagnostic(format_args!(
+                                        "single_network_request_sent entry_id={:?} path={:?} request_wait_ms={} dispatch_ms={}",
+                                        current.transfer_id,
+                                        current.file_name,
+                                        current
+                                            .requested_at
+                                            .map(|requested| dispatch_started
+                                                .saturating_duration_since(requested)
+                                                .as_millis())
+                                            .unwrap_or(0),
+                                        network_started
+                                            .saturating_duration_since(dispatch_started)
+                                            .as_millis()
+                                    ));
                                     with_status(&shared, |s| {
                                         s.file_transfer_phase = Some("receiving".into())
                                     });
@@ -2713,9 +2839,23 @@ fn run_session_loop(
                                 Err(err) => current.producer.fail(err.to_string()),
                             }
                         }
-                        BridgeEvent::Consumed => {}
+                        BridgeEvent::Consumed => {
+                            task_057_diagnostic(format_args!(
+                                "single_ole_stream_consumed entry_id={:?} path={:?} since_publish_ms={}",
+                                current.transfer_id,
+                                current.file_name,
+                                Instant::now()
+                                    .saturating_duration_since(current.published_at)
+                                    .as_millis()
+                            ));
+                        }
                         BridgeEvent::Released => {}
                         BridgeEvent::Cancel(reason) => {
+                            task_057_diagnostic(format_args!(
+                                "single_ole_stream_cancel entry_id={:?} path={:?} reason={reason:?}",
+                                current.transfer_id,
+                                current.file_name
+                            ));
                             session
                                 .cancel_file(current.transfer_id.clone(), reason)
                                 .map_err(|e| e.to_string())?;
@@ -2804,14 +2944,45 @@ fn run_session_loop(
                     while let Some(event) = current.files[index].bridge.take_event() {
                         match event {
                             BridgeEvent::Request => {
+                                let now = Instant::now();
+                                let duplicate = current.files[index].requested;
                                 current.files[index].requested = true;
+                                current.files[index].requested_at.get_or_insert(now);
                                 current.clipboard_replaced_idle_since = None;
+                                task_057_diagnostic(format_args!(
+                                    "ole_stream_request batch_id={:?} lindex={} entry_id={:?} path={:?} duplicate={} since_publish_ms={}",
+                                    current.batch_id,
+                                    current.files[index].descriptor_index,
+                                    current.files[index].entry.entry_id,
+                                    current.files[index].entry.relative_path,
+                                    duplicate,
+                                    now.saturating_duration_since(current.published_at).as_millis()
+                                ));
                                 if current.files[index].completed {
                                     current.files[index].producer.finish();
                                 }
                             }
-                            BridgeEvent::Consumed | BridgeEvent::Released => {}
+                            BridgeEvent::Consumed => {
+                                task_057_diagnostic(format_args!(
+                                    "ole_stream_consumed batch_id={:?} lindex={} entry_id={:?} path={:?} since_publish_ms={}",
+                                    current.batch_id,
+                                    current.files[index].descriptor_index,
+                                    current.files[index].entry.entry_id,
+                                    current.files[index].entry.relative_path,
+                                    Instant::now()
+                                        .saturating_duration_since(current.published_at)
+                                        .as_millis()
+                                ));
+                            }
+                            BridgeEvent::Released => {}
                             BridgeEvent::Cancel(reason) => {
+                                task_057_diagnostic(format_args!(
+                                    "ole_stream_cancel batch_id={:?} lindex={} entry_id={:?} path={:?} reason={reason:?}",
+                                    current.batch_id,
+                                    current.files[index].descriptor_index,
+                                    current.files[index].entry.entry_id,
+                                    current.files[index].entry.relative_path
+                                ));
                                 cancel_reason = Some(reason);
                                 break;
                             }
@@ -2835,12 +3006,39 @@ fn run_session_loop(
                 if keep_current && current.active_index.is_none() {
                     if let Some(index) = current.next_requested_index() {
                         let transfer_id = current.files[index].entry.entry_id.clone();
+                        let dispatch_started = Instant::now();
+                        let request_wait_ms = current.files[index]
+                            .requested_at
+                            .map(|requested| {
+                                dispatch_started
+                                    .saturating_duration_since(requested)
+                                    .as_millis()
+                            })
+                            .unwrap_or(0);
+                        task_057_diagnostic(format_args!(
+                            "network_request_dispatch batch_id={:?} lindex={} entry_id={transfer_id:?} path={:?} request_wait_ms={request_wait_ms}",
+                            current.batch_id,
+                            current.files[index].descriptor_index,
+                            current.files[index].entry.relative_path
+                        ));
                         let request_error = match session.request_file_stream(transfer_id) {
                             Ok(QueueFileResult::Queued) => {
                                 conn.send_all(session.take_outbox().iter())
                                     .map_err(|error| error.to_string())?;
+                                let network_started = Instant::now();
                                 current.files[index].producer.start();
+                                current.files[index].network_started_at = Some(network_started);
                                 current.active_index = Some(index);
+                                task_057_diagnostic(format_args!(
+                                    "network_request_sent batch_id={:?} lindex={} entry_id={:?} path={:?} dispatch_ms={}",
+                                    current.batch_id,
+                                    current.files[index].descriptor_index,
+                                    current.files[index].entry.entry_id,
+                                    current.files[index].entry.relative_path,
+                                    network_started
+                                        .saturating_duration_since(dispatch_started)
+                                        .as_millis()
+                                ));
                                 with_status(&shared, |status| {
                                     status.file_transfer_phase = Some("receiving".into());
                                     status.last_file_transfer_id = Some(current.batch_id.clone());
@@ -4321,11 +4519,17 @@ fn prepare_windows_virtual_offer(
         file,
         WindowsVirtualReceive {
             transfer_id: offer.transfer_id.clone(),
+            file_name: offer.file_name.clone(),
+            size: offer.size,
             bridge,
             producer,
             requested: false,
             completed: false,
             clipboard_replaced: false,
+            published_at: Instant::now(),
+            requested_at: None,
+            network_started_at: None,
+            first_chunk_at: None,
         },
     ))
 }
@@ -4363,7 +4567,7 @@ fn prepare_windows_virtual_batch_offer(
 > {
     let mut collection_entries = Vec::with_capacity(offer.entries.len());
     let mut files = Vec::new();
-    for entry in &offer.entries {
+    for (descriptor_index, entry) in offer.entries.iter().enumerate() {
         match entry.kind {
             BatchEntryKind::Directory => {
                 let descriptor =
@@ -4387,11 +4591,15 @@ fn prepare_windows_virtual_batch_offer(
                         .map_err(|error| error.to_string())?,
                 );
                 files.push(WindowsVirtualBatchFile {
+                    descriptor_index,
                     entry: entry.clone(),
                     bridge,
                     producer,
                     requested: false,
                     completed: false,
+                    requested_at: None,
+                    network_started_at: None,
+                    first_chunk_at: None,
                 });
             }
         }
@@ -4403,6 +4611,7 @@ fn prepare_windows_virtual_batch_offer(
         WindowsVirtualBatchReceive {
             batch_id: offer.batch_id.clone(),
             files,
+            published_at: Instant::now(),
             active_index: None,
             completed_files: 0,
             completed_bytes: 0,
@@ -4506,6 +4715,25 @@ fn handle_windows_virtual_batch_stream_event(
             let index = batch
                 .file_index(transfer_id)
                 .expect("matching Windows virtual batch file");
+            if batch.files[index].first_chunk_at.is_none() {
+                let first_chunk_at = Instant::now();
+                batch.files[index].first_chunk_at = Some(first_chunk_at);
+                let first_byte_ms = batch.files[index]
+                    .network_started_at
+                    .map(|started| {
+                        first_chunk_at
+                            .saturating_duration_since(started)
+                            .as_millis()
+                    })
+                    .unwrap_or(0);
+                task_057_diagnostic(format_args!(
+                    "network_first_chunk batch_id={:?} lindex={} entry_id={transfer_id:?} path={:?} bytes={} first_byte_ms={first_byte_ms}",
+                    batch.batch_id,
+                    batch.files[index].descriptor_index,
+                    batch.files[index].entry.relative_path,
+                    data.len()
+                ));
+            }
             let push_error = batch.files[index]
                 .producer
                 .push(data)
@@ -4544,6 +4772,32 @@ fn handle_windows_virtual_batch_stream_event(
             let index = batch
                 .file_index(transfer_id)
                 .expect("matching Windows virtual batch file");
+            let completed_at = Instant::now();
+            let network_elapsed = batch.files[index]
+                .network_started_at
+                .map(|started| completed_at.saturating_duration_since(started));
+            let data_elapsed = batch.files[index]
+                .first_chunk_at
+                .map(|started| completed_at.saturating_duration_since(started));
+            let effective_mib_per_second = network_elapsed
+                .filter(|elapsed| !elapsed.is_zero())
+                .map(|elapsed| *size as f64 / 1_048_576.0 / elapsed.as_secs_f64())
+                .unwrap_or(0.0);
+            let data_mib_per_second = data_elapsed
+                .filter(|elapsed| !elapsed.is_zero())
+                .map(|elapsed| *size as f64 / 1_048_576.0 / elapsed.as_secs_f64())
+                .unwrap_or(0.0);
+            task_057_diagnostic(format_args!(
+                "network_stream_completed batch_id={:?} lindex={} entry_id={transfer_id:?} path={:?} size={size} network_ms={} data_ms={} effective_mib_s={effective_mib_per_second:.2} data_mib_s={data_mib_per_second:.2} batch_elapsed_ms={}",
+                batch.batch_id,
+                batch.files[index].descriptor_index,
+                batch.files[index].entry.relative_path,
+                network_elapsed.map_or(0, |elapsed| elapsed.as_millis()),
+                data_elapsed.map_or(0, |elapsed| elapsed.as_millis()),
+                completed_at
+                    .saturating_duration_since(batch.published_at)
+                    .as_millis()
+            ));
             if !batch.files[index].completed {
                 batch.files[index].producer.finish();
                 batch.files[index].completed = true;
@@ -4580,6 +4834,12 @@ fn handle_windows_virtual_batch_stream_event(
         {
             let failed = receive.take().expect("matching Windows virtual batch");
             let batch_id = failed.batch_id.clone();
+            task_057_diagnostic(format_args!(
+                "network_stream_failed batch_id={batch_id:?} transfer_id={transfer_id:?} message={message:?} batch_elapsed_ms={}",
+                Instant::now()
+                    .saturating_duration_since(failed.published_at)
+                    .as_millis()
+            ));
             cancel_windows_virtual_batch(session, conn, &failed, message)?;
             manager.clear();
             with_status(shared, |status| {

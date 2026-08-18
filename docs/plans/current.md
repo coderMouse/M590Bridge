@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-18
-> 阶段：task-057 无网络 OLE 探针通过，standalone 增加旧 Hub 端口预检后等待干净复测
+> 阶段：task-057 standalone 干净复测仍失败，已加入 OLE/Hub/吞吐链路诊断等待 Windows 日志
 
 ## 目标（近期）
 
@@ -50,8 +50,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 进行中 / 暂停
 
-- [ ] **task-057** Windows Explorer 多文件剪贴板粘贴（OLE 集合探针通过；完整桌面端首次
-  复测无变化，已增加 5910 旧实例预检，Windows 10 待干净复测）
+- [ ] **task-057** Windows Explorer 多文件剪贴板粘贴（OLE 集合探针通过；standalone 在
+  5910 预检版本仍复现，已加入批次清单、`GetData.lindex`、网络调度与实测速率诊断）
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
@@ -105,7 +105,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. Windows 10 从托盘退出全部旧实例后重新运行 standalone，复测 **task-057** 多文件/嵌套目录；通过后继续取消、替换、断线与单文件回归
+1. Windows 10 运行诊断版 standalone，分别复现小型多文件/嵌套目录和一个大文件，回传
+   `[task-057]` 行；据清单、`GetData.lindex`、`FileRequest` 与完成速率定位 **task-057**
 2. task-057 完成后执行 **task-058**：Linux FUSE 虚拟目录树
 3. 完成 OS 文件管理器多文件/文件夹直接粘贴端到端真机验收
 4. （可选）设置页发现开关 / 本机显示名

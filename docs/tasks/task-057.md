@@ -50,9 +50,9 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 
 ## 下一步
 
-- 在 Windows 10 从托盘退出所有旧实例，确认 5910 未占用后重新运行
-  `desktop:standalone`，复测多文件、嵌套目录和空目录；通过后继续取消、替换、断线与
-  单文件回归验收。
+- Windows 10 拉取当前提交后运行 `desktop:standalone`，先复现包含 2 个顶层文件、嵌套
+  文件和空目录的小批次，再用同一个大文件做速度对照；回传完整 `[task-057]` 行，以确认
+  清单、Explorer `lindex`、逐文件网络请求和实际 MiB/s。
 
 ## 实施记录
 
@@ -86,6 +86,14 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   到托盘，且桌面端没有单实例保护；旧 `m590-ui.exe` 可继续占用 5910、持有旧 Hub/剪贴板，
   让新启动进程无法运行其内嵌 Hub。为避免后续误判，在 standalone 的 npm 前置脚本增加
   Hub 端口预检：发现旧实例占用时明确报错并停止启动，不自动终止用户进程。
+- 2026-08-18：用户在带 5910 预检的 standalone 再次复测，行为仍未改善，并反馈传输体感
+  比以前慢；旧实例不是完整解释。检查 `0ee6e65..40504d4` 确认 OLE 枚举和端口预检没有
+  修改文件分块、TCP 缓冲、Session 泵或网络流算法；多文件仍按 task-056 的同连接串行策略。
+- 2026-08-18：为下一次真机复测加入 feature-gated 诊断：打印收到/发布的完整批次清单与
+  descriptor 索引、Explorer `QueryGetData` / `GetData.lindex`、每个 `BridgeEvent::Request`、
+  `FileRequest` 发出、首块延迟、完成耗时与 MiB/s；单文件路径也输出同口径速度，便于与
+  用户之前的大 MP4 对照。`desktop:standalone` 在 Windows 临时保留控制台；普通打包与
+  NSIS 不启用诊断 feature，行为不变。
 
 ## 修改文件
 
@@ -96,8 +104,11 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   嵌套文件、空目录探针。
 - `crates/m590-daemon/src/windows_virtual_file_manager.rs`：STA 线程发布及条件替换集合。
 - `crates/m590-daemon/src/virtual_file_bridge.rs`：网络请求开始前不计算排队流读取超时。
-- `crates/m590-daemon/src/hub.rs`：Windows 批次发布、逐文件惰性请求、串行调度、状态和清理。
+- `crates/m590-daemon/Cargo.toml`、`src/hub.rs`：Windows 批次发布、逐文件惰性请求、串行
+  调度、状态和清理，并向 standalone 透传 task-057 诊断 feature。
 - `ui/scripts/prepare-standalone.mjs`：standalone 启动前检查固定 Hub 端口，拒绝与旧实例并行。
+- `ui/package.json`、`ui/src-tauri/Cargo.toml`、`ui/src-tauri/src/main.rs`：仅 standalone
+  启用 task-057 诊断并在 Windows 显示控制台；正式构建继续使用 windowed subsystem。
 - `ui/README.md`：补充 Windows 托盘退出和旧 Hub 端口占用说明。
 - `docs/domain/protocol-draft.md`、`docs/discovery/project-map.md`、
   `docs/discovery/commands.md`：同步 Windows 批次运行时、模块职责和真机验收步骤。
@@ -135,19 +146,36 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   `already in use`。
 - standalone 空闲端口/Linux 身份准备：通过；在临时数据目录生成 desktop entry 和图标后
   已清理该临时目录。
+- 本轮诊断 `cargo check -p m590-clipboard --target x86_64-pc-windows-gnu --lib --examples
+  --features task-057-diagnostics`：通过。
+- 本轮诊断 `cargo check -p m590-daemon --target x86_64-pc-windows-gnu --lib --bins --examples
+  --features task-057-diagnostics`：通过。
+- 本轮诊断 `cargo clippy -p m590-daemon --target x86_64-pc-windows-gnu --lib --bins --examples
+  --features task-057-diagnostics --no-deps -- -D warnings`：通过，无 warning。
+- `cargo check --manifest-path ui/src-tauri/Cargo.toml --features
+  custom-protocol,task-057-diagnostics`：通过；本机尝试完整 Tauri Windows GNU 交叉检查时因
+  缺少 `x86_64-w64-mingw32-windres` 停在资源构建，Windows 真机构建待本轮复测确认。
+- 本轮诊断 `cargo test -p m590-daemon virtual_file_bridge`：通过，5 passed；
+  `cargo test -p m590-clipboard`：通过，23 passed。
+- 本轮诊断 `cargo test --workspace`：通过，共 144 个单元测试，doc-tests 无失败。
+- 本轮诊断 `npm run lint -- --deny-warnings`、`npm run build`、
+  `node --check scripts/prepare-standalone.mjs`：通过。
 
 ## 文档影响检查
 
 - 已更新：本 task、当前计划、项目入口、协议草案、项目结构图和 Windows 验收命令；
-  本轮为新增 OLE 集合探针同步了项目结构图和真机命令，并补充 standalone 旧实例预检说明。
+  本轮为新增 OLE 集合探针同步了项目结构图和真机命令，并补充 standalone 旧实例预检及
+  feature-gated 诊断说明。
 - 无需更新：协议字段、Hub HTTP API、UI 交互、安装器和 Linux FUSE 均未改变。
 
 ## 风险 / blocker
 
 - Windows 10 首轮真机验收已确认多文件/目录行为失败；修复后仍需 Explorer 复测才能
   标记完成。
-- 无网络 OLE 已通过，当前待确认完整桌面端失败是否仅由托盘旧实例占用 5910 导致；
-  若干净启动仍失败，再依据 standalone 控制台与 Hub 批次日志排查网络接线。
+- 无网络 OLE 已通过且带 5910 预检的 standalone 仍失败；当前必须依据新增的清单、
+  `GetData.lindex` 与网络调度日志判断是批次接线丢项、Explorer 请求差异还是串行调度停滞。
+- 用户反馈速度体感下降，但源码比较未发现本轮修改传输算法；需用新增单文件/批次
+  `effective_mib_s` 与 `data_mib_s` 取得真机事实后再决定是否需要吞吐修复。
 - 沿用 task-044 的一次性网络 offer：同一剪贴板 offer 完成后再次 `Ctrl+V` 仍不保证可重开
   `FILECONTENTS`；本 task 验证“重新发送同批输入后再次粘贴”。若产品要求同一 offer 任意
   次粘贴，需要另建任务扩展发送源保留与重复请求协议生命周期。

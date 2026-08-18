@@ -15,6 +15,9 @@ cd ui && npm run build              # 仅前端
 `desktop:standalone` 使用内嵌前端资源，适合不使用 Web 端的源码运行方式。
 重新构建测试前应先从托盘菜单退出所有旧实例；关闭 Windows 主窗口只会最小化。启动脚本
 会预检 `127.0.0.1:5910`，旧 Hub 仍占用时直接报错，不再启动一个连接不到新 Hub 的窗口。
+task-057 排障期间，该命令还会临时启用 `task-057-diagnostics`；Windows 从源码运行时保留
+控制台并输出 `[task-057]` OLE/批次/速率行。NSIS 与普通 `desktop:build` 不启用该 feature，
+仍为无控制台正式构建。
 Linux 上该命令还会刷新用户级隐藏 `m590-ui.desktop` 与应用图标，供 GNOME/Wayland
 按 `app_id=m590-ui` 显示正确的任务栏图标；具体清理路径见 `ui/README.md`。
 
@@ -146,6 +149,12 @@ cargo run -p m590-clipboard --example windows_virtual_file_collection
 3. 分别在复制中取消、复制中替换 Windows 本机剪贴板、传输中断开连接；Explorer 不应
    永久阻塞，Hub 不应保留活动批次或临时文件。
 4. 重新发送同一批输入后再次粘贴，并回归一个普通单文件的按需粘贴。
+
+当前 standalone 会在 Windows 终端输出 `[task-057][ole]` 与 `[task-057][hub]`。先用
+2 个小文件、1 个嵌套文件和 1 个空目录复现一次，再用同一大文件做单文件速度对照；保留
+从 `batch_received` / `publish_collection` 到 `network_stream_completed` 的所有
+`[task-057]` 行。日志中的 `effective_mib_s` 包含请求到完成的等待，`data_mib_s` 从首块到
+完成，可据此区分网络吞吐下降与文件间调度等待。
 
 同一剪贴板 offer 完成后直接再次 `Ctrl+V` 仍受一次性 offer 限制，不属于本 task 的重复
 发送验收；需要支持时应另建生命周期任务。

@@ -36,6 +36,14 @@ use crate::{ClipboardError, VirtualFile, VirtualFileCollection, VirtualFileColle
 
 const FORMAT_INDEX_NONE: i32 = -1;
 
+#[cfg(feature = "task-057-diagnostics")]
+fn task_057_diagnostic(args: std::fmt::Arguments<'_>) {
+    eprintln!("[task-057][ole] {args}");
+}
+
+#[cfg(not(feature = "task-057-diagnostics"))]
+fn task_057_diagnostic(_args: std::fmt::Arguments<'_>) {}
+
 #[derive(Clone, Copy)]
 struct ClipboardFormats {
     descriptor: u16,
@@ -253,13 +261,38 @@ fn hglobal_medium_from_descriptors(descriptors: &[FILEDESCRIPTORW]) -> Result<ST
 
 impl IDataObject_Impl for VirtualFileDataObject_Impl {
     fn GetData(&self, format: *const FORMATETC) -> Result<STGMEDIUM> {
-        match self
+        #[cfg(feature = "task-057-diagnostics")]
+        if !format.is_null() {
+            let format = unsafe { &*format };
+            task_057_diagnostic(format_args!(
+                "get_data_request cf={} lindex={} tymed=0x{:x}",
+                format.cfFormat, format.lindex, format.tymed
+            ));
+        }
+        let requested = self
             .requested_format(format, false)
-            .map_err(Error::from_hresult)?
-        {
-            RequestedFormat::Descriptor => self.descriptor_medium(),
-            RequestedFormat::PreferredDropEffect => self.preferred_drop_effect_medium(),
-            RequestedFormat::Contents(index) => self.content_medium(index),
+            .map_err(Error::from_hresult)?;
+        match requested {
+            RequestedFormat::Descriptor => {
+                task_057_diagnostic(format_args!(
+                    "get_data kind=descriptor entries={}",
+                    self.collection.entries().len()
+                ));
+                self.descriptor_medium()
+            }
+            RequestedFormat::PreferredDropEffect => {
+                task_057_diagnostic(format_args!("get_data kind=preferred_drop_effect"));
+                self.preferred_drop_effect_medium()
+            }
+            RequestedFormat::Contents(index) => {
+                let entry = &self.collection.entries()[index];
+                task_057_diagnostic(format_args!(
+                    "get_data kind=contents lindex={index} path={:?} size={}",
+                    entry.relative_path(),
+                    entry.size()
+                ));
+                self.content_medium(index)
+            }
             RequestedFormat::ContentsQuery => unreachable!("GetData rejects capability queries"),
         }
     }
@@ -269,7 +302,34 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
     }
 
     fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
-        match self.requested_format(format, true) {
+        let result = self.requested_format(format, true);
+        #[cfg(feature = "task-057-diagnostics")]
+        if !format.is_null() {
+            let format = unsafe { &*format };
+            let outcome = match &result {
+                Ok(RequestedFormat::Descriptor) => "descriptor",
+                Ok(RequestedFormat::Contents(index)) => {
+                    task_057_diagnostic(format_args!(
+                        "query_get_data cf={} lindex={} tymed=0x{:x} outcome=contents path={:?}",
+                        format.cfFormat,
+                        format.lindex,
+                        format.tymed,
+                        self.collection.entries()[*index].relative_path()
+                    ));
+                    "logged"
+                }
+                Ok(RequestedFormat::ContentsQuery) => "contents_query",
+                Ok(RequestedFormat::PreferredDropEffect) => "preferred_drop_effect",
+                Err(_) => "rejected",
+            };
+            if outcome != "logged" {
+                task_057_diagnostic(format_args!(
+                    "query_get_data cf={} lindex={} tymed=0x{:x} outcome={outcome}",
+                    format.cfFormat, format.lindex, format.tymed
+                ));
+            }
+        }
+        match result {
             Ok(_) => S_OK,
             Err(err) => err,
         }
@@ -303,6 +363,9 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
         if direction != DATADIR_GET.0 as u32 {
             return Err(Error::from_hresult(E_NOTIMPL));
         }
+        task_057_diagnostic(format_args!(
+            "enum_format_etc direction=get formats=descriptor,contents_wildcard,preferred_drop_effect"
+        ));
         let formats = self.formats.as_format_etc();
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
     }
@@ -567,6 +630,33 @@ pub fn publish_virtual_file(
 pub fn publish_virtual_file_collection(
     collection: VirtualFileCollection,
 ) -> std::result::Result<VirtualFileClipboard, ClipboardError> {
+    task_057_diagnostic(format_args!(
+        "publish_collection entries={} files={} directories={}",
+        collection.entries().len(),
+        collection
+            .entries()
+            .iter()
+            .filter(|entry| !entry.is_directory())
+            .count(),
+        collection
+            .entries()
+            .iter()
+            .filter(|entry| entry.is_directory())
+            .count()
+    ));
+    #[cfg(feature = "task-057-diagnostics")]
+    for (index, entry) in collection.entries().iter().enumerate() {
+        task_057_diagnostic(format_args!(
+            "descriptor lindex={index} kind={} path={:?} size={}",
+            if entry.is_directory() {
+                "directory"
+            } else {
+                "file"
+            },
+            entry.relative_path(),
+            entry.size()
+        ));
+    }
     unsafe { OleInitialize(None) }.map_err(|err| ClipboardError::Backend(err.to_string()))?;
     let formats = match ClipboardFormats::register() {
         Ok(formats) => formats,
