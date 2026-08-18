@@ -50,8 +50,9 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 
 ## 下一步
 
-- 在 Windows 10 先运行无网络 OLE 集合探针，再重新打包并复测 Explorer 多文件、嵌套目录、
-  空目录与单文件回归；通过后继续取消、替换和断线验收。
+- 在 Windows 10 从托盘退出所有旧实例，确认 5910 未占用后重新运行
+  `desktop:standalone`，复测多文件、嵌套目录和空目录；通过后继续取消、替换、断线与
+  单文件回归验收。
 
 ## 实施记录
 
@@ -80,6 +81,11 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
   `QueryGetData` 接受该能力查询，而 `GetData` 仍只接受 Explorer 提供的具体文件 descriptor
   索引并拒绝目录内容流。新增无网络 Windows 集合探针，固定覆盖两个顶层文件、嵌套文件、
   嵌套空目录和顶层空目录，以便先区分 OLE/Shell 问题与跨机网络调度问题。
+- 2026-08-18：用户确认无网络 OLE 集合探针完整通过，但重新运行
+  `desktop:standalone` 后跨机行为仍无变化。代码核对确认 Windows 关闭主窗口只会最小化
+  到托盘，且桌面端没有单实例保护；旧 `m590-ui.exe` 可继续占用 5910、持有旧 Hub/剪贴板，
+  让新启动进程无法运行其内嵌 Hub。为避免后续误判，在 standalone 的 npm 前置脚本增加
+  Hub 端口预检：发现旧实例占用时明确报错并停止启动，不自动终止用户进程。
 
 ## 修改文件
 
@@ -91,6 +97,8 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 - `crates/m590-daemon/src/windows_virtual_file_manager.rs`：STA 线程发布及条件替换集合。
 - `crates/m590-daemon/src/virtual_file_bridge.rs`：网络请求开始前不计算排队流读取超时。
 - `crates/m590-daemon/src/hub.rs`：Windows 批次发布、逐文件惰性请求、串行调度、状态和清理。
+- `ui/scripts/prepare-standalone.mjs`：standalone 启动前检查固定 Hub 端口，拒绝与旧实例并行。
+- `ui/README.md`：补充 Windows 托盘退出和旧 Hub 端口占用说明。
 - `docs/domain/protocol-draft.md`、`docs/discovery/project-map.md`、
   `docs/discovery/commands.md`：同步 Windows 批次运行时、模块职责和真机验收步骤。
 - `AGENTS.md`、`docs/plans/current.md`、`项目说明.md`、本 task：同步当前阶段与验收边界。
@@ -119,17 +127,27 @@ Windows 10 真机：Explorer 多文件、嵌套文件夹、取消、替换、断
 - 本轮返工 `cargo fmt --all -- --check`、`git diff --check`：通过。
 - 修复后 Windows 10 Explorer：待复测；当前 Linux 环境只能交叉编译，不能代替 Shell/OLE
   行为验证。
+- Windows 10 无网络集合探针：通过；两个顶层文件、嵌套文件和空目录均可粘贴。
+- Windows 10 `desktop:standalone` 首次复测：仍不通过；需排除托盘旧实例/5910 占用后复测。
+- `node --check scripts/prepare-standalone.mjs`、`npm run lint -- --deny-warnings`：通过。
+- `npm run build`：通过；TypeScript 与 Vite production build 完成。
+- standalone 端口占用探测：通过；测试进程占用 5910 时前置脚本非零退出并报告
+  `already in use`。
+- standalone 空闲端口/Linux 身份准备：通过；在临时数据目录生成 desktop entry 和图标后
+  已清理该临时目录。
 
 ## 文档影响检查
 
 - 已更新：本 task、当前计划、项目入口、协议草案、项目结构图和 Windows 验收命令；
-  本轮为新增 OLE 集合探针同步了项目结构图和真机命令。
+  本轮为新增 OLE 集合探针同步了项目结构图和真机命令，并补充 standalone 旧实例预检说明。
 - 无需更新：协议字段、Hub HTTP API、UI 交互、安装器和 Linux FUSE 均未改变。
 
 ## 风险 / blocker
 
 - Windows 10 首轮真机验收已确认多文件/目录行为失败；修复后仍需 Explorer 复测才能
   标记完成。
+- 无网络 OLE 已通过，当前待确认完整桌面端失败是否仅由托盘旧实例占用 5910 导致；
+  若干净启动仍失败，再依据 standalone 控制台与 Hub 批次日志排查网络接线。
 - 沿用 task-044 的一次性网络 offer：同一剪贴板 offer 完成后再次 `Ctrl+V` 仍不保证可重开
   `FILECONTENTS`；本 task 验证“重新发送同批输入后再次粘贴”。若产品要求同一 offer 任意
   次粘贴，需要另建任务扩展发送源保留与重复请求协议生命周期。

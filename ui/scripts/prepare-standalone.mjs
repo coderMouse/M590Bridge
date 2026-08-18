@@ -1,8 +1,40 @@
 import { copyFile, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+
+const hubHost = "127.0.0.1";
+const hubPort = 5910;
+
+async function assertHubPortAvailable() {
+  await new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", (error) => {
+      if (error && typeof error === "object" && error.code === "EADDRINUSE") {
+        reject(
+          new Error(
+            `Hub ${hubHost}:${hubPort} is already in use. Exit every M590Bridge/m590-ui tray process before running desktop:standalone.`,
+          ),
+        );
+        return;
+      }
+      reject(error);
+    });
+    server.listen({ host: hubHost, port: hubPort, exclusive: true }, () => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
+    });
+  });
+}
+
+await assertHubPortAvailable();
 
 if (process.platform !== "linux") {
   process.exit(0);

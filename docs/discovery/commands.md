@@ -13,6 +13,8 @@ cd ui && npm run build              # 仅前端
 内嵌 hub：`http://127.0.0.1:5910`。Tauri WebView 自动取得进程临时令牌，无需手工配置。
 `desktop:dev` 与 `cargo run -p m590-ui` 会加载 `127.0.0.1:5173`，不可作为登录自启目标；
 `desktop:standalone` 使用内嵌前端资源，适合不使用 Web 端的源码运行方式。
+重新构建测试前应先从托盘菜单退出所有旧实例；关闭 Windows 主窗口只会最小化。启动脚本
+会预检 `127.0.0.1:5910`，旧 Hub 仍占用时直接报错，不再启动一个连接不到新 Hub 的窗口。
 Linux 上该命令还会刷新用户级隐藏 `m590-ui.desktop` 与应用图标，供 GNOME/Wayland
 按 `app_id=m590-ui` 显示正确的任务栏图标；具体清理路径见 `ui/README.md`。
 
