@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-19
-> 阶段：task-058 跨机日志定位到首块入管道后同步剪贴板读取阻塞；活跃流所有权轮询修复和 24 MiB 单文件/tree 本地挂载已通过，等待 GNOME/Nautilus 复测
+> 阶段：task-058 的 Windows→Linux 几十 MiB MP4 单文件已通过真机复测；等待含大文件批次及生命周期最终验收
 
 ## 目标（近期）
 
@@ -54,7 +54,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
-- [ ] **task-058** Linux FUSE 虚拟目录树（已修复管道背压，并暂停活跃流期间可能阻塞的 Wayland 剪贴板所有权读取；自动化和 24 MiB 单文件/tree 本地 FUSE smoke 已通过，真机待复测）
+- [ ] **task-058** Linux FUSE 虚拟目录树（几十 MiB MP4 单文件已通过 Windows→Linux 真机复测；含大文件批次及取消、替换、断线待验收）
 
 ## 产品分期对照
 
@@ -86,7 +86,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 发送方 FileComplete → UI done/满进度 | **有**（task-025） |
 | GNOME Wayland 文件管理器复制自动同步 | **受限**（用原生选文件/窗口拖放，task-026/027） |
 | GNOME Wayland 文件 URI 剪贴板发布 | **可行性通过**（task-050；`x11-fallback` 的 `text/uri-list` 可被 Nautilus 粘贴） |
-| Linux FUSE 按需读取 | task-052 的单文件曾真机通过；task-058 已改为非阻塞背压，并暂停活跃流期间的同步剪贴板所有权读取，本地单文件/tree 各 24 MiB 通过，GNOME/Nautilus 跨机待复测 |
+| Linux FUSE 按需读取 | task-058 已改为非阻塞背压并暂停活跃流同步剪贴板读取；本地单文件/tree 各 24 MiB 及 Windows→Linux 几十 MiB MP4 单文件真机复测通过，批次生命周期待验收 |
 | UI 拖入/原生选文件发送 | **有**（task-026/027） |
 | UI 自适应桌面窗口 | **有**（task-034；窄屏底栏、宽屏侧栏/双列） |
 | 托盘菜单文案保活 | **有**（task-053；AppIndicator 挂接后刷新标签，GNOME/Wayland 真机通过） |
@@ -101,8 +101,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 真机复测 **task-058**：先验证 Windows→Linux 的几十 MiB 单文件完整粘贴和传输中断开，再验证多文件/目录
-2. 继续验收 Linux GNOME Wayland + Nautilus 的取消、替换、断线与内容/路径一致性，并据日志收口 task-058
+1. 真机复测 **task-058**：验证多文件中包含大文件以及嵌套/空目录、空文件的内容与路径一致性
+2. 继续验收 Linux GNOME Wayland + Nautilus 的取消、替换、断线与重复粘贴，并据日志收口 task-058
 3. （可选）设置页发现开关 / 本机显示名
 4. 如需发布到非开发用户，另建代码签名/升级机制 task，不改动现有传输协议
 
@@ -112,8 +112,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 > 回归。task-058 已完成 Linux FUSE 虚拟目录树代码、路径安全和 Hub 串行惰性流；首轮
 > 跨机发现的大文件同步管道阻塞已改为非阻塞背压；后续日志确认首个 256 KiB 块已入管道
 > 但主循环未继续读取，现已暂停活跃流期间可能阻塞的 Wayland 剪贴板所有权读取，并再次
-> 通过单文件/tree 各 24 MiB 本地真实挂载校验。GNOME Wayland + Nautilus 跨机复测与
-> 断点续传仍未完成。
+> 通过单文件/tree 各 24 MiB 本地真实挂载校验。用户已确认 Windows→Linux 的几十 MiB
+> MP4 单文件粘贴通过；含大文件批次、取消、替换、断线、重复粘贴与断点续传仍未完成。
 
 ## 用户怎么用
 

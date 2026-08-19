@@ -52,8 +52,8 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 
 ## 下一步
 
-- 两端更新到本次活跃流剪贴板轮询修复后，先复测 Windows→Linux 的几十 MiB 单文件完整粘贴与
-  传输中断开，再执行多文件/目录、取消、替换和断线验收；通过前不完成本 task。
+- 复测多文件中包含大文件以及嵌套/空目录、空文件，再执行取消、替换、断线和重复粘贴；
+  通过前不完成本 task。
 
 ## 实施记录
 
@@ -98,6 +98,9 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 - 2026-08-19：单文件或批次只要已有 FUSE 请求尚未完成网络、消费和句柄释放，就不再从
   session 热循环同步读取剪贴板所有权。活跃传输原本就会在剪贴板替换后继续完成，因此
   取消语义不变；首次请求前和完整释放后仍检查所有权，保留替换与挂载清理。
+- 2026-08-19：用户确认 `55a283d` 后此前卡住的 Windows→Linux 几十 MiB MP4 单文件
+  粘贴通过；首块后停住的单文件回归已解除。该结果不代替含大文件批次和取消、替换、
+  断线、重复粘贴验收。
 
 ## 修改文件
 
@@ -172,6 +175,8 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 - `cargo check --workspace`、`cargo check -p m590-daemon --target x86_64-pc-windows-gnu --lib`、
   `cargo clippy -p m590-daemon --lib --no-deps -- -D warnings`：本轮通过；Windows OLE/wire
   分支未产生交叉编译回归。
+- Linux GNOME Wayland + Nautilus 真机：用户确认 `55a283d` 后 Windows→Linux 几十 MiB
+  MP4 单文件粘贴通过；此前首个 256 KiB 块后停住的问题未再出现。
 
 ## 文档影响检查
 
@@ -183,12 +188,10 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 
 ## 风险 / blocker
 
-- 仍需 Linux GNOME Wayland + Nautilus 真机确认：粘贴多个顶层文件、嵌套/空目录、空文件、
-  大文件、系统进度、取消、替换、断线及重新发送同批输入后再次粘贴；尤其要先确认本轮
-  单文件卡住和无法断开的回归已经消失。
-- 当前缺少活跃流剪贴板轮询修复后的跨机复测；启用 `task-057-diagnostics` 后重点确认
-  `single_network_first_chunk` 后持续出现 `single_network_chunk_pushed`，最终出现
-  `single_network_stream_completed`、`single_virtual_consumed` 和 `single_virtual_release`。
+- 仍需 Linux GNOME Wayland + Nautilus 真机确认：多文件中包含大文件、嵌套/空目录、
+  空文件、取消、替换、断线及重新发送同批输入后再次粘贴，并校验内容和相对路径。
+- 单个大文件回归已通过；批次复测若失败，继续收集 `[task-058][hub]` 的逐文件请求、
+  首块、完成、Consumed/Released/Cancel 事件。
 - 未请求的 offer 现在对一次所有权不一致采取保留策略，因此本地用户在首次粘贴前替换
   剪贴板时，旧挂载可能要等新的远端 offer 或显式取消才清理；跨机复测需覆盖该场景。
 - 沿用 task-044 的一次性网络 offer/reader：同一个 clipboard offer 完成后直接再次
