@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
-> 更新：2026-08-18
-> 阶段：task-058 首轮跨机发现大文件卡住回归；非阻塞背压修复和 24 MiB 单文件/tree 本地挂载已通过，等待 GNOME/Nautilus 复测
+> 更新：2026-08-19
+> 阶段：task-058 跨机日志定位到首块入管道后同步剪贴板读取阻塞；活跃流所有权轮询修复和 24 MiB 单文件/tree 本地挂载已通过，等待 GNOME/Nautilus 复测
 
 ## 目标（近期）
 
@@ -54,7 +54,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
 - [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
 - [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
-- [ ] **task-058** Linux FUSE 虚拟目录树（已修复首轮真机发现的同步管道阻塞；自动化和 24 MiB 单文件/tree 本地 FUSE smoke 已通过，真机待复测）
+- [ ] **task-058** Linux FUSE 虚拟目录树（已修复管道背压，并暂停活跃流期间可能阻塞的 Wayland 剪贴板所有权读取；自动化和 24 MiB 单文件/tree 本地 FUSE smoke 已通过，真机待复测）
 
 ## 产品分期对照
 
@@ -86,7 +86,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 发送方 FileComplete → UI done/满进度 | **有**（task-025） |
 | GNOME Wayland 文件管理器复制自动同步 | **受限**（用原生选文件/窗口拖放，task-026/027） |
 | GNOME Wayland 文件 URI 剪贴板发布 | **可行性通过**（task-050；`x11-fallback` 的 `text/uri-list` 可被 Nautilus 粘贴） |
-| Linux FUSE 按需读取 | task-052 的单文件曾真机通过；task-058 首轮发现大文件回归后已改为非阻塞背压，本地单文件/tree 各 24 MiB 通过，GNOME/Nautilus 跨机待复测 |
+| Linux FUSE 按需读取 | task-052 的单文件曾真机通过；task-058 已改为非阻塞背压，并暂停活跃流期间的同步剪贴板所有权读取，本地单文件/tree 各 24 MiB 通过，GNOME/Nautilus 跨机待复测 |
 | UI 拖入/原生选文件发送 | **有**（task-026/027） |
 | UI 自适应桌面窗口 | **有**（task-034；窄屏底栏、宽屏侧栏/双列） |
 | 托盘菜单文案保活 | **有**（task-053；AppIndicator 挂接后刷新标签，GNOME/Wayland 真机通过） |
@@ -110,8 +110,10 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 > 的 Windows Explorer 多文件剪贴板均已完成两端验收。task-052 已证明 Linux FUSE 单文件
 > 可在 Nautilus 粘贴时通过网络惰性读取并显示系统进度；task-053 已修复 Linux 托盘文字
 > 回归。task-058 已完成 Linux FUSE 虚拟目录树代码、路径安全和 Hub 串行惰性流；首轮
-> 跨机发现的大文件同步管道阻塞已改为非阻塞背压，并通过单文件/tree 各 24 MiB 本地真实
-> 挂载校验。GNOME Wayland + Nautilus 跨机复测与断点续传仍未完成。
+> 跨机发现的大文件同步管道阻塞已改为非阻塞背压；后续日志确认首个 256 KiB 块已入管道
+> 但主循环未继续读取，现已暂停活跃流期间可能阻塞的 Wayland 剪贴板所有权读取，并再次
+> 通过单文件/tree 各 24 MiB 本地真实挂载校验。GNOME Wayland + Nautilus 跨机复测与
+> 断点续传仍未完成。
 
 ## 用户怎么用
 

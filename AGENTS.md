@@ -26,7 +26,7 @@ M590Bridge 是局域网双机剪贴板与文件桥：在 A 电脑复制，用罗
 文本 + 图片 + 单文件流式已在 Linux↔Windows 实机可用（见 `docs/plans/current.md`）。
 **V2 图片/文件、mDNS、Linux `.deb`/登录自启已完成**；Windows NSIS、登录自启、卸载清理与跨机回归已在真机通过（task-042）；task-043 至 task-054 已完成真机验收（无文件夹/断点续传）。
 原 task-019A（收图落盘捷径）已 **cancelled**。  
-用户已确认 task-042 的登录自启、卸载清理与跨机回归通过；task-043 至 task-054 已完成。task-052 已验证 Linux FUSE 单文件在 GNOME Wayland Nautilus 粘贴时通过网络惰性读取、显示系统进度且内容一致；task-053 已修复 Linux 托盘菜单文字回归；task-054 的 Linux `.deb`、Windows NSIS 一键打包与 Windows 成功/异常按键暂停均已验收。task-055 已完成多文件批次清单与路径安全协议基础；task-056 的手动多选/文件夹/拖放、Hub 串行批次、双层进度及 Linux/Windows 跨机交互均已验收。task-057 的无网络 Windows OLE 集合探针及 Windows 10 真机测试均已通过；发送端多路径/目录批次、GNOME 多行文本与 Wayland 原始 MIME 回退，以及 `arboard` 多路径末尾 `\r` 修复均已完成。task-058 已实现 Linux FUSE tree、逐文件网络惰性读取和生命周期；首轮跨机验收发现 Linux 接收几十 MiB 单文件会卡住且 Hub 无法及时断开，现已将 Linux 管道写入改为非阻塞背压，并通过单文件/tree 各 24 MiB 的本地真实挂载校验，等待 GNOME Wayland + Nautilus 跨机复测。不要宣称 Linux Nautilus 已可直接粘贴多文件/文件夹；不复活 019A。
+用户已确认 task-042 的登录自启、卸载清理与跨机回归通过；task-043 至 task-054 已完成。task-052 已验证 Linux FUSE 单文件在 GNOME Wayland Nautilus 粘贴时通过网络惰性读取、显示系统进度且内容一致；task-053 已修复 Linux 托盘菜单文字回归；task-054 的 Linux `.deb`、Windows NSIS 一键打包与 Windows 成功/异常按键暂停均已验收。task-055 已完成多文件批次清单与路径安全协议基础；task-056 的手动多选/文件夹/拖放、Hub 串行批次、双层进度及 Linux/Windows 跨机交互均已验收。task-057 的无网络 Windows OLE 集合探针及 Windows 10 真机测试均已通过；发送端多路径/目录批次、GNOME 多行文本与 Wayland 原始 MIME 回退，以及 `arboard` 多路径末尾 `\r` 修复均已完成。task-058 已实现 Linux FUSE tree、逐文件网络惰性读取和生命周期；跨机日志进一步定位到首个 256 KiB 网络块入管道后，主循环可能被 Wayland 剪贴板所有权读取阻塞，现已在活跃 FUSE 流期间暂停该同步读取，并通过单文件/tree 各 24 MiB 的本地真实挂载校验，等待 GNOME Wayland + Nautilus 跨机复测。不要宣称 Linux Nautilus 已可直接粘贴多文件/文件夹；不复活 019A。
 
 ## 产品边界（默认）
 

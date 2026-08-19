@@ -422,6 +422,16 @@ fn linux_virtual_receive_must_finish(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_virtual_receive_can_poll_clipboard(
+    requested: bool,
+    completed: bool,
+    consumed: bool,
+    released: bool,
+) -> bool {
+    !linux_virtual_receive_must_finish(requested, completed, consumed, released)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_completed_replaced_virtual_receive_can_detach(
     completed: bool,
     consumed: bool,
@@ -3799,7 +3809,19 @@ fn run_session_loop(
                     }
                 }
 
-                if keep_current && !current.clipboard_replaced {
+                // Wayland ownership reads may synchronously request MIME data from the
+                // clipboard provider. Do not run them while Nautilus is blocked on this
+                // network-backed FUSE stream; an active transfer is retained on replacement
+                // anyway, and ownership is checked again after the reader fully releases.
+                if keep_current
+                    && !current.clipboard_replaced
+                    && linux_virtual_receive_can_poll_clipboard(
+                        current.requested,
+                        current.completed,
+                        current.consumed,
+                        current.released,
+                    )
+                {
                     if let Some(clip) = clipboard.as_mut() {
                         match fuse_manager.is_current(clip) {
                             Ok(true) => {}
@@ -3976,7 +3998,7 @@ fn run_session_loop(
                     }
                 }
 
-                if keep_current && !current.clipboard_replaced {
+                if keep_current && !current.clipboard_replaced && !current.must_finish() {
                     if let Some(clip) = clipboard.as_mut() {
                         match fuse_manager.is_current(clip) {
                             Ok(true) => {}
@@ -6688,6 +6710,25 @@ mod tests {
         assert!(linux_virtual_receive_must_finish(true, false, true, true));
         assert!(linux_virtual_receive_must_finish(true, true, true, false));
         assert!(!linux_virtual_receive_must_finish(true, true, true, true));
+    }
+
+    #[test]
+    fn linux_virtual_receive_polls_clipboard_only_outside_active_stream() {
+        assert!(linux_virtual_receive_can_poll_clipboard(
+            false, false, false, false
+        ));
+        assert!(!linux_virtual_receive_can_poll_clipboard(
+            true, false, false, false
+        ));
+        assert!(!linux_virtual_receive_can_poll_clipboard(
+            true, true, false, false
+        ));
+        assert!(!linux_virtual_receive_can_poll_clipboard(
+            true, true, true, false
+        ));
+        assert!(linux_virtual_receive_can_poll_clipboard(
+            true, true, true, true
+        ));
     }
 
     #[test]

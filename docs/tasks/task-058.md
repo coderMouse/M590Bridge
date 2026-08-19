@@ -52,7 +52,7 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 
 ## 下一步
 
-- 两端更新到本次非阻塞背压修复后，先复测 Windows→Linux 的几十 MiB 单文件完整粘贴与
+- 两端更新到本次活跃流剪贴板轮询修复后，先复测 Windows→Linux 的几十 MiB 单文件完整粘贴与
   传输中断开，再执行多文件/目录、取消、替换和断线验收；通过前不完成本 task。
 
 ## 实施记录
@@ -91,6 +91,13 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 - 2026-08-19：修正未收到任何 FUSE `Request` 时的剪贴板所有权检查。Wayland 读取当前
   URI 列表可能短暂返回不一致，单文件/批次现在会保留尚未开始读取的挂载；一旦有文件
   真正请求，仍按原逻辑处理替换、取消和完成后的清理。Windows OLE 分支未改动。
+- 2026-08-19：第二轮跨机日志确认单文件已完成 offer 发布、FUSE 请求、网络请求，首个
+  256 KiB 块也已成功写入管道，但此后没有下一块或完成事件。对照 task-052 与 task-057
+  的变更，主循环仍会在每轮调用 `is_current()`；其 Linux 文件列表读取会进入 task-057
+  新增的 Wayland MIME 同步回退，Nautilus 正在等待 FUSE 数据时可能互相等待。
+- 2026-08-19：单文件或批次只要已有 FUSE 请求尚未完成网络、消费和句柄释放，就不再从
+  session 热循环同步读取剪贴板所有权。活跃传输原本就会在剪贴板替换后继续完成，因此
+  取消语义不变；首次请求前和完整释放后仍检查所有权，保留替换与挂载清理。
 
 ## 修改文件
 
@@ -100,7 +107,8 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
   路径列表发布、条件替换与卸载清理。
 - `crates/m590-daemon/src/hub.rs`：Linux 虚拟批次发布、串行请求、进度、取消、替换、失败
   和延迟 offer 生命周期；本轮新增单文件/批次的非阻塞暂存块与 socket 背压、task-058
-  诊断事件及未请求 offer 的所有权检查保护，Windows OLE 分支未改变行为。
+  诊断事件、未请求 offer 的所有权检查保护，以及活跃流期间的同步所有权轮询暂停；
+  Windows OLE 分支未改变行为。
 - `crates/m590-daemon/src/virtual_file_bridge.rs`：新增整块非阻塞 `try_push`，覆盖容量不足、
   取消即时返回和单文件/tree 24 MiB 真实 FUSE 流测试；原同步 `push` 继续供 Windows 使用。
 - `docs/tasks/task-058.md`、`docs/plans/current.md`、`docs/discovery/project-map.md`、
@@ -150,13 +158,27 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 - `cargo test -p m590-daemon mounted_single_and_tree_stream_large_files_with_nonblocking_backpressure -- --ignored --nocapture`：
   当前环境未通过，测试在创建 FUSE 挂载时返回 `ENOENT`；不是代码断言失败，需在具备可用
   `/dev/fuse` 的 Linux 桌面环境重跑。
+- `cargo test -p m590-daemon linux_virtual -- --nocapture`：本轮通过，17 passed、1 ignored，
+  0 failed；新增“活跃网络/FUSE 流不轮询剪贴板，完整释放后恢复轮询”的状态回归。
+- `cargo test -p m590-daemon virtual_file -- --nocapture`：本轮通过，21 passed、2 ignored，
+  0 failed。
+- `cargo test -p m590-daemon`：本轮通过，daemon lib 69 passed、2 ignored，bin 1 passed，
+  0 failed。
+- `cargo test -p m590-daemon --features task-057-diagnostics linux_virtual -- --nocapture`：
+  本轮通过，17 passed、1 ignored，0 failed。
+- `cargo test -p m590-daemon mounted_single_and_tree_stream_large_files_with_nonblocking_backpressure
+  -- --ignored --nocapture`：本轮通过；真实 FUSE 单文件和 tree 各读取 24 MiB+123 B，逐字节
+  一致，0 failed。此前同日的 `ENOENT` 环境 blocker 已解除。
+- `cargo check --workspace`、`cargo check -p m590-daemon --target x86_64-pc-windows-gnu --lib`、
+  `cargo clippy -p m590-daemon --lib --no-deps -- -D warnings`：本轮通过；Windows OLE/wire
+  分支未产生交叉编译回归。
 
 ## 文档影响检查
 
-- 已更新：本 task，补充 task-058 诊断链路、未请求 offer 的 Wayland 所有权保护和本轮真实
-  验证结果。
-- 无需更新：当前计划、项目结构图、常用命令、Agent 当前阶段与项目说明；任务仍为
-  `in_progress`，没有新增模块、命令、wire 字段或产品能力边界。
+- 已更新：本 task、当前计划、Agent 当前阶段与项目说明，补充首块后停住的真机证据、
+  活跃流剪贴板所有权轮询暂停和本轮真实验证结果。
+- 无需更新：项目结构图和常用命令；任务仍为 `in_progress`，没有新增模块、命令、wire
+  字段或产品能力边界。
 - 无需更新：协议 wire 字段、Hub HTTP API、UI 交互、Windows OLE、安装器与自启均未改变。
 
 ## 风险 / blocker
@@ -164,9 +186,9 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 - 仍需 Linux GNOME Wayland + Nautilus 真机确认：粘贴多个顶层文件、嵌套/空目录、空文件、
   大文件、系统进度、取消、替换、断线及重新发送同批输入后再次粘贴；尤其要先确认本轮
   单文件卡住和无法断开的回归已经消失。
-- 当前缺少本轮跨机复测日志；启用 `task-057-diagnostics` 后重点收集 `[task-058][hub]`
-  事件，确认是否出现 `single_fuse_request`、`single_network_request_sent` 和
-  `single_network_first_chunk`。
+- 当前缺少活跃流剪贴板轮询修复后的跨机复测；启用 `task-057-diagnostics` 后重点确认
+  `single_network_first_chunk` 后持续出现 `single_network_chunk_pushed`，最终出现
+  `single_network_stream_completed`、`single_virtual_consumed` 和 `single_virtual_release`。
 - 未请求的 offer 现在对一次所有权不一致采取保留策略，因此本地用户在首次粘贴前替换
   剪贴板时，旧挂载可能要等新的远端 offer 或显式取消才清理；跨机复测需覆盖该场景。
 - 沿用 task-044 的一次性网络 offer/reader：同一个 clipboard offer 完成后直接再次
