@@ -107,7 +107,7 @@ export function SettingsScreen({ dark }: { dark?: boolean }) {
         </Section>
 
         <Section title="关于" dark={dark}>
-          <Row label="版本" value="0.1.0" dark={dark} />
+          <Row label="版本" value="0.1.1" dark={dark} />
           <Row label="开源许可" dark={dark} last />
         </Section>
       </div>

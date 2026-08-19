@@ -101,6 +101,8 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 - 2026-08-19：用户确认 `55a283d` 后此前卡住的 Windows→Linux 几十 MiB MP4 单文件
   粘贴通过；首块后停住的单文件回归已解除。该结果不代替含大文件批次和取消、替换、
   断线、重复粘贴验收。
+- 2026-08-19：按用户要求把应用补丁版本从 `0.1.0` 统一递增到 `0.1.1`；同步 Rust
+  工作区、Tauri、npm 锁文件和设置页显示，不改变协议版本或 task-058 验收状态。
 
 ## 修改文件
 
@@ -116,6 +118,9 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
   取消即时返回和单文件/tree 24 MiB 真实 FUSE 流测试；原同步 `push` 继续供 Windows 使用。
 - `docs/tasks/task-058.md`、`docs/plans/current.md`、`docs/discovery/project-map.md`、
   `docs/discovery/commands.md`、`AGENTS.md`、`项目说明.md`：同步实现状态、验证命令和真机边界。
+- `Cargo.toml`、`Cargo.lock`、`ui/package.json`、`ui/package-lock.json`、
+  `ui/src-tauri/Cargo.toml`、`ui/src-tauri/tauri.conf.json`、
+  `ui/src/screens/SettingsScreen.tsx`：统一发布版本及界面显示为 `0.1.1`。
 
 ## 验证结果
 
@@ -177,6 +182,13 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
   分支未产生交叉编译回归。
 - Linux GNOME Wayland + Nautilus 真机：用户确认 `55a283d` 后 Windows→Linux 几十 MiB
   MP4 单文件粘贴通过；此前首个 256 KiB 块后停住的问题未再出现。
+- `cargo check --workspace`：版本递增后通过；`m590-core`、`m590-clipboard`、`m590-net`、
+  `m590-daemon`、`m590-ui` 均解析并构建为 `0.1.1`。
+- `npm run build`：通过；以 `m590-ui@0.1.1` 完成 TypeScript 和 Vite production build。
+- `cargo test -p m590-daemon linux_virtual -- --nocapture`：通过，17 passed、1 ignored，
+  0 failed。
+- `cargo check -p m590-daemon --target x86_64-pc-windows-gnu --lib`、
+  `cargo fmt --all -- --check`：通过。
 
 ## 文档影响检查
 
@@ -185,6 +197,8 @@ Linux GNOME/Wayland + Nautilus 真机：浏览嵌套目录、粘贴多个文件�
 - 无需更新：项目结构图和常用命令；任务仍为 `in_progress`，没有新增模块、命令、wire
   字段或产品能力边界。
 - 无需更新：协议 wire 字段、Hub HTTP API、UI 交互、Windows OLE、安装器与自启均未改变。
+- 已更新：本 task 记录 `0.1.1` 版本递增和真实验证；无需更新当前计划、历史产物记录及
+  其它规格，因为能力边界、任务状态、协议版本和构建命令均未改变。
 
 ## 风险 / blocker
 
