@@ -64,6 +64,16 @@ fn task_057_diagnostic(args: std::fmt::Arguments<'_>) {
 #[cfg(not(feature = "task-057-diagnostics"))]
 fn task_057_diagnostic(_args: std::fmt::Arguments<'_>) {}
 
+#[cfg(feature = "task-057-diagnostics")]
+#[allow(dead_code)]
+fn task_058_diagnostic(args: std::fmt::Arguments<'_>) {
+    eprintln!("[task-058][hub] {args}");
+}
+
+#[cfg(not(feature = "task-057-diagnostics"))]
+#[allow(dead_code)]
+fn task_058_diagnostic(_args: std::fmt::Arguments<'_>) {}
+
 #[cfg(target_os = "windows")]
 struct WindowsVirtualReceive {
     transfer_id: String,
@@ -158,6 +168,9 @@ struct LinuxVirtualReceive {
     consumed: bool,
     released: bool,
     clipboard_replaced: bool,
+    published_at: Instant,
+    network_started_at: Option<Instant>,
+    first_chunk_at: Option<Instant>,
 }
 
 #[cfg(target_os = "linux")]
@@ -190,6 +203,7 @@ struct LinuxVirtualBatchFile {
     completed: bool,
     consumed: bool,
     released: bool,
+    first_chunk_seen: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -219,6 +233,10 @@ impl LinuxVirtualBatchReceive {
                 file.released,
             )
         })
+    }
+
+    fn has_requested_file(&self) -> bool {
+        self.files.iter().any(|file| file.requested)
     }
 
     fn is_complete(&self) -> bool {
@@ -2454,6 +2472,19 @@ fn run_session_loop(
                             entries,
                         } = &file_event
                         {
+                            let file_count = entries
+                                .iter()
+                                .filter(|entry| entry.kind == BatchEntryKind::File)
+                                .count();
+                            let total_bytes = entries
+                                .iter()
+                                .filter(|entry| entry.kind == BatchEntryKind::File)
+                                .map(|entry| entry.size)
+                                .sum::<u64>();
+                            task_058_diagnostic(format_args!(
+                                "batch_virtual_offer_received batch_id={batch_id:?} entries={} files={file_count} total_bytes={total_bytes}",
+                                entries.len()
+                            ));
                             cancel_runtime_batch(
                                 &shared,
                                 session,
@@ -2551,6 +2582,10 @@ fn run_session_loop(
                                     });
                                 match published {
                                     Ok(receive) => {
+                                        task_058_diagnostic(format_args!(
+                                            "batch_virtual_offer_published batch_id={batch_id:?} entries={} files={file_count} total_bytes={total_bytes}",
+                                            entries.len()
+                                        ));
                                         virtual_batch_receive = Some(receive);
                                         mark_linux_virtual_batch_offer(&shared, &next);
                                     }
@@ -2652,9 +2687,37 @@ fn run_session_loop(
                                         });
                                     }
                                     #[cfg(target_os = "linux")]
+                                    if current.first_chunk_at.is_none() {
+                                        let first_chunk_at = Instant::now();
+                                        current.first_chunk_at = Some(first_chunk_at);
+                                        task_058_diagnostic(format_args!(
+                                            "single_network_first_chunk entry_id={transfer_id:?} bytes={} first_byte_ms={}",
+                                            data.len(),
+                                            current
+                                                .network_started_at
+                                                .map(|started| first_chunk_at
+                                                    .saturating_duration_since(started)
+                                                    .as_millis())
+                                                .unwrap_or(0)
+                                        ));
+                                    }
+                                    #[cfg(target_os = "linux")]
                                     match current.producer.try_push(data) {
-                                        Ok(true) => {}
+                                        Ok(true) => {
+                                            if current.first_chunk_at.is_some_and(|started| {
+                                                started.elapsed() < Duration::from_secs(1)
+                                            }) {
+                                                task_058_diagnostic(format_args!(
+                                                    "single_network_chunk_pushed entry_id={transfer_id:?} bytes={}",
+                                                    data.len()
+                                                ));
+                                            }
+                                        }
                                         Ok(false) => {
+                                            task_058_diagnostic(format_args!(
+                                                "single_network_chunk_backpressured entry_id={transfer_id:?} bytes={}",
+                                                data.len()
+                                            ));
                                             pending_virtual_chunk =
                                                 Some(PendingLinuxVirtualChunk {
                                                     transfer_id: transfer_id.clone(),
@@ -2662,6 +2725,10 @@ fn run_session_loop(
                                                 });
                                         }
                                         Err(error) => {
+                                            task_058_diagnostic(format_args!(
+                                                "single_network_chunk_push_error entry_id={transfer_id:?} bytes={} error={error}",
+                                                data.len()
+                                            ));
                                             with_status(&shared, |status| {
                                                 status.last_error =
                                                     Some(format!("virtual file stream: {error}"));
@@ -2881,6 +2948,9 @@ fn run_session_loop(
                                     file_name,
                                     size,
                                 } => {
+                                    task_058_diagnostic(format_args!(
+                                        "single_virtual_offer_received entry_id={transfer_id:?} path={file_name:?} size={size}"
+                                    ));
                                     let next = DeferredVirtualOffer {
                                         transfer_id: transfer_id.clone(),
                                         file_name: file_name.clone(),
@@ -2973,6 +3043,9 @@ fn run_session_loop(
                                             });
                                         match published {
                                             Ok(receive) => {
+                                                task_058_diagnostic(format_args!(
+                                                    "single_virtual_offer_published entry_id={transfer_id:?} path={file_name:?} size={size}"
+                                                ));
                                                 virtual_receive = Some(receive);
                                                 mark_virtual_offer(&shared, &next);
                                             }
@@ -3025,6 +3098,24 @@ fn run_session_loop(
                                         .as_mut()
                                         .filter(|current| current.transfer_id == *transfer_id)
                                     {
+                                        task_058_diagnostic(format_args!(
+                                            "single_network_stream_completed entry_id={transfer_id:?} size={size} network_ms={} data_ms={} since_publish_ms={}",
+                                            current
+                                                .network_started_at
+                                                .map(|started| Instant::now()
+                                                    .saturating_duration_since(started)
+                                                    .as_millis())
+                                                .unwrap_or(0),
+                                            current
+                                                .first_chunk_at
+                                                .map(|started| Instant::now()
+                                                    .saturating_duration_since(started)
+                                                    .as_millis())
+                                                .unwrap_or(0),
+                                            Instant::now()
+                                                .saturating_duration_since(current.published_at)
+                                                .as_millis()
+                                        ));
                                         current.producer.finish();
                                         current.completed = true;
                                         with_status(&shared, |s| {
@@ -3628,6 +3719,14 @@ fn run_session_loop(
                     }
                     match event {
                         BridgeEvent::Request => {
+                            let requested_at = Instant::now();
+                            task_058_diagnostic(format_args!(
+                                "single_fuse_request entry_id={:?} since_publish_ms={}",
+                                current.transfer_id,
+                                requested_at
+                                    .saturating_duration_since(current.published_at)
+                                    .as_millis()
+                            ));
                             current.requested = true;
                             if current.completed {
                                 current.producer.finish();
@@ -3638,6 +3737,17 @@ fn run_session_loop(
                                     conn.send_all(session.take_outbox().iter())
                                         .map_err(|e| e.to_string())?;
                                     current.producer.start();
+                                    current.network_started_at = Some(Instant::now());
+                                    task_058_diagnostic(format_args!(
+                                        "single_network_request_sent entry_id={:?} request_dispatch_ms={}",
+                                        current.transfer_id,
+                                        current
+                                            .network_started_at
+                                            .map(|started| started
+                                                .saturating_duration_since(requested_at)
+                                                .as_millis())
+                                            .unwrap_or(0)
+                                    ));
                                     with_status(&shared, |s| {
                                         s.file_transfer_phase = Some("receiving".into())
                                     });
@@ -3648,9 +3758,31 @@ fn run_session_loop(
                                 Err(err) => current.producer.fail(err.to_string()),
                             }
                         }
-                        BridgeEvent::Consumed => current.consumed = true,
-                        BridgeEvent::Released => current.released = true,
+                        BridgeEvent::Consumed => {
+                            current.consumed = true;
+                            task_058_diagnostic(format_args!(
+                                "single_virtual_consumed entry_id={:?} since_publish_ms={}",
+                                current.transfer_id,
+                                Instant::now()
+                                    .saturating_duration_since(current.published_at)
+                                    .as_millis()
+                            ));
+                        }
+                        BridgeEvent::Released => {
+                            current.released = true;
+                            task_058_diagnostic(format_args!(
+                                "single_virtual_release entry_id={:?} since_publish_ms={}",
+                                current.transfer_id,
+                                Instant::now()
+                                    .saturating_duration_since(current.published_at)
+                                    .as_millis()
+                            ));
+                        }
                         BridgeEvent::Cancel(reason) => {
+                            task_058_diagnostic(format_args!(
+                                "single_virtual_cancel entry_id={:?} reason={reason:?}",
+                                current.transfer_id
+                            ));
                             session
                                 .cancel_file(current.transfer_id.clone(), reason.clone())
                                 .map_err(|e| e.to_string())?;
@@ -3672,7 +3804,20 @@ fn run_session_loop(
                         match fuse_manager.is_current(clip) {
                             Ok(true) => {}
                             Ok(false) => {
-                                if linux_virtual_receive_must_finish(
+                                task_058_diagnostic(format_args!(
+                                    "single_clipboard_not_current entry_id={:?} requested={} completed={} consumed={} released={}",
+                                    current.transfer_id,
+                                    current.requested,
+                                    current.completed,
+                                    current.consumed,
+                                    current.released
+                                ));
+                                if !current.requested {
+                                    task_058_diagnostic(format_args!(
+                                        "single_clipboard_not_current_before_request_kept entry_id={:?}",
+                                        current.transfer_id
+                                    ));
+                                } else if linux_virtual_receive_must_finish(
                                     current.requested,
                                     current.completed,
                                     current.consumed,
@@ -3694,8 +3839,10 @@ fn run_session_loop(
                                     fuse_manager.clear();
                                     keep_current = false;
                                 }
-                                discard_deferred = true;
-                                latest_clipboard_file_offer_id = None;
+                                if current.requested {
+                                    discard_deferred = true;
+                                    latest_clipboard_file_offer_id = None;
+                                }
                             }
                             Err(error) => {
                                 with_status(&shared, |s| {
@@ -3739,13 +3886,36 @@ fn run_session_loop(
                         match event {
                             BridgeEvent::Request => {
                                 current.files[index].requested = true;
+                                task_058_diagnostic(format_args!(
+                                    "batch_fuse_request batch_id={:?} path={:?} entry_id={:?}",
+                                    current.batch_id,
+                                    current.files[index].entry.relative_path,
+                                    current.files[index].entry.entry_id
+                                ));
                                 if current.files[index].completed {
                                     current.files[index].producer.finish();
                                 }
                             }
-                            BridgeEvent::Consumed => current.files[index].consumed = true,
-                            BridgeEvent::Released => current.files[index].released = true,
+                            BridgeEvent::Consumed => {
+                                current.files[index].consumed = true;
+                                task_058_diagnostic(format_args!(
+                                    "batch_virtual_consumed batch_id={:?} path={:?}",
+                                    current.batch_id, current.files[index].entry.relative_path
+                                ));
+                            }
+                            BridgeEvent::Released => {
+                                current.files[index].released = true;
+                                task_058_diagnostic(format_args!(
+                                    "batch_virtual_release batch_id={:?} path={:?}",
+                                    current.batch_id, current.files[index].entry.relative_path
+                                ));
+                            }
                             BridgeEvent::Cancel(reason) => {
+                                task_058_diagnostic(format_args!(
+                                    "batch_virtual_cancel batch_id={:?} path={:?} reason={reason:?}",
+                                    current.batch_id,
+                                    current.files[index].entry.relative_path
+                                ));
                                 cancel_reason = Some(reason);
                                 break;
                             }
@@ -3769,12 +3939,17 @@ fn run_session_loop(
                 if keep_current && current.active_index.is_none() {
                     if let Some(index) = current.next_requested_index() {
                         let transfer_id = current.files[index].entry.entry_id.clone();
-                        let request_error = match session.request_file_stream(transfer_id) {
+                        let request_error = match session.request_file_stream(transfer_id.clone()) {
                             Ok(QueueFileResult::Queued) => {
                                 conn.send_all(session.take_outbox().iter())
                                     .map_err(|error| error.to_string())?;
                                 current.files[index].producer.start();
                                 current.active_index = Some(index);
+                                task_058_diagnostic(format_args!(
+                                    "batch_network_request_sent batch_id={:?} path={:?} entry_id={transfer_id:?}",
+                                    current.batch_id,
+                                    current.files[index].entry.relative_path
+                                ));
                                 with_status(&shared, |status| {
                                     status.file_transfer_phase = Some("receiving".into());
                                     status.last_file_transfer_id = Some(current.batch_id.clone());
@@ -3806,7 +3981,12 @@ fn run_session_loop(
                         match fuse_manager.is_current(clip) {
                             Ok(true) => {}
                             Ok(false) => {
-                                if current.must_finish() {
+                                if !current.has_requested_file() {
+                                    task_058_diagnostic(format_args!(
+                                        "batch_clipboard_not_current_before_request_kept batch_id={:?}",
+                                        current.batch_id
+                                    ));
+                                } else if current.must_finish() {
                                     current.clipboard_replaced = true;
                                 } else {
                                     cancel_linux_virtual_batch(
@@ -3825,8 +4005,10 @@ fn run_session_loop(
                                     });
                                     keep_current = false;
                                 }
-                                discard_deferred = true;
-                                latest_clipboard_file_offer_id = None;
+                                if current.has_requested_file() {
+                                    discard_deferred = true;
+                                    latest_clipboard_file_offer_id = None;
+                                }
                             }
                             Err(error) => {
                                 with_status(&shared, |status| {
@@ -3886,6 +4068,10 @@ fn run_session_loop(
                         });
                     match published {
                         Ok(receive) => {
+                            task_058_diagnostic(format_args!(
+                                "single_virtual_offer_published entry_id={:?} path={:?} size={}",
+                                next.transfer_id, next.file_name, next.size
+                            ));
                             virtual_receive = Some(receive);
                             mark_virtual_offer(&shared, &next);
                         }
@@ -5668,6 +5854,7 @@ fn prepare_linux_virtual_batch_offer(
                     completed: false,
                     consumed: false,
                     released: false,
+                    first_chunk_seen: false,
                 });
             }
         }
@@ -5780,9 +5967,24 @@ fn handle_linux_virtual_batch_stream_event(
             let index = batch
                 .file_index(transfer_id)
                 .expect("matching Linux virtual batch file");
+            if !batch.files[index].first_chunk_seen {
+                batch.files[index].first_chunk_seen = true;
+                task_058_diagnostic(format_args!(
+                    "batch_network_first_chunk batch_id={:?} path={:?} entry_id={transfer_id:?} bytes={}",
+                    batch.batch_id,
+                    batch.files[index].entry.relative_path,
+                    data.len()
+                ));
+            }
             let (push_error, pending_chunk) = match batch.files[index].producer.try_push(data) {
                 Ok(true) => (None, None),
                 Ok(false) => {
+                    task_058_diagnostic(format_args!(
+                        "batch_network_chunk_backpressured batch_id={:?} path={:?} entry_id={transfer_id:?} bytes={}",
+                        batch.batch_id,
+                        batch.files[index].entry.relative_path,
+                        data.len()
+                    ));
                     let pending = PendingLinuxVirtualChunk {
                         transfer_id: transfer_id.clone(),
                         data: data.clone(),
@@ -5790,6 +5992,12 @@ fn handle_linux_virtual_batch_stream_event(
                     (None, Some(pending))
                 }
                 Err(error) => {
+                    task_058_diagnostic(format_args!(
+                        "batch_network_chunk_push_error batch_id={:?} path={:?} entry_id={transfer_id:?} bytes={} error={error}",
+                        batch.batch_id,
+                        batch.files[index].entry.relative_path,
+                        data.len()
+                    ));
                     let pending = PendingLinuxVirtualChunk {
                         transfer_id: transfer_id.clone(),
                         data: data.clone(),
@@ -5833,6 +6041,11 @@ fn handle_linux_virtual_batch_stream_event(
             let index = batch
                 .file_index(transfer_id)
                 .expect("matching Linux virtual batch file");
+            task_058_diagnostic(format_args!(
+                "batch_network_stream_completed batch_id={:?} path={:?} entry_id={transfer_id:?} size={size}",
+                batch.batch_id,
+                batch.files[index].entry.relative_path
+            ));
             if !batch.files[index].completed {
                 batch.files[index].producer.finish();
                 batch.files[index].completed = true;
@@ -5981,6 +6194,9 @@ fn prepare_linux_virtual_offer(
             consumed: false,
             released: false,
             clipboard_replaced: false,
+            published_at: Instant::now(),
+            network_started_at: None,
+            first_chunk_at: None,
         },
     ))
 }
@@ -6506,6 +6722,9 @@ mod tests {
             consumed: false,
             released: false,
             clipboard_replaced: false,
+            published_at: Instant::now(),
+            network_started_at: None,
+            first_chunk_at: None,
         };
 
         assert_eq!(
@@ -6547,9 +6766,11 @@ mod tests {
             .all(|file| file.bridge.take_event().is_none()));
         assert_eq!(receive.next_requested_index(), None);
         assert!(!receive.must_finish());
+        assert!(!receive.has_requested_file());
 
         receive.files[1].requested = true;
         assert_eq!(receive.next_requested_index(), Some(1));
+        assert!(receive.has_requested_file());
         assert!(receive.must_finish());
         receive.files[1].completed = true;
         receive.files[1].consumed = true;
