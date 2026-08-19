@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-19
-> 阶段：task-058 的 Windows→Linux 几十 MiB MP4 单文件已通过真机复测；等待含大文件批次及生命周期最终验收
+> 阶段：task-058 Linux FUSE 虚拟目录树已完成 GNOME Wayland + Nautilus 跨机验收
 
 ## 目标（近期）
 
@@ -48,13 +48,11 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-055** 多文件批次清单与路径安全基础（type 16；仅协议模型与本地验证）
 - [x] **task-056** 多文件选择、目录扫描与串行批次传输（Linux/Windows 桌面交互与跨机验收通过）
 - [x] **task-057** Windows Explorer 多文件剪贴板粘贴（用户确认 Windows 真机测试通过）
+- [x] **task-058** Linux FUSE 虚拟目录树（大文件批次、目录树及生命周期真机验收通过）
 
 ## 进行中 / 暂停
 
-- [x] Linux↔Windows 对 task-036 做同文件、同网络实机复测（用户确认：两边可复制文件）
-- [x] **task-040** 修复 Linux 内嵌 Hub 持续离线提示
-- [x] **task-041** 桌面壳经 IPC 访问内嵌 Hub（修复仍不可达）
-- [ ] **task-058** Linux FUSE 虚拟目录树（几十 MiB MP4 单文件已通过 Windows→Linux 真机复测；含大文件批次及取消、替换、断线待验收）
+- 无。
 
 ## 产品分期对照
 
@@ -62,7 +60,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 |--------|------|------|
 | MVP | 配对 + 文本 | **已完成** |
 | V2 · 图片 | 图片剪贴板双向 | **已完成** |
-| V2 · 文件 | 元数据 + 按需 + 进度 + 流式 | **单文件 OS 粘贴、手动多文件/目录批次及 Windows OS 多文件/目录粘贴已完成**；Linux 目录树已实现并通过本地挂载 smoke，真机与断点续传未完成 |
+| V2 · 文件 | 元数据 + 按需 + 进度 + 流式 | **Linux/Windows 单文件及多文件/目录 OS 粘贴均已完成真机验收**；断点续传未实现 |
 | V3 · mDNS | 局域网发现 | **第一刀完成**（task-029） |
 | V3 · 安装 | 安装包/自启 | **Linux `.deb` + 用户登录自启、Windows NSIS + HKCU 自启均完成**；均为当前用户安装，未签名 |
 
@@ -79,14 +77,14 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 | 多文件/目录手动批次 | **真机验收通过**（task-056；原生多选/目录/拖放、安全扫描、串行传输、整批暂存发布、双层进度/取消） |
 | hub 自动落盘 + send_file(_bytes) | 有 |
 | UI 选文件发送 + 进度 + 保存目录 | **有** |
-| 文件夹 / OS 文件剪贴板 | 手动文件夹批次与 Windows Explorer 多文件/目录已通过；Linux FUSE tree 已实现并通过本地挂载 smoke，Nautilus 跨机待验收 |
+| 文件夹 / OS 文件剪贴板 | 手动文件夹批次及 Windows Explorer、Linux Nautilus 多文件/目录均已真机验收通过 |
 | 大文件流式（磁盘流+SHA-256，软上限 8GiB） | **有**（task-033；同连接串行；task-036 已移除固定批次节流和多帧累计误判） |
 | file_list 触发原文件 offer（非图片，路径流式） | **有**；单文件走原 offer，多路径/目录走批次，Windows Explorer 验收通过 |
 | 路径文本（非图片）→ file offer | **有**（task-025） |
 | 发送方 FileComplete → UI done/满进度 | **有**（task-025） |
 | GNOME Wayland 文件管理器复制自动同步 | **受限**（用原生选文件/窗口拖放，task-026/027） |
 | GNOME Wayland 文件 URI 剪贴板发布 | **可行性通过**（task-050；`x11-fallback` 的 `text/uri-list` 可被 Nautilus 粘贴） |
-| Linux FUSE 按需读取 | task-058 已改为非阻塞背压并暂停活跃流同步剪贴板读取；本地单文件/tree 各 24 MiB 及 Windows→Linux 几十 MiB MP4 单文件真机复测通过，批次生命周期待验收 |
+| Linux FUSE 按需读取 | **task-058 已完成**；单文件/tree 本地真实挂载及 GNOME Wayland + Nautilus 大文件批次、目录树和生命周期跨机验收通过 |
 | UI 拖入/原生选文件发送 | **有**（task-026/027） |
 | UI 自适应桌面窗口 | **有**（task-034；窄屏底栏、宽屏侧栏/双列） |
 | 托盘菜单文案保活 | **有**（task-053；AppIndicator 挂接后刷新标签，GNOME/Wayland 真机通过） |
@@ -101,19 +99,18 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 真机复测 **task-058**：验证多文件中包含大文件以及嵌套/空目录、空文件的内容与路径一致性
-2. 继续验收 Linux GNOME Wayland + Nautilus 的取消、替换、断线与重复粘贴，并据日志收口 task-058
+1. 如需同一份已消费 clipboard offer 直接多次 `Ctrl+V`，先建独立协议生命周期 task
+2. 为 Rust/前端构建与测试增加 CI，并统一应用版本来源
 3. （可选）设置页发现开关 / 本机显示名
 4. 如需发布到非开发用户，另建代码签名/升级机制 task，不改动现有传输协议
 
 > task-042 至 task-054 已完成相应真机验收；task-056 的手动多文件/目录批次和 task-057
 > 的 Windows Explorer 多文件剪贴板均已完成两端验收。task-052 已证明 Linux FUSE 单文件
 > 可在 Nautilus 粘贴时通过网络惰性读取并显示系统进度；task-053 已修复 Linux 托盘文字
-> 回归。task-058 已完成 Linux FUSE 虚拟目录树代码、路径安全和 Hub 串行惰性流；首轮
-> 跨机发现的大文件同步管道阻塞已改为非阻塞背压；后续日志确认首个 256 KiB 块已入管道
-> 但主循环未继续读取，现已暂停活跃流期间可能阻塞的 Wayland 剪贴板所有权读取，并再次
-> 通过单文件/tree 各 24 MiB 本地真实挂载校验。用户已确认 Windows→Linux 的几十 MiB
-> MP4 单文件粘贴通过；含大文件批次、取消、替换、断线、重复粘贴与断点续传仍未完成。
+> 回归。task-058 已完成 Linux FUSE 虚拟目录树、路径安全、非阻塞背压和活跃流剪贴板
+> 轮询保护；单文件/tree 本地真实挂载，以及 GNOME Wayland + Nautilus 的大文件批次、
+> 嵌套/空目录、空文件、取消、替换、断线和重新发送后再次粘贴均已通过。断点续传和同一
+> 已消费 clipboard offer 任意次重开不在 task-058 范围内。
 
 ## 用户怎么用
 

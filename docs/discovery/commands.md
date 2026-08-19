@@ -1,6 +1,6 @@
 # 常用命令 · M590Bridge
 
-> 更新日期：2026-08-18（task-058 增加 Linux FUSE tree 本地与 Nautilus 验收入口）
+> 更新日期：2026-08-19（task-058 Linux FUSE tree 本地与 Nautilus 验收均已通过）
 
 ## 桌面（推荐）
 
@@ -198,10 +198,11 @@ cargo check -p m590-daemon --target x86_64-pc-windows-gnu --examples
 
 这些自动化命令不能代替 GNOME Wayland + Nautilus 挂载验收。真机测试时两端运行
 `cd ui && npm run desktop:standalone`；Windows 复制单个文件后 Linux 只应先显示文件
-URI，Nautilus `Ctrl+V` 后才发起网络请求并显示系统进度，完成后检查内容一致。还需测试系统
-取消、粘贴前/传输中替换剪贴板、断线和同一文件再次复制。
+URI，Nautilus `Ctrl+V` 后才发起网络请求并显示系统进度，完成后检查内容一致。验收范围还
+包括系统取消、粘贴前/传输中替换剪贴板、断线和同一文件再次复制；task-058 最终真机验收
+已按此范围通过，后续保留为回归步骤。
 
-### Linux FUSE 虚拟目录树（task-058，真机待验收）
+### Linux FUSE 虚拟目录树（task-058，已完成）
 
 本地自动化与显式 FUSE 挂载 smoke：
 
@@ -234,8 +235,8 @@ Linux GNOME Wayland + Nautilus 与同一局域网 Windows 真机验收：
    需另建协议生命周期任务。
 
 task-058 首轮跨机发现几十 MiB 单文件在接收数百 KiB 后卡住且 Hub 无法及时断开；Linux
-接收路径已改为非阻塞背压并通过大文件本地挂载校验，但尚不能宣称 Linux Nautilus 单文件
-回归或多文件/目录跨机粘贴已通过。
+接收路径改为非阻塞背压并暂停活跃流期间的同步剪贴板所有权读取后，用户已确认单文件、
+大文件批次、多文件/目录和生命周期的 Linux Nautilus 跨机验收通过。
 
 ## Rust 测试 / CLI
 
@@ -278,7 +279,8 @@ cargo run -p m590-clipboard --example set_file_and_read -- /path/to/test-file
   `FileBatchOffer`、安全目录扫描、按 manifest 串行请求、整批暂存/发布与整体/当前条目进度
   （批次总上限 8GiB；`send_file_bytes` 仍限内存）
 - Linux FUSE：单文件网络惰性读取、Nautilus 系统进度、内容和取消已跨机真机通过
-  （task-052）；tree 已通过自动化与本地真实挂载，跨机 Nautilus 待验收（task-058）
+  （task-052）；tree 自动化、本地真实挂载及跨机 Nautilus 大文件批次和生命周期已通过
+  （task-058）
 - Linux 托盘：AppIndicator 菜单挂接后刷新标签，GNOME/Wayland“打开主面板 / 退出”真机通过（task-053）
 - **mDNS**：host `listen` 广播 `_m590bridge._tcp.local.`；`GET /api/discover` 列表；UI joiner 点选  
 - **Linux 安装包**：Tauri `.deb`，含可执行文件、桌面入口、图标和运行时依赖（task-032）
@@ -339,8 +341,7 @@ UI 加入页「局域网设备」旁有刷新图标。
 
 ## 未做
 
-- Linux FUSE 虚拟目录树的 Nautilus 多文件/文件夹跨机真机验收（task-058 代码与本地
-  挂载 smoke 已通过）
+- 同一份已消费 clipboard offer 直接任意次 `Ctrl+V` 重开网络流
 - 断点续传 / 多文件并行 / 独立数据连接
 - 设置页「发现方式」开关  
 - （已取消）019A  

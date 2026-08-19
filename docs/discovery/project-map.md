@@ -1,7 +1,7 @@
 # 项目结构图 · M590Bridge
 
-> 更新日期：2026-08-18
-> 状态：文本+图片+单文件按需流+mDNS+Linux/Windows 发布；task-058 Linux FUSE tree 待 Nautilus 跨机验收
+> 更新日期：2026-08-19
+> 状态：文本+图片+单/多文件与目录按需流+mDNS+Linux/Windows 发布；task-058 Linux FUSE tree 已通过 Nautilus 跨机验收
 
 ```text
 crates/
