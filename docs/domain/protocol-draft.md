@@ -98,8 +98,10 @@ Windows 单文件 OS 文件剪贴板现已接入：OLE STA 仅持有虚拟 `IDat
    完成，未开始的 offer 可释放或由更新的远端 offer 替换。当前实现不预先写入接收目录。
 
 **仍未做/验收**：Windows OLE 多文件代码尚待 Explorer 真机验收；Linux FUSE 虚拟目录
-树、断点续传、多文件并行和独立数据连接未实现。同一网络 offer 仍为一次性消费；需要
-再次粘贴时先重新发送批次，同一 offer 任意次数重复 `Ctrl+V` 需另行扩展生命周期。
+树、断点续传、多文件并行和独立数据连接未实现。同一网络 offer 自 task-060 起支持串行
+重开：剪贴板来源的 offer 在完成后保留发送源与接收端 stream offer，OS 第二次打开虚拟
+文件时重新发起 `FileRequest` 并重置管道；同一 `transfer_id` 同一时刻只允许一个活动流，
+不支持并发重开、断点续传或剪贴板替换后的重开。普通 API 发送仍为一次性。
 
 **hub**：单文件自动 request/虚拟剪贴板；`POST /api/send_file`（路径流式）；
 `send_file_bytes` 仍限内存 cap；`POST /api/send_batch` 扫描路径并串行传输；

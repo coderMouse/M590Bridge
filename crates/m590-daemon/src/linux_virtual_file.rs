@@ -636,6 +636,12 @@ impl TreeFilesystem {
             if let Some(file) = node.file.as_ref() {
                 file.release_content();
             }
+            // Reset the per-inode content state so a second open (serial reopen of the
+            // same clipboard offer) re-invokes the bridge factory instead of reusing
+            // the now-exhausted reader.
+            if let Ok(mut state) = node.reader.lock() {
+                *state = ContentState::Unopened;
+            }
         }
     }
 }
@@ -949,6 +955,12 @@ impl SingleFileFilesystem {
             .is_ok()
         {
             self.file.release_content();
+            // Reset the content state so a second open (serial reopen of the same
+            // clipboard offer) re-invokes the bridge factory instead of reusing the
+            // now-exhausted reader.
+            if let Ok(mut state) = self.reader.lock() {
+                *state = ContentState::Unopened;
+            }
         }
     }
 }

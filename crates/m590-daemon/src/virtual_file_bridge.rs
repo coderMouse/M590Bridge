@@ -142,23 +142,42 @@ impl VirtualFileBridge {
 #[allow(dead_code)]
 fn open_reader(inner: &Arc<PipeInner>, size: u64) -> io::Result<PipeReader> {
     let mut state = inner.state.lock().map_err(poisoned)?;
+    // Serial reopen: allow a second open only after the previous reader finished its
+    // round cleanly (consumed/released). A still-open reader or a hard cancel blocks
+    // reopening, mirroring the single active-stream invariant of protocol v3.
     if state.reader_open {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "virtual file content was opened more than once",
+            "virtual file content is already open",
         ));
     }
-    if state.cancelled {
+    if state.cancelled && !state.consumed {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "transfer cancelled",
         ));
     }
-    state.reader_open = true;
-    if !state.requested {
-        state.requested = true;
-        let _ = inner.events.send(BridgeEvent::Request);
+    // Reset the pipe for a fresh round so the new reader streams from offset 0.
+    #[cfg(target_os = "linux")]
+    let prior_round = state.consumed || state.finished || state.cancelled || state.released;
+    #[cfg(not(target_os = "linux"))]
+    let prior_round = state.consumed || state.finished || state.cancelled;
+    if prior_round {
+        state.bytes.clear();
+        state.started = false;
+        state.consumed = false;
+        state.finished = false;
+        state.cancelled = false;
+        state.error = None;
+        state.write_blocked_since = None;
+        #[cfg(target_os = "linux")]
+        {
+            state.released = false;
+        }
     }
+    state.reader_open = true;
+    state.requested = true;
+    let _ = inner.events.send(BridgeEvent::Request);
     inner.changed.notify_all();
     Ok(PipeReader {
         inner: Arc::clone(inner),
@@ -407,6 +426,7 @@ impl Drop for PipeReader {
                 #[cfg(not(target_os = "windows"))]
                 let should_cancel = true;
                 if !should_cancel || state.cancelled {
+                    state.reader_open = false;
                     self.inner.changed.notify_all();
                     return;
                 }
@@ -416,6 +436,7 @@ impl Drop for PipeReader {
                     .events
                     .send(BridgeEvent::Cancel("virtual file reader closed".into()));
             }
+            state.reader_open = false;
             self.inner.changed.notify_all();
         }
     }
@@ -466,6 +487,39 @@ mod tests {
         reader.read_to_end(&mut out).unwrap();
         producer_thread.join().unwrap();
         assert_eq!(out, b"abcdef");
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Consumed));
+    }
+
+    #[test]
+    fn completed_reader_can_be_reopened_for_a_second_stream() {
+        let (bridge, producer) = VirtualFileBridge::with_capacity(6);
+        let producer2 = producer.clone();
+
+        // First round.
+        let mut first = open_reader(&bridge.inner, 6).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        let producer_thread = thread::spawn(move || {
+            producer.push(b"abcdef").unwrap();
+            producer.finish();
+        });
+        let mut out = Vec::new();
+        first.read_to_end(&mut out).unwrap();
+        producer_thread.join().unwrap();
+        assert_eq!(out, b"abcdef");
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Consumed));
+        drop(first);
+
+        // Second round: reopen after the first reader dropped.
+        let mut second = open_reader(&bridge.inner, 6).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        let producer_thread2 = thread::spawn(move || {
+            producer2.push(b"xyz123").unwrap();
+            producer2.finish();
+        });
+        let mut out2 = Vec::new();
+        second.read_to_end(&mut out2).unwrap();
+        producer_thread2.join().unwrap();
+        assert_eq!(out2, b"xyz123");
         assert_eq!(bridge.take_event(), Some(BridgeEvent::Consumed));
     }
 

@@ -26,7 +26,7 @@ M590Bridge 是局域网双机剪贴板与文件桥：在 A 电脑复制，用罗
 文本 + 图片 + 单文件流式已在 Linux↔Windows 实机可用（见 `docs/plans/current.md`）。
 **V2 图片/文件、mDNS、Linux `.deb`/登录自启已完成**；Windows NSIS、登录自启、卸载清理与跨机回归已在真机通过（task-042）；task-043 至 task-054 已完成真机验收（无文件夹/断点续传）。
 原 task-019A（收图落盘捷径）已 **cancelled**。  
-用户已确认 task-042 的登录自启、卸载清理与跨机回归通过；task-043 至 task-054 已完成。task-052 已验证 Linux FUSE 单文件在 GNOME Wayland Nautilus 粘贴时通过网络惰性读取、显示系统进度且内容一致；task-053 已修复 Linux 托盘菜单文字回归；task-054 的 Linux `.deb`、Windows NSIS 一键打包与 Windows 成功/异常按键暂停均已验收。task-055 已完成多文件批次清单与路径安全协议基础；task-056 的手动多选/文件夹/拖放、Hub 串行批次、双层进度及 Linux/Windows 跨机交互均已验收。task-057 的无网络 Windows OLE 集合探针及 Windows 10 真机测试均已通过；发送端多路径/目录批次、GNOME 多行文本与 Wayland 原始 MIME 回退，以及 `arboard` 多路径末尾 `\r` 修复均已完成。task-058 的 Linux FUSE tree、逐文件网络惰性读取、非阻塞背压和生命周期已完成；GNOME Wayland + Nautilus 的大文件批次、目录树、取消、替换、断线及重新发送后再次粘贴均已真机验收通过。不复活 019A；断点续传和同一已消费 clipboard offer 任意次重开仍不在当前能力内。
+用户已确认 task-042 的登录自启、卸载清理与跨机回归通过；task-043 至 task-054 已完成。task-052 已验证 Linux FUSE 单文件在 GNOME Wayland Nautilus 粘贴时通过网络惰性读取、显示系统进度且内容一致；task-053 已修复 Linux 托盘菜单文字回归；task-054 的 Linux `.deb`、Windows NSIS 一键打包与 Windows 成功/异常按键暂停均已验收。task-055 已完成多文件批次清单与路径安全协议基础；task-056 的手动多选/文件夹/拖放、Hub 串行批次、双层进度及 Linux/Windows 跨机交互均已验收。task-057 的无网络 Windows OLE 集合探针及 Windows 10 真机测试均已通过；发送端多路径/目录批次、GNOME 多行文本与 Wayland 原始 MIME 回退，以及 `arboard` 多路径末尾 `\r` 修复均已完成。task-058 的 Linux FUSE tree、逐文件网络惰性读取、非阻塞背压和生命周期已完成；GNOME Wayland + Nautilus 的大文件批次、目录树、取消、替换、断线及重新发送后再次粘贴均已真机验收通过。task-060 已实现同一 clipboard offer 串行重开（发送源保留、stream offer 保留、bridge/FUSE 重开、批次 entry 状态重置），自动化全绿，待两端真机连续两次 `Ctrl+V` 验收；并发重开、断点续传与替换后重开仍不保证。不复活 019A。
 
 ## 产品边界（默认）
 

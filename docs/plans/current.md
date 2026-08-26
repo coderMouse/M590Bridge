@@ -100,7 +100,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. 如需同一份已消费 clipboard offer 直接多次 `Ctrl+V`，先建独立协议生命周期 task
+1. task-060（实现完成，真机待验收）：同一 clipboard offer 串行重开已实现，待两端
+   连续两次 `Ctrl+V` 真机验收；Nautilus「x」图标待真机确认
 2. 为 Rust/前端构建与测试增加 CI
 3. （可选）设置页发现开关 / 本机显示名
 4. 如需发布到非开发用户，另建代码签名/升级机制 task，不改动现有传输协议
@@ -111,7 +112,9 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 > 回归。task-058 已完成 Linux FUSE 虚拟目录树、路径安全、非阻塞背压和活跃流剪贴板
 > 轮询保护；单文件/tree 本地真实挂载，以及 GNOME Wayland + Nautilus 的大文件批次、
 > 嵌套/空目录、空文件、取消、替换、断线和重新发送后再次粘贴均已通过。断点续传和同一
-> 已消费 clipboard offer 任意次重开不在 task-058 范围内。task-059 已将应用版本收敛到
+> 已消费 clipboard offer 任意次重开不在 task-058 范围内。task-060 已实现同一 offer 串行
+> 重开（发送源保留、stream offer 保留、bridge/FUSE 重开），自动化全绿，待两端真机连续两次
+> `Ctrl+V` 验收；并发重开、断点续传与替换后重开仍不保证。task-059 已将应用版本收敛到
 > 根 workspace，并通过 Tauri Linux 实包确认 `.deb` 元数据仍为 `0.1.1`。
 
 ## 用户怎么用

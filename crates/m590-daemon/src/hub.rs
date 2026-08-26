@@ -2211,6 +2211,11 @@ fn run_session_loop(
                         entry_count,
                         state.files.len()
                     ));
+                    // Clipboard-sourced batches retain every file entry so the same offer
+                    // can answer a second serial `FileRequest` round without re-announcing.
+                    for file in &state.files {
+                        session.retain_outbound_file(&file.entry_id);
+                    }
                     mark_outbound_batch_started(&shared, &state);
                     if state.files.is_empty() {
                         mark_batch_done(&shared, &state.batch_id, None);
@@ -3294,8 +3299,10 @@ fn run_session_loop(
                                     .as_millis()
                             ));
                             if current.completed {
-                                current.producer.finish();
-                                continue;
+                                // Serial reopen of a completed clipboard offer: reset the
+                                // round-local state and request the network stream again.
+                                current.completed = false;
+                                current.first_chunk_at = None;
                             }
                             let dispatch_started = Instant::now();
                             match session.request_file_stream(current.transfer_id.clone()) {
@@ -3449,7 +3456,16 @@ fn run_session_loop(
                                     now.saturating_duration_since(current.published_at).as_millis()
                                 ));
                                 if current.files[index].completed {
-                                    current.files[index].producer.finish();
+                                    // Serial reopen of a completed entry: reset round-local
+                                    // state so `next_requested_index` reselects it and the
+                                    // hub dispatches a fresh network request below.
+                                    current.files[index].completed = false;
+                                    current.files[index].first_chunk_at = None;
+                                    current.completed_files =
+                                        current.completed_files.saturating_sub(1);
+                                    current.completed_bytes = current
+                                        .completed_bytes
+                                        .saturating_sub(current.files[index].entry.size);
                                 }
                             }
                             BridgeEvent::Consumed => {
@@ -3739,8 +3755,12 @@ fn run_session_loop(
                             ));
                             current.requested = true;
                             if current.completed {
-                                current.producer.finish();
-                                continue;
+                                // Serial reopen of a completed clipboard offer: reset the
+                                // round-local state and request the network stream again.
+                                current.completed = false;
+                                current.consumed = false;
+                                current.released = false;
+                                current.first_chunk_at = None;
                             }
                             match session.request_file_stream(current.transfer_id.clone()) {
                                 Ok(QueueFileResult::Queued) => {
@@ -3915,7 +3935,18 @@ fn run_session_loop(
                                     current.files[index].entry.entry_id
                                 ));
                                 if current.files[index].completed {
-                                    current.files[index].producer.finish();
+                                    // Serial reopen of a completed entry: reset round-local
+                                    // state so `next_requested_index` reselects it and the
+                                    // hub dispatches a fresh network request below.
+                                    current.files[index].completed = false;
+                                    current.files[index].consumed = false;
+                                    current.files[index].released = false;
+                                    current.files[index].first_chunk_seen = false;
+                                    current.completed_files =
+                                        current.completed_files.saturating_sub(1);
+                                    current.completed_bytes = current
+                                        .completed_bytes
+                                        .saturating_sub(current.files[index].entry.size);
                                 }
                             }
                             BridgeEvent::Consumed => {
@@ -6281,12 +6312,15 @@ fn offer_local_file(
     let transfer_id = format!("ui-file-{}-{content_seq}", std::process::id());
     let bytes = meta.len();
     match session.offer_file_path(transfer_id.clone(), &p) {
-        Ok(QueueFileResult::Queued) => Ok((
-            format!("[file offer {file_name} {bytes}B id={transfer_id}]"),
-            transfer_id,
-            file_name,
-            bytes,
-        )),
+        Ok(QueueFileResult::Queued) => {
+            session.retain_outbound_file(&transfer_id);
+            Ok((
+                format!("[file offer {file_name} {bytes}B id={transfer_id}]"),
+                transfer_id,
+                file_name,
+                bytes,
+            ))
+        }
         Ok(QueueFileResult::DuplicateTransferId) => Err("duplicate transfer id".into()),
         Ok(QueueFileResult::FileTooLarge { byte_len, limit }) => {
             Err(format!("file too large: {byte_len}B > {limit}B"))
@@ -6838,6 +6872,42 @@ mod tests {
         assert!(receive.is_complete());
         assert!(!receive.must_finish());
         assert_eq!(receive.next_requested_index(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_virtual_batch_completed_entry_can_be_reopened() {
+        let offer = DeferredVirtualBatchOffer {
+            batch_id: "batch-reopen".into(),
+            display_name: "batch".into(),
+            entries: vec![
+                BatchEntry::file("file-1", "one.bin", 3, "").unwrap(),
+                BatchEntry::file("file-2", "two.bin", 4, "").unwrap(),
+            ],
+        };
+        let (_tree, mut receive) = prepare_linux_virtual_batch_offer(&offer).unwrap();
+
+        // Simulate a first completed round for file-1.
+        receive.files[0].requested = true;
+        receive.files[0].completed = true;
+        receive.files[0].consumed = true;
+        receive.files[0].released = true;
+        receive.completed_files = 1;
+        receive.completed_bytes = 3;
+        assert!(receive.files[0].completed);
+
+        // Second round Request resets the entry so it can be rescheduled.
+        receive.files[0].requested = true;
+        receive.files[0].completed = false;
+        receive.files[0].consumed = false;
+        receive.files[0].released = false;
+        receive.files[0].first_chunk_seen = false;
+        receive.completed_files = receive.completed_files.saturating_sub(1);
+        receive.completed_bytes = receive.completed_bytes.saturating_sub(3);
+
+        assert!(!receive.files[0].completed);
+        assert_eq!(receive.next_requested_index(), Some(0));
+        assert!(receive.must_finish());
     }
 
     #[test]

@@ -165,6 +165,10 @@ struct StagedOutboundFile {
     body: OutboundBody,
     /// Precomputed digest for memory offers; path offers hash while sending.
     sha256_hex: Option<String>,
+    /// When true the staged source is retained after a completed transfer so the same
+    /// clipboard offer can be streamed again on a second `FileRequest` (protocol v3
+    /// serial reopen). API-sourced sends stay one-shot and clean up as before.
+    retain_for_clipboard: bool,
 }
 
 #[derive(Debug)]
@@ -179,6 +183,9 @@ struct ActiveOutboundSend {
     hasher: Option<Sha256>,
     sha256_hex: Option<String>,
     file: Option<File>,
+    /// Mirror of [`StagedOutboundFile::retain_for_clipboard`]; when true the source is
+    /// re-staged after the send completes so the same clipboard offer can be reopened.
+    retain_for_clipboard: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -600,6 +607,7 @@ impl Session {
                 size: byte_len,
                 body: OutboundBody::Memory(data),
                 sha256_hex: Some(sha256_hex),
+                retain_for_clipboard: false,
             },
         );
         self.sync_state = SyncState::Syncing;
@@ -667,6 +675,7 @@ impl Session {
                 size,
                 body: OutboundBody::Path(path.to_path_buf()),
                 sha256_hex: None,
+                retain_for_clipboard: false,
             },
         );
         self.sync_state = SyncState::Syncing;
@@ -676,6 +685,15 @@ impl Session {
         self.pending_outbox.push(Message::file_offer(offer));
         self.sync_state = SyncState::Idle;
         Ok(QueueFileResult::Queued)
+    }
+
+    /// Mark an already-staged outbound file as clipboard-sourced so its send source is
+    /// retained after a completed transfer. This lets the same clipboard offer answer a
+    /// second serial `FileRequest` without re-announcing. No-op if the id is not staged.
+    pub fn retain_outbound_file(&mut self, transfer_id: impl AsRef<str>) {
+        if let Some(staged) = self.staged_outbound_files.get_mut(transfer_id.as_ref()) {
+            staged.retain_for_clipboard = true;
+        }
     }
 
     /// Stage a validated batch manifest and its regular-file paths.
@@ -763,6 +781,7 @@ impl Session {
                     size: entry.size,
                     body: OutboundBody::Path(source.path),
                     sha256_hex: (!entry.sha256_hex.is_empty()).then(|| entry.sha256_hex.clone()),
+                    retain_for_clipboard: false,
                 },
             ));
         }
@@ -1342,6 +1361,7 @@ impl Session {
             })?),
             OutboundBody::Memory(_) => None,
         };
+        let retain_for_clipboard = staged.retain_for_clipboard;
 
         self.active_outbound = Some(ActiveOutboundSend {
             transfer_id: payload.transfer_id,
@@ -1352,6 +1372,7 @@ impl Session {
             hasher,
             sha256_hex: staged.sha256_hex,
             file,
+            retain_for_clipboard,
         });
         self.sync_state = SyncState::Syncing;
         self.pump_outbound_file_inner()?;
@@ -1430,8 +1451,8 @@ impl Session {
         }
 
         let active = self.active_outbound.take().expect("active outbound");
-        let sha256_hex = if let Some(hex) = active.sha256_hex {
-            hex
+        let sha256_hex = if let Some(hex) = active.sha256_hex.as_ref() {
+            hex.clone()
         } else if let Some(hasher) = active.hasher {
             bytes_to_hex(&hasher.finalize())
         } else {
@@ -1439,11 +1460,25 @@ impl Session {
         };
         let complete = FileCompletePayload::with_sha256(
             self.local_device.clone(),
-            active.transfer_id,
+            active.transfer_id.clone(),
             true,
             "",
             sha256_hex,
         )?;
+        // Re-stage clipboard-sourced transfers so the same offer can be reopened for a
+        // second serial `FileRequest`. API sends (retain_for_clipboard=false) drop as before.
+        if active.retain_for_clipboard {
+            self.staged_outbound_files.insert(
+                active.transfer_id,
+                StagedOutboundFile {
+                    file_name: active.file_name,
+                    size: active.size,
+                    body: active.body,
+                    sha256_hex: active.sha256_hex,
+                    retain_for_clipboard: true,
+                },
+            );
+        }
         self.pending_outbox.push(Message::file_complete(complete));
         self.sync_state = SyncState::Idle;
         Ok(())
@@ -1562,6 +1597,10 @@ impl Session {
                 incoming.hasher.update(&payload.data);
                 incoming.next_offset = payload.data.len() as u64;
                 if stream_target {
+                    // Re-insert the stream offer so a second serial `FileRequest` round can
+                    // re-request the same clipboard offer without re-announcing it.
+                    self.inbound_offers
+                        .insert(payload.transfer_id.clone(), offer);
                     self.last_inbound_file = Some(InboundFileResult::Chunk {
                         transfer_id: payload.transfer_id.clone(),
                         data: payload.data.clone(),
@@ -1615,6 +1654,10 @@ impl Session {
                         stream_target,
                     ) {
                         Ok(incoming) => {
+                            if stream_target {
+                                self.inbound_offers
+                                    .insert(payload.transfer_id.clone(), offer);
+                            }
                             self.incoming_files
                                 .insert(payload.transfer_id.clone(), incoming);
                         }
@@ -1643,7 +1686,13 @@ impl Session {
             });
             return Ok(());
         };
-        self.inbound_offers.remove(&payload.transfer_id);
+        // Disk targets consume the offer (one-shot). Stream targets back a clipboard
+        // virtual file and are retained so the same offer can be reopened for a second
+        // serial `FileRequest` round.
+        let is_stream = matches!(incoming.target, IncomingFileTarget::Stream);
+        if !is_stream {
+            self.inbound_offers.remove(&payload.transfer_id);
+        }
 
         let flush_error = match &mut incoming.target {
             IncomingFileTarget::Disk { writer, .. } => writer.flush().err(),
@@ -2499,6 +2548,113 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), data);
         assert_eq!(host.snapshot().last_file_name.as_deref(), Some("note.bin"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retained_clipboard_offer_can_be_requested_again_after_completion() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        let data = b"hello-again".to_vec();
+        let expect_sha = crate::bytes_to_hex(&{
+            use sha2::Digest;
+            sha2::Sha256::digest(&data)
+        });
+
+        assert_eq!(
+            joiner
+                .offer_file("xfer-retain", "retain.bin", data.clone())
+                .unwrap(),
+            QueueFileResult::Queued
+        );
+        joiner.retain_outbound_file("xfer-retain");
+        let offer_msg = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer_msg)).unwrap();
+        assert_eq!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Offered {
+                transfer_id: "xfer-retain".into(),
+                file_name: "retain.bin".into(),
+                size: data.len() as u64,
+            })
+        );
+
+        // First round via the stream path (clipboard virtual file semantics).
+        assert_eq!(
+            host.request_file_stream("xfer-retain").unwrap(),
+            QueueFileResult::Queued
+        );
+        let req_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(req_msg)).unwrap();
+        drain_file_send(&mut joiner, &mut host);
+        let first = host.take_inbound_file();
+        assert!(matches!(
+            first,
+            Some(InboundFileResult::StreamCompleted { .. })
+        ));
+
+        // Second round: re-request the same offer id; the retained source should still serve.
+        assert_eq!(
+            host.request_file_stream("xfer-retain").unwrap(),
+            QueueFileResult::Queued
+        );
+        let req_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(req_msg)).unwrap();
+        drain_file_send(&mut joiner, &mut host);
+        let second = host.take_inbound_file();
+        let InboundFileResult::StreamCompleted {
+            transfer_id,
+            size,
+            sha256_hex,
+            ..
+        } = second.unwrap()
+        else {
+            panic!("expected second stream completed");
+        };
+        assert_eq!(transfer_id, "xfer-retain");
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(sha256_hex, expect_sha);
+    }
+
+    #[test]
+    fn non_retained_offer_is_gone_after_completion() {
+        let (mut host, mut joiner) = pair_host_joiner();
+        let data = b"one-shot".to_vec();
+
+        assert_eq!(
+            joiner
+                .offer_file("xfer-once", "once.bin", data.clone())
+                .unwrap(),
+            QueueFileResult::Queued
+        );
+        // No retain_outbound_file: default one-shot semantics. The stream offer is still
+        // retained on the receiver for stream targets, but the sender drops its source,
+        // so the second request fails on the sender side.
+        let offer_msg = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer_msg)).unwrap();
+        assert_eq!(
+            host.request_file_stream("xfer-once").unwrap(),
+            QueueFileResult::Queued
+        );
+        let req_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(req_msg)).unwrap();
+        drain_file_send(&mut joiner, &mut host);
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::StreamCompleted { .. })
+        ));
+
+        // The receiver still has the stream offer, so the request queues again; but the
+        // sender no longer has the source, so it replies with a failed FileComplete.
+        assert_eq!(
+            host.request_file_stream("xfer-once").unwrap(),
+            QueueFileResult::Queued
+        );
+        let req_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(req_msg)).unwrap();
+        drain_file_send(&mut joiner, &mut host);
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Failed { .. })
+        ));
     }
 
     #[test]
