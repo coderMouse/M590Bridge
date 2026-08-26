@@ -1,6 +1,6 @@
 [package]
 name = "m590-ui"
-version = "0.1.1"
+version.workspace = true
 description = "M590Bridge desktop shell (Tauri)"
 authors = ["M590Bridge"]
 edition = "2021"
