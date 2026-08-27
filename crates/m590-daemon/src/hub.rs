@@ -3877,10 +3877,28 @@ fn run_session_loop(
                                     current.released
                                 ));
                                 if !current.requested {
+                                    // The OS consumer never opened the FUSE file
+                                    // (e.g. a Nautilus replace/conflict flow that
+                                    // failed before `read`), and the clipboard has
+                                    // already moved on. Keeping the receive only
+                                    // hot-loops and blocks the local clipboard poll
+                                    // until the idle backstop fires. Detach now.
                                     task_058_diagnostic(format_args!(
-                                        "single_clipboard_not_current_before_request_kept entry_id={:?}",
+                                        "single_clipboard_not_current_before_request_detached entry_id={:?}",
                                         current.transfer_id
                                     ));
+                                    current.producer.fail("clipboard replaced before request");
+                                    session
+                                        .cancel_file(
+                                            current.transfer_id.clone(),
+                                            "clipboard replaced before request",
+                                        )
+                                        .map_err(|e| e.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|e| e.to_string())?;
+                                    fuse_manager.clear();
+                                    latest_clipboard_file_offer_id = None;
+                                    keep_current = false;
                                 } else if linux_virtual_receive_must_finish(
                                     current.requested,
                                     current.completed,
@@ -4082,10 +4100,31 @@ fn run_session_loop(
                             Ok(true) => {}
                             Ok(false) => {
                                 if !current.has_requested_file() {
+                                    // No entry was ever opened by the OS consumer
+                                    // (e.g. a Nautilus replace/conflict flow that
+                                    // failed before any `read`), and the clipboard
+                                    // has already moved on. Detach immediately
+                                    // instead of hot-looping until the idle backstop.
                                     task_058_diagnostic(format_args!(
-                                        "batch_clipboard_not_current_before_request_kept batch_id={:?}",
+                                        "batch_clipboard_not_current_before_request_detached batch_id={:?}",
                                         current.batch_id
                                     ));
+                                    cancel_linux_virtual_batch(
+                                        session,
+                                        conn,
+                                        &current,
+                                        "clipboard replaced before request",
+                                    )?;
+                                    fuse_manager.clear();
+                                    with_status(&shared, |status| {
+                                        status.file_transfer_phase = Some("cancelled".into());
+                                        status.file_batch_current_path = None;
+                                        status.file_bytes_received = None;
+                                        status.file_bytes_total = None;
+                                        status.last_error = None;
+                                    });
+                                    latest_clipboard_file_offer_id = None;
+                                    keep_current = false;
                                 } else if current.must_finish() {
                                     current.clipboard_replaced = true;
                                 } else {

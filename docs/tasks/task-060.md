@@ -176,12 +176,23 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
 - **新 blocker（最高优先级）**：Q3 报错出现后，**Linux 无法再复制新内容到 Windows**——
   Linux 复制时剪贴板内容不会更新，**重启两端应用也不恢复**。怀疑 Q3 的替换失败把某处
   FUSE/会话/剪贴板状态卡死，导致后续剪贴板发布被阻断。
-  - **已定位+修复（2026-08-27）**：根因是已发布但从未被请求的虚拟 offer 永久保留
-    `virtual_receive`/`virtual_batch_receive`，使 `virtual_clipboard_active` 恒为 true，
-    本地剪贴板轮询被永久阻塞。已加 `VIRTUAL_PUBLISH_IDLE_TIMEOUT`（120s）兜底 detach。
+  - **已定位+修复（2026-08-27，第一轮）**：根因是已发布但从未被请求的虚拟 offer
+    永久保留 `virtual_receive`/`virtual_batch_receive`，使
+    `virtual_clipboard_active` 恒为 true，本地剪贴板轮询被永久阻塞。已加
+    `VIRTUAL_PUBLISH_IDLE_TIMEOUT`（120s）兜底 detach。
+  - **已定位+修复（2026-08-27，第二轮，真机复测 `a66ba2e` 后）**：120s 兜底虽最终触发
+    （日志 `single_virtual_publish_idle_detached … since_publish_ms=120031`），但在此之前
+    `ui-file-14168-5` 被发布但从未被请求，`is_current` 返回 `false` 后代码进入
+    `single_clipboard_not_current_before_request_kept` 分支——该分支只记日志并 **保留**
+    receive，导致每秒数百次 hot-loop、剪贴板被阻塞整整 120s。根因：never-requested 且
+    剪贴板已移走时应立即 detach，而非等待 idle 兜底。已将单文件与批次两条
+    `*_before_request_kept` 路径改为立即 `fuse_manager.clear()` +
+    `cancel_file`/`cancel_linux_virtual_batch("clipboard replaced before request")` +
+    `keep_current = false`（日志改为 `*_before_request_detached`）。120s idle 兜底保留
+    作为 backstop（理论上不再先命中）。
 
-结论：串行重开本身（Q1/Q2）已在真机验证有效；Q3 连锁故障已在本轮代码修复，待真机复测；
-剩余 Q3 替换 `ENOENT` 与 Q4 角标为待真机排查开放项。
+结论：串行重开本身（Q1/Q2）已在真机验证有效；Q3 连锁故障（发布后卡死 120s）已在第二轮
+代码修复，待真机复测；剩余 Q3 替换 `ENOENT` 与 Q4 角标为待真机排查开放项。
 
 ## 验证结果
 
@@ -203,7 +214,15 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
 - 二轮：`cargo check --workspace`、`cargo check -p m590-daemon --target
   x86_64-pc-windows-gnu --lib`、`cargo clippy -p m590-{core,daemon} --lib --no-deps
   -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：全部通过。
-- 待真机验收：Q3 连锁修复（发布后 120s 自动恢复本地剪贴板）、Q3 替换 `ENOENT`、Q4 角标。
+- 三轮（2026-08-27，before-request 立即 detach）：`cargo test -p m590-daemon --lib`：
+  72 passed，0 failed，2 ignored；`cargo test -p m590-daemon virtual_file`：22 passed，
+  2 ignored；`cargo test -p m590-daemon linux_virtual`：18 passed，1 ignored；
+  `cargo test -p m590-core file`：18 passed，0 failed。
+  `cargo check --workspace`、`cargo check -p m590-daemon --target
+  x86_64-pc-windows-gnu --lib`、`cargo clippy -p m590-{core,daemon} --lib --no-deps
+  -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：全部通过。
+- 待真机验收：Q3 连锁修复（替换失败后本地剪贴板立即恢复，不再卡 120s）、Q3 替换
+  `ENOENT`、Q4 角标。
 
 ## 文档影响
 
@@ -220,8 +239,9 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
 
 ## 下一步
 
-- 真机复测 Q3 连锁修复：在 Windows→Linux 触发替换 `ENOENT` 后，确认本地剪贴板在 120s 内
-  自动恢复轮询、可重新复制内容到 Windows。
+- 真机复测 Q3 连锁修复：在 Windows→Linux 触发替换 `ENOENT` 后，确认本地剪贴板**立即**
+  恢复轮询、可重新复制内容到 Windows（不再卡 120s；日志应出现
+  `single_clipboard_not_current_before_request_detached`）。
 - 真机排查 Q3 替换 `ENOENT`：用 FUSE 日志确认是否为替换流程中 reader 未完成时 release
   触发 `BridgeEvent::Cancel` → FUSE 卸载，随后 Nautilus 再 stat 而报错；若是，评估将
   「已请求但未完成」的 release 改为保留挂载以支持重开，而非立即 cancel。
