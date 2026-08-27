@@ -12,7 +12,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime};
 
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
@@ -331,6 +333,7 @@ struct TreeFilesystem {
     root_names: Vec<String>,
     next_inode: AtomicU64,
     next_handle: AtomicU64,
+    published: SystemTime,
 }
 
 impl TreeFilesystem {
@@ -341,6 +344,7 @@ impl TreeFilesystem {
             root_names: Vec::new(),
             next_inode: AtomicU64::new(2),
             next_handle: AtomicU64::new(1),
+            published: SystemTime::now(),
         };
         filesystem.nodes.insert(
             ROOT_INODE,
@@ -487,10 +491,10 @@ impl TreeFilesystem {
             ino: inode,
             size: node.size,
             blocks: node.size.div_ceil(BLOCK_SIZE),
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: self.published,
+            mtime: self.published,
+            ctime: self.published,
+            crtime: self.published,
             kind: node.kind,
             perm: if node.kind == FileType::Directory {
                 0o555
@@ -818,6 +822,7 @@ struct SingleFileFilesystem {
     reader: Mutex<ContentState>,
     next_handle: AtomicU64,
     content_handle: AtomicU64,
+    published: SystemTime,
 }
 
 enum ContentState {
@@ -836,6 +841,7 @@ impl SingleFileFilesystem {
             reader: Mutex::new(ContentState::Unopened),
             next_handle: AtomicU64::new(1),
             content_handle: AtomicU64::new(NO_CONTENT_HANDLE),
+            published: SystemTime::now(),
         }
     }
 
@@ -848,10 +854,10 @@ impl SingleFileFilesystem {
             ino: ROOT_INODE,
             size: 0,
             blocks: 0,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: self.published,
+            mtime: self.published,
+            ctime: self.published,
+            crtime: self.published,
             kind: FileType::Directory,
             perm: 0o555,
             nlink: 2,
@@ -872,10 +878,10 @@ impl SingleFileFilesystem {
             ino: FILE_INODE,
             size: self.file.size,
             blocks: self.file.size.div_ceil(BLOCK_SIZE),
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: self.published,
+            mtime: self.published,
+            ctime: self.published,
+            crtime: self.published,
             kind: FileType::RegularFile,
             perm: 0o444,
             nlink: 1,

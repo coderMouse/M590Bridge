@@ -192,7 +192,31 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
     作为 backstop（理论上不再先命中）。
 
 结论：串行重开本身（Q1/Q2）已在真机验证有效；Q3 连锁故障（发布后卡死 120s）已在第二轮
-代码修复，待真机复测；剩余 Q3 替换 `ENOENT` 与 Q4 角标为待真机排查开放项。
+代码修复并真机验证恢复；Q3 替换 `ENOENT` 与 Q4 角标在第三轮做代码层修复，待真机复测。
+
+## Q3 替换 ENOENT 与 Q4 角标修复（2026-08-27，第三轮）
+
+真机复测确认：**Q3 连锁故障（发布后立即恢复）已通过**。本轮针对剩余两个问题做代码层修复：
+
+- **Q4（Nautilus「x」角标）根因**：所有 FUSE 虚拟文件的 `atime/mtime/ctime/crtime` 均为
+  `UNIX_EPOCH`（1970 年），`perm` 为 `0o444`。Nautilus/GVFS 据 1970 时间戳判定缩略图/
+  预览不可用，附加「x」/占位 emblem。**修复**：`TreeFilesystem` 与
+  `SingleFileFilesystem` 构造时各记录一个 `published: SystemTime = SystemTime::now()`，
+  `getattr`/`lookup` 返回该时间作为 `atime/mtime/ctime/crtime`，使 Nautilus 看到正常
+  的近期时间戳。`perm 0o444`（只读）保留——FUSE 本身就是只读挂载。
+- **Q3（替换 ENOENT）根因**：`replace_if_current`/`replace_tree_if_current` 在串行重开
+  时调用 `publish`，每次 `create_mount_point()` 分配**新的**挂载目录（序列号递增），
+  因此同一份 clipboard offer 第二次 `Ctrl+V` 时 FUSE URI 变了。Nautilus「替换」流程先
+  `stat` 第一轮缓存的旧 URI，但旧挂载已卸载、新挂载在不同路径 → `ENOENT`。本机复制
+  粘贴无此问题是因为源文件始终在固定路径。**修复**：为 `MountedVirtualFile`/
+  `MountedVirtualTree` 新增 `remount` 与 `take_mount_point`：卸载旧 FUSE 会话但保留
+  挂载目录，在同一目录重新挂载新会话，使 FUSE URI 在串行重开时**完全不变**。
+  `replace_if_current`/`replace_tree_if_current` 改为走 `remount` 路径（仅在当前 offer
+  与替换目标同形时复用；跨形如 file→tree 则回退到全新挂载）。`Drop` 增加
+  `reuse_mount_point` 标志避免移交出去的目录被删除。
+- **120s `VIRTUAL_PUBLISH_IDLE_TIMEOUT` 与大文件传输**：idle 判定条件是
+  `!requested && !completed && elapsed >= 120s`。一旦 OS 打开 FUSE 文件 `requested=true`
+  即不再命中 idle；正在传输的大文件不受影响。
 
 ## 验证结果
 
@@ -221,8 +245,14 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
   `cargo check --workspace`、`cargo check -p m590-daemon --target
   x86_64-pc-windows-gnu --lib`、`cargo clippy -p m590-{core,daemon} --lib --no-deps
   -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：全部通过。
-- 待真机验收：Q3 连锁修复（替换失败后本地剪贴板立即恢复，不再卡 120s）、Q3 替换
-  `ENOENT`、Q4 角标。
+- 四轮（2026-08-27，Q3 稳定 URI + Q4 真实时间戳）：`cargo test -p m590-daemon --lib`：
+  72 passed，0 failed，2 ignored；`cargo test -p m590-daemon virtual_file`：22 passed，
+  2 ignored；`cargo test -p m590-daemon linux_virtual`：18 passed，1 ignored；
+  `cargo test -p m590-core file`：18 passed，0 failed。
+  `cargo check --workspace`、`cargo check -p m590-daemon --target
+  x86_64-pc-windows-gnu --lib`、`cargo clippy -p m590-{core,daemon} --lib --no-deps
+  -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：全部通过。
+- 待真机验收：Q3 替换 `ENOENT`（稳定 URI）、Q4 角标（真实时间戳）。Q3 连锁修复已真机通过。
 
 ## 文档影响
 
@@ -239,12 +269,9 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
 
 ## 下一步
 
-- 真机复测 Q3 连锁修复：在 Windows→Linux 触发替换 `ENOENT` 后，确认本地剪贴板**立即**
-  恢复轮询、可重新复制内容到 Windows（不再卡 120s；日志应出现
-  `single_clipboard_not_current_before_request_detached`）。
-- 真机排查 Q3 替换 `ENOENT`：用 FUSE 日志确认是否为替换流程中 reader 未完成时 release
-  触发 `BridgeEvent::Cancel` → FUSE 卸载，随后 Nautilus 再 stat 而报错；若是，评估将
-  「已请求但未完成」的 release 改为保留挂载以支持重开，而非立即 cancel。
-- 真机排查 Q4：对比落地文件与本机文件的 `stat`/xattr/MIME（尤其 `atime/mtime`、
-  `perm 0o444`），消除 Nautilus「x」角标或记录为无害已知现象。
+- 真机复测 Q3 连锁修复：✅ 已通过（替换失败后本地剪贴板立即恢复）。
+- 真机复测 Q3 替换 `ENOENT`：目标目录存在同名文件，`Ctrl+V` 选「替换」，确认不再报
+  `ENOENT`、正常替换落地（FUSE URI 在串行重开时由 `remount` 保持不变）。
+- 真机复测 Q4 角标：确认粘贴落地文件在 Nautilus 中不再显示「x」角标
+  （`getattr` 现返回 `SystemTime::now()` 而非 1970）。若仍有角标，记录 `stat`/xattr 差异。
 - Q1/Q2 已真机通过，不再重复验证。
