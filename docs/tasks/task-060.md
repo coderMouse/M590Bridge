@@ -214,7 +214,27 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
 - **代码清理**：撤销第三轮添加的 `remount`/`take_mount_point`/`reuse_mount_point` 与
   `published: SystemTime` 时间戳机制（经真机验证无效，属无用代码），恢复
   `linux_virtual_file.rs` 与 `linux_virtual_file_manager.rs` 到 `796b8eb` 基线后仅改权限。
-- **120s `VIRTUAL_PUBLISH_IDLE_TIMEOUT` 与大文件传输**：idle 判定条件是
+## 第五轮（2026-08-27）：Q3 缩略图探测 + 权限确认
+
+真机复测确认：权限修复（`0o644`/`0o755`）后 Q4「x」角标消失、txt/apk/zip 可正常替换。
+但 **mp4/pdf 替换仍报 `ENOENT`**，txt/apk/zip 成功。根因：Nautilus 为 mp4/pdf 生成缩略图，
+打开 FUSE 文件读几 KB 后关闭 → `release_reader` 发送 `BridgeEvent::Cancel`（因 `!consumed`）
+→ hub `Cancel` 处理器调用 `fuse_manager.clear()` 卸载 FUSE → 随后 Nautilus「替换」流程
+`stat` 源 FUSE 路径时挂载已卸载 → `ENOENT`。txt/apk/zip 不生成缩略图故不触发此路径。
+
+**修复**：
+- `crates/m590-core/src/session.rs`：新增 `cancel_file_stream`——通知对端停止网络流但**保留
+  `inbound_offers`**，使后续串行重开可重新请求同一 `transfer_id`。`abort_active_outbound_if`
+  /`abort_active_outbound` 在 `retain_for_clipboard` 为真时重新 stage 源（与完成路径一致），
+  使对端取消后仍能响应第二次 `FileRequest`。
+- `crates/m590-daemon/src/hub.rs`：单文件与批次两条 `BridgeEvent::Cancel` 路径增加
+  **缩略图探测判定**——当 `reason == "virtual file reader closed" && !completed` 时走
+  软取消：`producer.fail()` + `cancel_file_stream` + 重置 round-local 状态
+  （`requested=false` 等）供重开，**不调用** `fuse_manager.clear()`、不丢弃 receive。
+  网络分片处理器增加 `!requested` 守卫，丢弃软取消后到达的陈旧分片。
+- 权限已为 `0o644`（文件）/`0o755`（目录），`uid`/`gid` 为 `request.uid()`（当前用户）。
+
+- - **120s `VIRTUAL_PUBLISH_IDLE_TIMEOUT` 与大文件传输**：idle 判定条件是
   `!requested && !completed && elapsed >= 120s`。一旦 OS 打开 FUSE 文件 `requested=true`
   即不再命中 idle；正在传输的大文件不受影响。
 
@@ -252,8 +272,26 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
   `cargo check --workspace`、`cargo check -p m590-daemon --target
   x86_64-pc-windows-gnu --lib`、`cargo clippy -p m590-{core,daemon} --lib --no-deps
   -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：全部通过。
-- 待真机验收：Q3 替换（权限修复后可替换）、Q4 角标（权限修复后无角标）。Q1/Q2 与 Q3 连锁
-  修复已真机通过。
+- 五轮（2026-08-27，缩略图探测软取消）：修复 4 个实现缺陷：
+  (1) `open_reader` 的 `cancelled && !consumed` 提前返回阻止重开——改为
+  `cancelled && !consumed && !finished`，使 `producer.fail()` 后 `prior_round`
+  重置可运行；
+  (2) `on_file_cancel` 无条件删除 `staged_outbound_files`——改为
+  `retain_for_clipboard` 时保留，使对端可响应第二次 `FileRequest`；
+  (3) 软取消条件用 `!completed` 而非 `!consumed`——小文件 `StreamCompleted`
+  先到设 `completed=true` 导致软取消不触发、走硬取消卸载 FUSE；改用
+  `!consumed`（读者未读完即触发）；
+  (4) 软取消后 `pending_virtual_chunk` 对 `fail()` 的 producer 无限重试——
+  软取消时清空；并对单文件/批次 `StreamCompleted` 增加 `!requested` 陈旧守卫。
+  `cargo test -p m590-core --lib`：39 passed；
+  `cargo test -p m590-daemon --lib`：73 passed，2 ignored；`cargo test -p m590-daemon
+  virtual_file`：23 passed，2 ignored；`cargo test -p m590-daemon linux_virtual`：18 passed，
+  1 ignored。
+  `cargo check --workspace`、`cargo check -p m590-daemon --target
+  x86_64-pc-windows-gnu --lib`、`cargo clippy -p m590-core -p m590-daemon --lib --no-deps
+  -D warnings`、`cargo fmt --all -- --check`：全部通过。
+- 待真机验收：Q3 mp4/pdf 替换（缩略图探测软取消后 FUSE 不卸载、可重开）。Q4 角标已真机
+  确认消失。
 
 ## 文档影响
 

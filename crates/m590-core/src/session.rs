@@ -877,6 +877,27 @@ impl Session {
         Ok(())
     }
 
+    /// Notify the peer to stop the active network stream for a transfer **without**
+    /// dropping the inbound offer. This lets a partial read (e.g. a Nautilus
+    /// thumbnail probe that opens the FUSE file and closes it before completion)
+    /// abort the in-flight network stream while keeping the FUSE mount and offer
+    /// alive so a subsequent reopen (`request_file_stream`) can re-request it.
+    pub fn cancel_file_stream(
+        &mut self,
+        transfer_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), SessionError> {
+        self.pending_outbox.clear();
+        let transfer_id = transfer_id.into();
+        let payload =
+            FileCancelPayload::new(self.local_device.clone(), transfer_id.clone(), message)?;
+        // Stop our local consumer side without removing the inbound offer.
+        self.stream_inbound.remove(&transfer_id);
+        self.cleanup_incoming(&transfer_id);
+        self.pending_outbox.push(Message::file_cancel(payload));
+        Ok(())
+    }
+
     /// Emit up to [`OUTBOUND_CHUNKS_PER_PUMP`] file chunks (or a Complete) for the active send.
     ///
     /// Returns `true` if more pumping is still required. Appends to the outbox without clearing it.
@@ -1384,9 +1405,18 @@ impl Session {
         self.ensure_connected_file_peer(&payload.device_id, "file_cancel")?;
         validate_transfer_id(&payload.transfer_id)?;
         self.abort_active_outbound_if(&payload.transfer_id);
-        self.staged_outbound_files.remove(&payload.transfer_id);
+        // Keep the staged file and inbound offer for clipboard-sourced transfers
+        // so a serial reopen (e.g. after a Nautilus thumbnail probe aborts the
+        // stream) can re-request the same transfer_id.
+        let retain = self
+            .staged_outbound_files
+            .get(&payload.transfer_id)
+            .is_some_and(|s| s.retain_for_clipboard);
+        if !retain {
+            self.staged_outbound_files.remove(&payload.transfer_id);
+            self.inbound_offers.remove(&payload.transfer_id);
+        }
         self.cleanup_incoming(&payload.transfer_id);
-        self.inbound_offers.remove(&payload.transfer_id);
         self.stream_inbound.remove(&payload.transfer_id);
         self.last_inbound_file = Some(InboundFileResult::Failed {
             transfer_id: payload.transfer_id,
@@ -1862,7 +1892,20 @@ impl Session {
     }
 
     fn abort_active_outbound(&mut self) {
-        self.active_outbound = None;
+        if let Some(active) = self.active_outbound.take() {
+            if active.retain_for_clipboard {
+                self.staged_outbound_files.insert(
+                    active.transfer_id,
+                    StagedOutboundFile {
+                        file_name: active.file_name,
+                        size: active.size,
+                        body: active.body,
+                        sha256_hex: active.sha256_hex,
+                        retain_for_clipboard: true,
+                    },
+                );
+            }
+        }
     }
 
     fn abort_active_outbound_if(&mut self, transfer_id: &str) {
@@ -1871,7 +1914,7 @@ impl Session {
             .as_ref()
             .is_some_and(|active| active.transfer_id == transfer_id)
         {
-            self.active_outbound = None;
+            self.abort_active_outbound();
         }
     }
 

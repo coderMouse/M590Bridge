@@ -151,7 +151,7 @@ fn open_reader(inner: &Arc<PipeInner>, size: u64) -> io::Result<PipeReader> {
             "virtual file content is already open",
         ));
     }
-    if state.cancelled && !state.consumed {
+    if state.cancelled && !state.consumed && !state.finished {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "transfer cancelled",
@@ -487,6 +487,46 @@ mod tests {
         reader.read_to_end(&mut out).unwrap();
         producer_thread.join().unwrap();
         assert_eq!(out, b"abcdef");
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Consumed));
+    }
+
+    #[test]
+    fn cancelled_reader_can_reopen_after_producer_fail() {
+        // Simulate a Nautilus thumbnail probe: open, read a few bytes, drop
+        // without consuming → Cancel. Then the hub soft-cancels via
+        // producer.fail(). The next open must succeed (serial reopen).
+        let (bridge, producer) = VirtualFileBridge::with_capacity(6);
+        let producer2 = producer.clone();
+
+        // First round: open and read partial data.
+        let mut first = open_reader(&bridge.inner, 6).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        producer.push(b"abc").unwrap();
+        let mut prefix = [0_u8; 3];
+        first.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"abc");
+
+        // Drop the reader without consuming → Cancel.
+        drop(first);
+        assert_eq!(
+            bridge.take_event(),
+            Some(BridgeEvent::Cancel("virtual file reader closed".into()))
+        );
+
+        // Hub soft-cancel: producer.fail() sets finished=true.
+        producer.fail("thumbnail probe");
+
+        // Reopen must succeed despite cancelled=true (finished=true allows it).
+        let mut second = open_reader(&bridge.inner, 6).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        let producer_thread = thread::spawn(move || {
+            producer2.push(b"xyz123").unwrap();
+            producer2.finish();
+        });
+        let mut out = Vec::new();
+        second.read_to_end(&mut out).unwrap();
+        producer_thread.join().unwrap();
+        assert_eq!(out, b"xyz123");
         assert_eq!(bridge.take_event(), Some(BridgeEvent::Consumed));
     }
 

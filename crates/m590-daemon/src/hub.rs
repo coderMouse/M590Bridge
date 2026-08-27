@@ -2700,6 +2700,18 @@ fn run_session_loop(
                         if let Some(current) = virtual_receive.as_mut() {
                             if let InboundFileResult::Chunk { transfer_id, data } = &file_event {
                                 if current.transfer_id == *transfer_id {
+                                    // Drop stale chunks that belong to a network stream
+                                    // we soft-cancelled (e.g. a Nautilus thumbnail probe
+                                    // that opened the FUSE file and closed it before
+                                    // finishing). They arrive between the cancel and the
+                                    // reopen and must not poison the reset pipe.
+                                    if !current.requested {
+                                        task_058_diagnostic(format_args!(
+                                            "single_network_chunk_dropped_stale entry_id={transfer_id:?} bytes={}",
+                                            data.len()
+                                        ));
+                                        continue;
+                                    }
                                     #[cfg(target_os = "windows")]
                                     if current.first_chunk_at.is_none() {
                                         let first_chunk_at = Instant::now();
@@ -3135,6 +3147,14 @@ fn run_session_loop(
                                         .as_mut()
                                         .filter(|current| current.transfer_id == *transfer_id)
                                     {
+                                        if !current.requested {
+                                            // Stale completion from a soft-cancelled stream
+                                            // (e.g. a thumbnail probe that already aborted).
+                                            task_058_diagnostic(format_args!(
+                                                "single_network_stream_completed_stale entry_id={transfer_id:?}"
+                                            ));
+                                            continue;
+                                        }
                                         task_058_diagnostic(format_args!(
                                             "single_network_stream_completed entry_id={transfer_id:?} size={size} network_ms={} data_ms={} since_publish_ms={}",
                                             current
@@ -3831,6 +3851,50 @@ fn run_session_loop(
                             ));
                         }
                         BridgeEvent::Cancel(reason) => {
+                            let reader_closed = reason == "virtual file reader closed";
+                            if reader_closed && !current.consumed {
+                                // The FUSE reader was opened and closed without
+                                // finishing the stream. This is typically a
+                                // Nautilus thumbnail/metadata probe (mp4/pdf)
+                                // that reads a few KB then releases. Abort the
+                                // in-flight network stream but keep the FUSE
+                                // mount and inbound offer alive so the
+                                // subsequent "replace" stat (and a confirmed
+                                // paste) can reopen the file. Falling through
+                                // to the hard cancel path here would unmount
+                                // FUSE before Nautilus can stat the source.
+                                //
+                                // Use !consumed (not !completed) so this also
+                                // fires when the network stream already finished
+                                // (small files) but the reader didn't read the
+                                // full content.
+                                task_058_diagnostic(format_args!(
+                                    "single_virtual_cancel_partial_reopen entry_id={:?} reason={reason:?}",
+                                    current.transfer_id
+                                ));
+                                current
+                                    .producer
+                                    .fail("virtual file reader closed (thumbnail probe)");
+                                session
+                                    .cancel_file_stream(current.transfer_id.clone(), reason.clone())
+                                    .map_err(|e| e.to_string())?;
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|e| e.to_string())?;
+                                // Drop any backpressured chunk — it belongs to
+                                // the now-cancelled stream and would busy-loop
+                                // try_push against a failed producer.
+                                pending_virtual_chunk = None;
+                                // Reset round-local state so a new FUSE `open`
+                                // re-requests the network stream (serial reopen).
+                                current.requested = false;
+                                current.completed = false;
+                                current.consumed = false;
+                                current.released = false;
+                                current.first_chunk_at = None;
+                                current.network_started_at = None;
+                                // Keep the mount; do NOT promote deferred.
+                                continue;
+                            }
                             task_058_diagnostic(format_args!(
                                 "single_virtual_cancel entry_id={:?} reason={reason:?}",
                                 current.transfer_id
@@ -4029,6 +4093,46 @@ fn run_session_loop(
                                 ));
                             }
                             BridgeEvent::Cancel(reason) => {
+                                let reader_closed = reason == "virtual file reader closed";
+                                if reader_closed && !current.files[index].consumed {
+                                    // Thumbnail/metadata probe: the FUSE reader opened
+                                    // and closed without finishing. Soft-cancel the
+                                    // network stream for this entry (keep the FUSE
+                                    // mount + inbound offer) so the batch survives and
+                                    // a confirmed paste can reopen this entry.
+                                    //
+                                    // Use !consumed (not !completed) so this also
+                                    // fires when the network stream already finished
+                                    // (small files) but the reader didn't read the
+                                    // full content.
+                                    task_058_diagnostic(format_args!(
+                                        "batch_virtual_cancel_partial_reopen batch_id={:?} path={:?} reason={reason:?}",
+                                        current.batch_id,
+                                        current.files[index].entry.relative_path
+                                    ));
+                                    current.files[index]
+                                        .producer
+                                        .fail("virtual file reader closed (thumbnail probe)");
+                                    let entry_id = current.files[index].entry.entry_id.clone();
+                                    session
+                                        .cancel_file_stream(entry_id.clone(), reason.clone())
+                                        .map_err(|e| e.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|e| e.to_string())?;
+                                    // Drop any backpressured chunk — it belongs to
+                                    // the now-cancelled stream and would busy-loop
+                                    // try_push against a failed producer.
+                                    pending_virtual_chunk = None;
+                                    // Reset round-local state so a new FUSE `open`
+                                    // re-requests the network stream (serial reopen).
+                                    current.files[index].requested = false;
+                                    current.files[index].completed = false;
+                                    current.files[index].consumed = false;
+                                    current.files[index].released = false;
+                                    current.files[index].first_chunk_seen = false;
+                                    current.active_index = None;
+                                    continue;
+                                }
                                 task_058_diagnostic(format_args!(
                                     "batch_virtual_cancel batch_id={:?} path={:?} reason={reason:?}",
                                     current.batch_id,
@@ -6132,6 +6236,17 @@ fn handle_linux_virtual_batch_stream_event(
             let index = batch
                 .file_index(transfer_id)
                 .expect("matching Linux virtual batch file");
+            // Drop stale chunks belonging to a network stream we soft-cancelled
+            // (e.g. a Nautilus thumbnail probe on this batch entry).
+            if !batch.files[index].requested {
+                task_058_diagnostic(format_args!(
+                    "batch_network_chunk_dropped_stale batch_id={:?} path={:?} entry_id={transfer_id:?} bytes={}",
+                    batch.batch_id,
+                    batch.files[index].entry.relative_path,
+                    data.len()
+                ));
+                return Ok(LinuxVirtualBatchStreamEvent::Handled(None));
+            }
             if !batch.files[index].first_chunk_seen {
                 batch.files[index].first_chunk_seen = true;
                 task_058_diagnostic(format_args!(
@@ -6206,6 +6321,16 @@ fn handle_linux_virtual_batch_stream_event(
             let index = batch
                 .file_index(transfer_id)
                 .expect("matching Linux virtual batch file");
+            if !batch.files[index].requested {
+                // Stale completion from a soft-cancelled stream
+                // (e.g. a thumbnail probe that already aborted).
+                task_058_diagnostic(format_args!(
+                    "batch_network_stream_completed_stale batch_id={:?} path={:?} entry_id={transfer_id:?}",
+                    batch.batch_id,
+                    batch.files[index].entry.relative_path
+                ));
+                return Ok(LinuxVirtualBatchStreamEvent::Handled(None));
+            }
             task_058_diagnostic(format_args!(
                 "batch_network_stream_completed batch_id={:?} path={:?} entry_id={transfer_id:?} size={size}",
                 batch.batch_id,
