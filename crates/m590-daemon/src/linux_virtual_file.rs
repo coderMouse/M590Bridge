@@ -12,9 +12,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
-use std::time::UNIX_EPOCH;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
@@ -333,7 +331,6 @@ struct TreeFilesystem {
     root_names: Vec<String>,
     next_inode: AtomicU64,
     next_handle: AtomicU64,
-    published: SystemTime,
 }
 
 impl TreeFilesystem {
@@ -344,7 +341,6 @@ impl TreeFilesystem {
             root_names: Vec::new(),
             next_inode: AtomicU64::new(2),
             next_handle: AtomicU64::new(1),
-            published: SystemTime::now(),
         };
         filesystem.nodes.insert(
             ROOT_INODE,
@@ -491,15 +487,15 @@ impl TreeFilesystem {
             ino: inode,
             size: node.size,
             blocks: node.size.div_ceil(BLOCK_SIZE),
-            atime: self.published,
-            mtime: self.published,
-            ctime: self.published,
-            crtime: self.published,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
             kind: node.kind,
             perm: if node.kind == FileType::Directory {
-                0o555
+                0o755
             } else {
-                0o444
+                0o644
             },
             nlink: if node.kind == FileType::Directory {
                 2
@@ -822,7 +818,6 @@ struct SingleFileFilesystem {
     reader: Mutex<ContentState>,
     next_handle: AtomicU64,
     content_handle: AtomicU64,
-    published: SystemTime,
 }
 
 enum ContentState {
@@ -841,7 +836,6 @@ impl SingleFileFilesystem {
             reader: Mutex::new(ContentState::Unopened),
             next_handle: AtomicU64::new(1),
             content_handle: AtomicU64::new(NO_CONTENT_HANDLE),
-            published: SystemTime::now(),
         }
     }
 
@@ -854,12 +848,12 @@ impl SingleFileFilesystem {
             ino: ROOT_INODE,
             size: 0,
             blocks: 0,
-            atime: self.published,
-            mtime: self.published,
-            ctime: self.published,
-            crtime: self.published,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
             kind: FileType::Directory,
-            perm: 0o555,
+            perm: 0o755,
             nlink: 2,
             uid,
             gid,
@@ -878,12 +872,12 @@ impl SingleFileFilesystem {
             ino: FILE_INODE,
             size: self.file.size,
             blocks: self.file.size.div_ceil(BLOCK_SIZE),
-            atime: self.published,
-            mtime: self.published,
-            ctime: self.published,
-            crtime: self.published,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
             kind: FileType::RegularFile,
-            perm: 0o444,
+            perm: 0o644,
             nlink: 1,
             uid,
             gid,

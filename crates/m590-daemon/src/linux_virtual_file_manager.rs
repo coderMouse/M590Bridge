@@ -48,12 +48,6 @@ impl LinuxVirtualFileManager {
     }
 
     /// Replace the current offer only while its exact FUSE path still owns the clipboard.
-    ///
-    /// When the current offer is a single file, the existing mount-point
-    /// directory is reused so the FUSE URI stays identical across a serial
-    /// reopen (Nautilus "replace" stat keeps working). When the current
-    /// offer is a tree (different path shape) the old mount is dropped and a
-    /// fresh mount-point is allocated.
     pub fn replace_if_current(
         &mut self,
         clipboard: &mut dyn ClipboardService,
@@ -63,31 +57,11 @@ impl LinuxVirtualFileManager {
             self.clear();
             return Ok(false);
         }
-        let prev = self.current.take();
-        let next = match prev {
-            Some(MountedVirtualClipboard::File(mounted)) => {
-                MountedVirtualClipboard::File(MountedVirtualFile::remount(file, mounted)?)
-            }
-            // Different shape: drop the old mount and allocate a fresh one.
-            other => {
-                drop(other);
-                self.current = None;
-                MountedVirtualClipboard::File(MountedVirtualFile::mount(file)?)
-            }
-        };
-        clipboard
-            .write_file_list(next.clipboard_paths())
-            .map_err(|error| io::Error::other(format!("publish FUSE clipboard: {error}")))?;
-        self.current = Some(next);
+        self.publish(clipboard, file)?;
         Ok(true)
     }
 
     /// Replace the current offer with a tree only while its full path list owns the clipboard.
-    ///
-    /// When the current offer is a tree, the existing mount-point directory
-    /// is reused so the root FUSE URIs stay identical across a serial
-    /// reopen. When the current offer is a single file (different shape) the
-    /// old mount is dropped and a fresh mount-point is allocated.
     pub fn replace_tree_if_current(
         &mut self,
         clipboard: &mut dyn ClipboardService,
@@ -97,22 +71,7 @@ impl LinuxVirtualFileManager {
             self.clear();
             return Ok(false);
         }
-        let prev = self.current.take();
-        let next = match prev {
-            Some(MountedVirtualClipboard::Tree(mounted)) => {
-                MountedVirtualClipboard::Tree(MountedVirtualTree::remount(tree, mounted)?)
-            }
-            // Different shape: drop the old mount and allocate a fresh one.
-            other => {
-                drop(other);
-                self.current = None;
-                MountedVirtualClipboard::Tree(MountedVirtualTree::mount(tree)?)
-            }
-        };
-        clipboard
-            .write_file_list(next.clipboard_paths())
-            .map_err(|error| io::Error::other(format!("publish FUSE clipboard: {error}")))?;
-        self.current = Some(next);
+        self.publish_tree(clipboard, tree)?;
         Ok(true)
     }
 
@@ -163,7 +122,6 @@ struct MountedVirtualFile {
     mount: Option<LinuxVirtualFileMount>,
     mount_point: PathBuf,
     file_path: PathBuf,
-    reuse_mount_point: bool,
 }
 
 impl MountedVirtualFile {
@@ -176,7 +134,6 @@ impl MountedVirtualFile {
                     mount: Some(mount),
                     mount_point,
                     file_path,
-                    reuse_mount_point: false,
                 })
             }
             Err(error) => {
@@ -184,47 +141,6 @@ impl MountedVirtualFile {
                 Err(error)
             }
         }
-    }
-
-    /// Reuse the existing mount-point directory so the FUSE URI stays
-    /// identical across a serial reopen. The previous session is
-    /// unmounted (the directory becomes empty) and a fresh one is mounted
-    /// in the same path.
-    fn remount(file: LinuxVirtualFile, prev: MountedVirtualFile) -> io::Result<Self> {
-        let mount_point = prev.take_mount_point();
-        // Reuse the same mount point directory; unmount already removed the
-        // FUSE backing so the directory is empty again.
-        match LinuxVirtualFileMount::mount(&mount_point, file) {
-            Ok(mount) => {
-                let file_path = mount.file_path().to_path_buf();
-                Ok(Self {
-                    mount: Some(mount),
-                    mount_point,
-                    file_path,
-                    reuse_mount_point: false,
-                })
-            }
-            Err(error) => {
-                let _ = fs::remove_dir(&mount_point);
-                Err(error)
-            }
-        }
-    }
-}
-
-impl MountedVirtualFile {
-    /// Unmount the live session but keep the mount-point directory so a
-    /// subsequent [`Self::remount`] can reuse it (stable FUSE URI).
-    fn take_mount_point(mut self) -> PathBuf {
-        if let Some(mount) = self.mount.take() {
-            if let Err(error) = mount.unmount() {
-                eprintln!("FUSE virtual file unmount failed: {error}");
-            }
-        }
-        let mount_point = self.mount_point.clone();
-        // Prevent Drop from removing the directory we are handing off.
-        self.reuse_mount_point = true;
-        mount_point
     }
 }
 
@@ -235,11 +151,9 @@ impl Drop for MountedVirtualFile {
                 eprintln!("FUSE virtual file unmount failed: {error}");
             }
         }
-        if !self.reuse_mount_point {
-            if let Err(error) = fs::remove_dir(&self.mount_point) {
-                if error.kind() != io::ErrorKind::NotFound {
-                    eprintln!("FUSE virtual file mount cleanup failed: {error}");
-                }
+        if let Err(error) = fs::remove_dir(&self.mount_point) {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!("FUSE virtual file mount cleanup failed: {error}");
             }
         }
     }
@@ -249,7 +163,6 @@ impl Drop for MountedVirtualFile {
 struct MountedVirtualTree {
     mount: Option<LinuxVirtualFileTreeMount>,
     mount_point: PathBuf,
-    reuse_mount_point: bool,
 }
 
 impl MountedVirtualTree {
@@ -259,7 +172,6 @@ impl MountedVirtualTree {
             Ok(mount) => Ok(Self {
                 mount: Some(mount),
                 mount_point,
-                reuse_mount_point: false,
             }),
             Err(error) => {
                 let _ = fs::remove_dir(&mount_point);
@@ -274,41 +186,6 @@ impl MountedVirtualTree {
             .expect("mounted virtual tree is present")
             .root_paths()
     }
-
-    /// Reuse the existing mount-point directory so all root FUSE URIs stay
-    /// identical across a serial reopen. The previous session is unmounted
-    /// (the directory becomes empty) and a fresh one is mounted in the same
-    /// path.
-    fn remount(tree: LinuxVirtualFileTree, prev: MountedVirtualTree) -> io::Result<Self> {
-        let mount_point = prev.take_mount_point();
-        match LinuxVirtualFileTreeMount::mount(&mount_point, tree) {
-            Ok(mount) => Ok(Self {
-                mount: Some(mount),
-                mount_point,
-                reuse_mount_point: false,
-            }),
-            Err(error) => {
-                let _ = fs::remove_dir(&mount_point);
-                Err(error)
-            }
-        }
-    }
-}
-
-impl MountedVirtualTree {
-    /// Unmount the live session but keep the mount-point directory so a
-    /// subsequent [`Self::remount`] can reuse it (stable FUSE URIs).
-    fn take_mount_point(mut self) -> PathBuf {
-        if let Some(mount) = self.mount.take() {
-            if let Err(error) = mount.unmount() {
-                eprintln!("FUSE virtual tree unmount failed: {error}");
-            }
-        }
-        let mount_point = self.mount_point.clone();
-        // Prevent Drop from removing the directory we are handing off.
-        self.reuse_mount_point = true;
-        mount_point
-    }
 }
 
 impl Drop for MountedVirtualTree {
@@ -318,11 +195,9 @@ impl Drop for MountedVirtualTree {
                 eprintln!("FUSE virtual tree unmount failed: {error}");
             }
         }
-        if !self.reuse_mount_point {
-            if let Err(error) = fs::remove_dir(&self.mount_point) {
-                if error.kind() != io::ErrorKind::NotFound {
-                    eprintln!("FUSE virtual tree mount cleanup failed: {error}");
-                }
+        if let Err(error) = fs::remove_dir(&self.mount_point) {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!("FUSE virtual tree mount cleanup failed: {error}");
             }
         }
     }
