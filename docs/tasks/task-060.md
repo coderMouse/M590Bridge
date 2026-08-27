@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（实现完成，真机待验收）
+`in_progress`（Q1/Q2 真机通过；Q3/Q4 待修复；Q3 触发后 Linux→Windows 剪贴板卡死待排查）
 
 ## 背景
 
@@ -91,10 +91,10 @@ git diff --check
 
 真机验收（两端各连续两次 `Ctrl+V`，校验内容一致）：
 
-- [ ] Linux → Windows 单文件：第二次粘贴成功。
-- [ ] Linux → Windows 多文件：第二次粘贴全部成功（不再是只第一个）。
-- [ ] Windows → Linux 单文件：第二次粘贴成功。
-- [ ] Windows → Linux 多文件：第二次粘贴成功（不再「拼接文件时出错」）。
+- [x] Linux → Windows 单文件：第二次粘贴成功。（2026-08-27 真机通过）
+- [x] Linux → Windows 多文件：第二次粘贴全部成功（不再是只第一个）。（2026-08-27 真机通过）
+- [x] Windows → Linux 单文件：第二次粘贴成功。（2026-08-27 真机通过）
+- [x] Windows → Linux 多文件：第二次粘贴成功（不再「拼接文件时出错」）。（2026-08-27 真机通过）
 - [ ] Windows → Linux 同名文件「替换」：不再 `ENOENT`，内容正确覆盖。
 - [ ] Windows → Linux 粘贴落地文件：Nautilus 无异常「x」图标，或已记录为无害已知现象
       并说明原因。
@@ -134,6 +134,54 @@ git diff --check
   并重发网络流、批次完成计数回退、批次重开回归测试。
 - `crates/m590-daemon/src/linux_virtual_file.rs`：`release_handle` 重置 `ContentState` 为
   `Unopened`（单文件与 tree）。
+- `crates/m590-daemon/src/hub.rs`（二轮）：`VIRTUAL_PUBLISH_IDLE_TIMEOUT` 与
+  `virtual_receive_publish_is_idle`、单文件/批次 keep_current 兜底 detach、
+  `LinuxVirtualBatchReceive.published_at` 字段、idle 回归测试。
+
+### 二轮（2026-08-27）：Q3 连锁故障兜底
+
+真机复测确认 Q1/Q2 已通过，Q3（替换 `ENOENT`）出现后 Linux→Windows 剪贴板完全卡死、
+重启不复位。只读定位根因：已发布但**从未被请求**（OS 消费者在 `read` 之前失败，例如
+Nautilus 替换/冲突流程未进入读取）的虚拟 offer，会让 `virtual_receive`/
+`virtual_batch_receive` 永久保留为 `Some`，使主循环里 `virtual_clipboard_active` 恒为
+true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新、重启不复位」的成因。原代码无
+任何 publish-idle 超时或兜底 detach 路径。
+
+- **hub**（`hub.rs`）：新增 `VIRTUAL_PUBLISH_IDLE_TIMEOUT`（120s）与谓词
+  `virtual_receive_publish_is_idle(requested, completed, published_at, now)`。Linux 单文件
+  与批次 receive 的 keep_current 评估中，在 is_current 与原有 detach 判定之间插入：当
+  从未被请求且未完成、且发布已超过 120s 时，`producer.fail` + `cancel_file` +
+  `fuse_manager.clear()` + 清 `latest_clipboard_file_offer_id` 并 detach，释放本地剪贴板
+  轮询。被请求过的 offer 不受影响（仍由 stream 生命周期/重开逻辑负责清理），避免回归
+  Q1/Q2。
+- `LinuxVirtualBatchReceive` 新增 `published_at: Instant` 字段（构造时设为 `now`），供
+  批次 idle 判定使用。
+- **Q3 替换流程的 `ENOENT` 与 Q4 Nautilus「x」角标**：无桌面环境，本轮未改 FUSE 属性，
+  避免引入回归。怀疑 Q3 的 ENOENT 来自替换流程中 reader 在未完成时被 release 触发
+  `BridgeEvent::Cancel` → `fuse_manager.clear()` → FUSE 卸载，随后 Nautilus 再 stat 即
+  ENOENT；Q4 疑与 FUSE 文件 `atime/mtime=UNIX_EPOCH`/`perm 0o444` 等元数据被 GVFS 误判
+  为占位/失效有关。两者列为待真机排查开放项。
+
+## 真机复测反馈（2026-08-27）
+
+提交 `796b8eb` 推送后真机复测结果：
+
+- **Q1（Linux→Windows 多文件第二次只粘第一个）**：已修复，真机通过。
+- **Q2（Windows→Linux 多文件第二次「拼接文件时出错」）**：已修复，真机通过。
+- **Q3（Windows→Linux 同名文件「替换」报 `ENOENT`）**：问题依旧，未修复。
+  - 现象：目标目录存在同名文件，`Ctrl+V` 选「替换」仍报
+    「获取文件 "/tmp/m590bridge-fuse-263923-13/DJI_20260412164952_0709_D.MP4" 的信息时出错：
+    没有那个文件或目录」。
+- **Q4（Nautilus「x」角标）**：问题依旧，未修复。
+- **新 blocker（最高优先级）**：Q3 报错出现后，**Linux 无法再复制新内容到 Windows**——
+  Linux 复制时剪贴板内容不会更新，**重启两端应用也不恢复**。怀疑 Q3 的替换失败把某处
+  FUSE/会话/剪贴板状态卡死，导致后续剪贴板发布被阻断。
+  - **已定位+修复（2026-08-27）**：根因是已发布但从未被请求的虚拟 offer 永久保留
+    `virtual_receive`/`virtual_batch_receive`，使 `virtual_clipboard_active` 恒为 true，
+    本地剪贴板轮询被永久阻塞。已加 `VIRTUAL_PUBLISH_IDLE_TIMEOUT`（120s）兜底 detach。
+
+结论：串行重开本身（Q1/Q2）已在真机验证有效；Q3 连锁故障已在本轮代码修复，待真机复测；
+剩余 Q3 替换 `ENOENT` 与 Q4 角标为待真机排查开放项。
 
 ## 验证结果
 
@@ -150,7 +198,12 @@ git diff --check
 - 新增 `retained_clipboard_offer_can_be_requested_again_after_completion`：通过。
 - 新增 `non_retained_offer_is_gone_after_completion`：通过。
 - 新增 `linux_virtual_batch_completed_entry_can_be_reopened`：通过。
-- 待真机验收：四类问题在 Windows/Linux 桌面连续两次 `Ctrl+V` 的真机复测（见完成标准）。
+- 二轮（2026-08-27）：`cargo test -p m590-daemon --lib`：72 passed，0 failed，2 ignored
+  （新增 `virtual_publish_idle_detaches_unrequested_offers`）。
+- 二轮：`cargo check --workspace`、`cargo check -p m590-daemon --target
+  x86_64-pc-windows-gnu --lib`、`cargo clippy -p m590-{core,daemon} --lib --no-deps
+  -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：全部通过。
+- 待真机验收：Q3 连锁修复（发布后 120s 自动恢复本地剪贴板）、Q3 替换 `ENOENT`、Q4 角标。
 
 ## 文档影响
 
@@ -167,6 +220,11 @@ git diff --check
 
 ## 下一步
 
-- 开始任务时先以只读分析定位：发送端哪个 entry 在批次完成后被清理、Linux FUSE 第二轮
-  重新打开的具体失败点、Windows OLE 集合第二次打开的请求顺序、Nautilus「替换」的
-  `stat` 目标路径、emblem 触发的 `stat`/xattr 差异。
+- 真机复测 Q3 连锁修复：在 Windows→Linux 触发替换 `ENOENT` 后，确认本地剪贴板在 120s 内
+  自动恢复轮询、可重新复制内容到 Windows。
+- 真机排查 Q3 替换 `ENOENT`：用 FUSE 日志确认是否为替换流程中 reader 未完成时 release
+  触发 `BridgeEvent::Cancel` → FUSE 卸载，随后 Nautilus 再 stat 而报错；若是，评估将
+  「已请求但未完成」的 release 改为保留挂载以支持重开，而非立即 cancel。
+- 真机排查 Q4：对比落地文件与本机文件的 `stat`/xattr/MIME（尤其 `atime/mtime`、
+  `perm 0o444`），消除 Nautilus「x」角标或记录为无害已知现象。
+- Q1/Q2 已真机通过，不再重复验证。

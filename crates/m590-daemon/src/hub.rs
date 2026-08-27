@@ -53,6 +53,11 @@ const STALLED_FILE_LOOP_DELAY: Duration = Duration::from_millis(1);
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// A published Linux/Windows virtual file offer that never gets opened (the OS
+/// rejected the path, or the file manager failed before reading) is abandoned
+/// after this delay so the local clipboard poll is not blocked forever.
+#[cfg(target_os = "linux")]
+const VIRTUAL_PUBLISH_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "windows")]
 const REPLACED_BATCH_REQUEST_GRACE: Duration = Duration::from_secs(2);
 
@@ -214,6 +219,7 @@ struct LinuxVirtualBatchReceive {
     completed_files: u32,
     completed_bytes: u64,
     clipboard_replaced: bool,
+    published_at: Instant,
 }
 
 #[cfg(target_os = "linux")]
@@ -439,6 +445,22 @@ fn linux_completed_replaced_virtual_receive_can_detach(
     clipboard_replaced: bool,
 ) -> bool {
     completed && consumed && released && clipboard_replaced
+}
+
+/// A published but never-requested virtual offer is abandoned after
+/// [`VIRTUAL_PUBLISH_IDLE_TIMEOUT`] so the local clipboard poll is not
+/// blocked forever when the OS consumer failed before opening the file
+/// (e.g. a Nautilus replace/conflict flow that never reached `read`).
+#[cfg(target_os = "linux")]
+fn virtual_receive_publish_is_idle(
+    requested: bool,
+    completed: bool,
+    published_at: Instant,
+    now: Instant,
+) -> bool {
+    !requested
+        && !completed
+        && now.saturating_duration_since(published_at) >= VIRTUAL_PUBLISH_IDLE_TIMEOUT
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3897,6 +3919,31 @@ fn run_session_loop(
                 }
 
                 if keep_current
+                    && virtual_receive_publish_is_idle(
+                        current.requested,
+                        current.completed,
+                        current.published_at,
+                        Instant::now(),
+                    )
+                {
+                    task_058_diagnostic(format_args!(
+                        "single_virtual_publish_idle_detached entry_id={:?} since_publish_ms={}",
+                        current.transfer_id,
+                        Instant::now()
+                            .saturating_duration_since(current.published_at)
+                            .as_millis()
+                    ));
+                    current.producer.fail("virtual file publish idle");
+                    session
+                        .cancel_file(current.transfer_id.clone(), "virtual file publish idle")
+                        .map_err(|e| e.to_string())?;
+                    conn.send_all(session.take_outbox().iter())
+                        .map_err(|e| e.to_string())?;
+                    fuse_manager.clear();
+                    latest_clipboard_file_offer_id = None;
+                    keep_current = false;
+                }
+                if keep_current
                     && linux_completed_replaced_virtual_receive_can_detach(
                         current.completed,
                         current.consumed,
@@ -4073,6 +4120,31 @@ fn run_session_loop(
                     }
                 }
 
+                if keep_current
+                    && virtual_receive_publish_is_idle(
+                        current.has_requested_file(),
+                        current.is_complete(),
+                        current.published_at,
+                        Instant::now(),
+                    )
+                {
+                    task_058_diagnostic(format_args!(
+                        "batch_virtual_publish_idle_detached batch_id={:?} since_publish_ms={}",
+                        current.batch_id,
+                        Instant::now()
+                            .saturating_duration_since(current.published_at)
+                            .as_millis()
+                    ));
+                    cancel_linux_virtual_batch(
+                        session,
+                        conn,
+                        &current,
+                        "virtual batch publish idle",
+                    )?;
+                    fuse_manager.clear();
+                    latest_clipboard_file_offer_id = None;
+                    keep_current = false;
+                }
                 if keep_current && current.clipboard_replaced && !current.must_finish() {
                     cancel_linux_virtual_batch(session, conn, &current, "clipboard replaced")?;
                     fuse_manager.clear();
@@ -5922,6 +5994,7 @@ fn prepare_linux_virtual_batch_offer(
             completed_files: 0,
             completed_bytes: 0,
             clipboard_replaced: false,
+            published_at: Instant::now(),
         },
     ))
 }
@@ -6781,6 +6854,41 @@ mod tests {
         ));
         assert!(linux_completed_replaced_virtual_receive_can_detach(
             true, true, true, true
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn virtual_publish_idle_detaches_unrequested_offers() {
+        let published_at = Instant::now() - VIRTUAL_PUBLISH_IDLE_TIMEOUT - Duration::from_secs(1);
+        // Never requested, never completed, past the idle window -> detach.
+        assert!(virtual_receive_publish_is_idle(
+            false,
+            false,
+            published_at,
+            Instant::now()
+        ));
+        // Still within the idle window -> keep.
+        assert!(!virtual_receive_publish_is_idle(
+            false,
+            false,
+            Instant::now(),
+            Instant::now()
+        ));
+        // Requested (OS opened the file) -> never idle-detach, let the stream
+        // lifecycle own cleanup.
+        assert!(!virtual_receive_publish_is_idle(
+            true,
+            false,
+            published_at,
+            Instant::now()
+        ));
+        // Completed (even if somehow never requested) -> keep, not idle.
+        assert!(!virtual_receive_publish_is_idle(
+            false,
+            true,
+            published_at,
+            Instant::now()
         ));
     }
 
