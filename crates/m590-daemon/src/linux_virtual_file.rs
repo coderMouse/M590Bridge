@@ -493,9 +493,9 @@ impl TreeFilesystem {
             crtime: UNIX_EPOCH,
             kind: node.kind,
             perm: if node.kind == FileType::Directory {
-                0o755
+                0o775
             } else {
-                0o644
+                0o664
             },
             nlink: if node.kind == FileType::Directory {
                 2
@@ -853,7 +853,7 @@ impl SingleFileFilesystem {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: 0o775,
             nlink: 2,
             uid,
             gid,
@@ -877,7 +877,7 @@ impl SingleFileFilesystem {
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind: FileType::RegularFile,
-            perm: 0o644,
+            perm: 0o664,
             nlink: 1,
             uid,
             gid,

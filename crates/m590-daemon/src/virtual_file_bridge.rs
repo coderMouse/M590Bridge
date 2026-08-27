@@ -187,12 +187,16 @@ fn open_reader(inner: &Arc<PipeInner>, size: u64) -> io::Result<PipeReader> {
 }
 
 #[cfg(target_os = "linux")]
-fn release_reader(inner: &Arc<PipeInner>, reason: &str) {
+fn release_reader(inner: &Arc<PipeInner>, _reason: &str) {
     if let Ok(mut state) = inner.state.lock() {
-        if state.reader_open && !state.consumed && !state.cancelled {
-            state.cancelled = true;
-            let _ = inner.events.send(BridgeEvent::Cancel(reason.into()));
-        }
+        // Do NOT set cancelled or send Cancel. A partial read (e.g. a Nautilus
+        // thumbnail/metadata probe) closes the reader without consuming the full
+        // file. Sending Cancel would tear down the network stream and, via the
+        // hub's clipboard-poll/idle logic, unmount the FUSE before the user can
+        // reopen the file for the actual paste/replace. Instead, just mark the
+        // reader as released; open_reader will reset the pipe and re-request on
+        // the next open. The producer's stalled-timeout is suppressed while
+        // `released` is true so the sender does not abort prematurely.
         if state.reader_open && !state.released {
             state.released = true;
             let _ = inner.events.send(BridgeEvent::Released);
@@ -250,7 +254,14 @@ impl PipeProducer {
         }
         if self.inner.capacity - state.bytes.len() < data.len() {
             let blocked_since = *state.write_blocked_since.get_or_insert_with(Instant::now);
-            if blocked_since.elapsed() >= timeout {
+            // Suppress the stalled timeout while the reader has been released
+            // (e.g. a Nautilus thumbnail probe that will reopen). The sender
+            // should continue streaming; the pipe will be drained on reopen.
+            #[cfg(target_os = "linux")]
+            let suppress_timeout = state.released;
+            #[cfg(not(target_os = "linux"))]
+            let suppress_timeout = false;
+            if blocked_since.elapsed() >= timeout && !suppress_timeout {
                 state.cancelled = true;
                 let message = "virtual file consumer stalled".to_string();
                 let _ = self.inner.events.send(BridgeEvent::Cancel(message.clone()));
@@ -424,7 +435,7 @@ impl Drop for PipeReader {
                 #[cfg(target_os = "windows")]
                 let should_cancel = !state.finished;
                 #[cfg(not(target_os = "windows"))]
-                let should_cancel = true;
+                let should_cancel = !state.released;
                 if !should_cancel || state.cancelled {
                     state.reader_open = false;
                     self.inner.changed.notify_all();
@@ -779,11 +790,9 @@ mod tests {
         let (bridge, _producer) = VirtualFileBridge::new();
         let _reader = open_reader(&bridge.inner, 1).unwrap();
         assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        // release_reader no longer sends Cancel — it only marks the reader
+        // as released so the pipe can be reset on reopen.
         release_reader(&bridge.inner, "virtual file reader closed");
-        assert_eq!(
-            bridge.take_event(),
-            Some(BridgeEvent::Cancel("virtual file reader closed".into()))
-        );
         assert_eq!(bridge.take_event(), Some(BridgeEvent::Released));
     }
 }
