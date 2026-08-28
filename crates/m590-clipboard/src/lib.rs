@@ -349,6 +349,15 @@ pub trait ClipboardService {
     fn adopt_text_baseline(&mut self) {
         let _ = self;
     }
+
+    /// Record `image` as the current clipboard image baseline without writing.
+    ///
+    /// Used when an application-specific representation (e.g. a Windows OLE
+    /// virtual image offer that also serves the bitmap formats) replaces the
+    /// bitmap on the clipboard instead of [`Self::write_image`].
+    fn adopt_image_baseline(&mut self, image: &ImageClipboard) {
+        let _ = image;
+    }
 }
 
 /// No-op clipboard used in tests and headless demos.
@@ -628,6 +637,13 @@ impl ClipboardService for PlatformClipboard {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             self.inner.adopt_text_baseline();
+        }
+    }
+
+    fn adopt_image_baseline(&mut self, image: &ImageClipboard) {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.adopt_image_baseline(image);
         }
     }
 }

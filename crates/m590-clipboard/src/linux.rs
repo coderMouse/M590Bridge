@@ -107,6 +107,10 @@ impl ClipboardService for LinuxClipboard {
         Ok(())
     }
 
+    fn adopt_image_baseline(&mut self, image: &ImageClipboard) {
+        self.last_image_fp = Some(image.fingerprint());
+    }
+
     fn poll_image_change(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
         let current = read_image_raw(&mut self.clipboard)?;
         let fp = current.as_ref().map(|img| img.fingerprint());

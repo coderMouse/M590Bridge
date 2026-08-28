@@ -95,6 +95,10 @@ impl ClipboardService for WindowsClipboard {
         Ok(())
     }
 
+    fn adopt_image_baseline(&mut self, image: &ImageClipboard) {
+        self.last_image_fp = Some(image.fingerprint());
+    }
+
     fn poll_image_change(&mut self) -> Result<Option<ImageClipboard>, ClipboardError> {
         let current = match read_image_raw(&mut self.clipboard) {
             Ok(v) => v,

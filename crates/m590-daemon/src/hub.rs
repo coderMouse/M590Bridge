@@ -2366,36 +2366,45 @@ fn run_session_loop(
                                     Ok(image) => {
                                         #[cfg(target_os = "windows")]
                                         {
-                                            // Dual representation: keep the bitmap on the
-                                            // clipboard (Word/WordPad) AND advertise the same
-                                            // image as a virtual .png file (Explorer paste-as-file).
-                                            // The OLE object also serves CF_DIBV5 + registered PNG,
-                                            // so our own poll reads back the same pixels (no echo).
-                                            if let Err(err) = clip.write_image(&image) {
-                                                with_status(&shared, |s| {
-                                                    s.last_error = Some(format!(
-                                                        "clipboard_write_image: {err}"
-                                                    ));
-                                                });
-                                            }
-                                            match image_file_collection(&content_id, &image) {
-                                                Ok(collection) => {
-                                                    if let Err(err) =
-                                                        ole_manager.publish_collection(collection)
+                                            // Dual representation via one OLE publish: the data
+                                            // object serves CF_DIBV5 (Word/WordPad), the
+                                            // registered PNG (our poll reads the same pixels, no
+                                            // echo) and a virtual .png file (Explorer paste).
+                                            // Do NOT raw-write first: EmptyClipboard over an OLE
+                                            // owned clipboard corrupts ole32 ownership and every
+                                            // later OleSetClipboard fails with CLIPBRD_E_CANT_OPEN
+                                            // until an external app re-copies.
+                                            let published =
+                                                image_file_collection(&content_id, &image)
+                                                    .map_err(|e| e.to_string())
+                                                    .and_then(|collection| {
+                                                        ole_manager
+                                                            .publish_collection(collection)
+                                                            .map_err(|e| e.to_string())
+                                                    });
+                                            match published {
+                                                Ok(()) => {
+                                                    clip.adopt_image_baseline(&image);
+                                                }
+                                                Err(err) => {
+                                                    // OLE unavailable: fall back to a plain
+                                                    // bitmap write so Word/paint paste still
+                                                    // works; Explorer paste-as-file is lost.
+                                                    if let Err(write_err) = clip.write_image(&image)
                                                     {
+                                                        with_status(&shared, |s| {
+                                                            s.last_error = Some(format!(
+                                                                "clipboard_write_image: {write_err} \
+                                                                 (OLE publish: {err})"
+                                                            ));
+                                                        });
+                                                    } else {
                                                         with_status(&shared, |s| {
                                                             s.last_error = Some(format!(
                                                                 "clipboard_offer_image_file: {err}"
                                                             ));
                                                         });
                                                     }
-                                                }
-                                                Err(err) => {
-                                                    with_status(&shared, |s| {
-                                                        s.last_error = Some(format!(
-                                                            "clipboard_prepare_image_file: {err}"
-                                                        ));
-                                                    });
                                                 }
                                             }
                                         }

@@ -4,6 +4,7 @@ use std::mem::{offset_of, size_of, ManuallyDrop};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::thread::ThreadId;
+use std::time::Duration;
 
 use windows::core::{implement, ComObject, Error, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
@@ -35,6 +36,11 @@ use crate::virtual_file::ReadSeek;
 use crate::{ClipboardError, VirtualFile, VirtualFileCollection, VirtualFileCollectionEntry};
 
 const FORMAT_INDEX_NONE: i32 = -1;
+
+/// `CLIPBRD_E_CANT_OPEN` — the clipboard is momentarily open by another window
+/// (including our own pollers); retry like arboard does for plain writes.
+const CLIPBRD_E_CANT_OPEN: HRESULT = HRESULT(0x8004_01D0u32 as i32);
+const OLE_PUBLISH_RETRIES: usize = 10;
 
 #[cfg(feature = "task-057-diagnostics")]
 fn task_057_diagnostic(args: std::fmt::Arguments<'_>) {
@@ -736,7 +742,27 @@ pub fn publish_virtual_file_collection(
         formats,
     })
     .into_interface::<IDataObject>();
-    if let Err(err) = unsafe { OleSetClipboard(&object) } {
+    let mut last_error = None;
+    for attempt in 0..=OLE_PUBLISH_RETRIES {
+        match unsafe { OleSetClipboard(&object) } {
+            Ok(()) => {
+                last_error = None;
+                break;
+            }
+            Err(err) if err.code() == CLIPBRD_E_CANT_OPEN && attempt < OLE_PUBLISH_RETRIES => {
+                task_057_diagnostic(format_args!(
+                    "ole_set_clipboard retry attempt={attempt} err={err}"
+                ));
+                last_error = Some(err);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                last_error = Some(err);
+                break;
+            }
+        }
+    }
+    if let Some(err) = last_error {
         drop(object);
         unsafe { OleUninitialize() };
         return Err(ClipboardError::Backend(err.to_string()));

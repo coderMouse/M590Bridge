@@ -123,3 +123,36 @@
   若真机不满足，再补双表示（FUSE 文件 + 位图并存）。
 - 已知上游：image ≥0.25.7 对「仅 DIBv5（无 PNG）」的外部剪贴板读取存在 +12 偏移
   误读风险（与本改动无关，属既有行为）；真机观察 Word/浏览器复制图片是否正常。
+
+## 修复记录（2026-08-29）：prtsc 位图后 OLE 发布失败 / 之后文件复制阻塞
+
+### 用户真机问题
+
+Linux prtsc 截图 → Windows 能贴 Word、无法粘贴成图片文件；随后 Linux 向
+Windows 复制任何文件都报 `OLE publish failed: ... OpenClipboard 失败
+(0x800401D0)`，直到 Windows 本地随便复制一个文件才恢复。
+
+### 根因
+
+位图分支原来先 `clip.write_image`（arboard 裸 `EmptyClipboard` +
+`SetClipboardData`，hub 线程），再 `OleSetClipboard`（OLE STA 线程）。当剪贴板
+正被我们自己的 OLE 对象持有（例如早前的文件 offer）时，用裸 `EmptyClipboard`
+覆盖 OLE owner 会破坏 ole32 内部 owner 状态：之后每次 `OleSetClipboard` 都返回
+`CLIPBRD_E_CANT_OPEN`（0x800401D0），直到外部程序重新复制（`EmptyClipboard`）
+才重置。文件 offer 之间用 OLE 替换 OLE 不触发（task-045/046 已验证）。
+
+### 修复
+
+1. **Windows 位图接收改为单一 OLE 发布**：直接发布双表示对象（serve
+   `CF_DIBV5` + 已注册 `PNG` + 虚拟 `.png`），不再先裸写；回读指纹由
+   `ClipboardService::adopt_image_baseline` 登记（Windows/Linux 实现均登记
+   `last_image_fp`），无回环。OLE 发布失败时才回退 `write_image`（保 Word 粘贴）。
+2. **OLE 发布对 `CLIPBRD_E_CANT_OPEN` 短暂重试**（10 次 × 25ms，等效 arboard
+   的 5×5ms 打开重试），吸收瞬时竞争；`task-057-diagnostics` 记录每次重试。
+
+### 代码级验证
+
+- `cargo test -p m590-clipboard --lib` 26 通过；`cargo test -p m590-daemon --lib`
+  74 通过；Windows 交叉 `cargo check --target x86_64-pc-windows-gnu --lib`、
+  clippy `-D warnings`、fmt、`git diff --check` 通过。
+- 待真机复测：prtsc → Windows 贴 Word + 粘贴成图片文件；随后文件复制恢复正常。
