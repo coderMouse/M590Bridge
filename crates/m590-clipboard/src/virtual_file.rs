@@ -103,6 +103,14 @@ impl fmt::Debug for VirtualFileCollectionEntry {
 #[derive(Clone, Debug)]
 pub struct VirtualFileCollection {
     entries: Vec<VirtualFileCollectionEntry>,
+    /// Optional DIBv5 payload served as the Windows `CF_DIBV5` clipboard
+    /// format when this collection also carries an image (Word/WordPad).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    dib_v5: Option<Vec<u8>>,
+    /// Optional PNG payload served as the registered `PNG` clipboard format
+    /// (used by `arboard` reads and image-aware apps).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    png: Option<Vec<u8>>,
 }
 
 impl VirtualFileCollection {
@@ -140,7 +148,11 @@ impl VirtualFileCollection {
                 }
             }
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            dib_v5: None,
+            png: None,
+        })
     }
 
     pub fn single(file: VirtualFile) -> Self {
@@ -151,11 +163,39 @@ impl VirtualFileCollection {
         };
         Self {
             entries: vec![entry],
+            dib_v5: None,
+            png: None,
+        }
+    }
+
+    /// A single virtual PNG file whose image is ALSO advertised as the Windows
+    /// `CF_DIBV5` and registered `PNG` clipboard formats. One OLE data object
+    /// then serves Explorer (virtual file paste) and Word/WordPad (image paste).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn single_image(file: VirtualFile, dib_v5: Vec<u8>, png: Vec<u8>) -> Self {
+        Self {
+            entries: vec![VirtualFileCollectionEntry {
+                relative_path: file.file_name.clone(),
+                relative_path_utf16: file.file_name_utf16.clone(),
+                file: Some(file),
+            }],
+            dib_v5: Some(dib_v5),
+            png: Some(png),
         }
     }
 
     pub fn entries(&self) -> &[VirtualFileCollectionEntry] {
         &self.entries
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn dib_v5_bytes(&self) -> Option<&[u8]> {
+        self.dib_v5.as_deref()
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn png_bytes(&self) -> Option<&[u8]> {
+        self.png.as_deref()
     }
 }
 

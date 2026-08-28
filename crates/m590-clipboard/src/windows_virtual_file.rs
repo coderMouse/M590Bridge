@@ -21,7 +21,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::DataExchange::{GetClipboardSequenceNumber, RegisterClipboardFormatW};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{
-    OleInitialize, OleSetClipboard, OleUninitialize, DROPEFFECT_COPY,
+    OleInitialize, OleSetClipboard, OleUninitialize, CF_DIBV5, DROPEFFECT_COPY,
 };
 use windows::Win32::UI::Shell::{
     SHCreateStdEnumFmtEtc, CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_PREFERREDDROPEFFECT,
@@ -49,6 +49,8 @@ struct ClipboardFormats {
     descriptor: u16,
     contents: u16,
     preferred_drop_effect: u16,
+    dib_v5: u16,
+    png: u16,
 }
 
 impl ClipboardFormats {
@@ -57,10 +59,12 @@ impl ClipboardFormats {
             descriptor: register_format(CFSTR_FILEDESCRIPTORW)?,
             contents: register_format(CFSTR_FILECONTENTS)?,
             preferred_drop_effect: register_format(CFSTR_PREFERREDDROPEFFECT)?,
+            dib_v5: CF_DIBV5.0,
+            png: register_format(windows::core::w!("PNG"))?,
         })
     }
 
-    fn as_format_etc(self) -> [FORMATETC; 3] {
+    fn as_format_etc(self) -> [FORMATETC; 5] {
         [
             FORMATETC {
                 cfFormat: self.descriptor,
@@ -89,6 +93,20 @@ impl ClipboardFormats {
                 lindex: FORMAT_INDEX_NONE,
                 tymed: TYMED_HGLOBAL.0 as u32,
             },
+            FORMATETC {
+                cfFormat: self.dib_v5,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: FORMAT_INDEX_NONE,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            },
+            FORMATETC {
+                cfFormat: self.png,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: FORMAT_INDEX_NONE,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            },
         ]
     }
 }
@@ -107,6 +125,8 @@ enum RequestedFormat {
     Contents(usize),
     ContentsQuery,
     PreferredDropEffect,
+    DibV5,
+    Png,
 }
 
 #[implement(IDataObject)]
@@ -159,6 +179,16 @@ impl VirtualFileDataObject {
                 return Err(DV_E_LINDEX);
             }
             (RequestedFormat::PreferredDropEffect, TYMED_HGLOBAL.0 as u32)
+        } else if format.cfFormat == self.formats.dib_v5 {
+            if format.lindex != FORMAT_INDEX_NONE {
+                return Err(DV_E_LINDEX);
+            }
+            (RequestedFormat::DibV5, TYMED_HGLOBAL.0 as u32)
+        } else if format.cfFormat == self.formats.png {
+            if format.lindex != FORMAT_INDEX_NONE {
+                return Err(DV_E_LINDEX);
+            }
+            (RequestedFormat::Png, TYMED_HGLOBAL.0 as u32)
         } else {
             return Err(DV_E_CLIPFORMAT);
         };
@@ -294,6 +324,22 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
                 self.content_medium(index)
             }
             RequestedFormat::ContentsQuery => unreachable!("GetData rejects capability queries"),
+            RequestedFormat::DibV5 => {
+                let dib = self
+                    .collection
+                    .dib_v5_bytes()
+                    .ok_or_else(|| Error::from_hresult(DV_E_CLIPFORMAT))?;
+                task_057_diagnostic(format_args!("get_data kind=dibv5 bytes={}", dib.len()));
+                hglobal_medium_from_bytes(dib)
+            }
+            RequestedFormat::Png => {
+                let png = self
+                    .collection
+                    .png_bytes()
+                    .ok_or_else(|| Error::from_hresult(DV_E_CLIPFORMAT))?;
+                task_057_diagnostic(format_args!("get_data kind=png bytes={}", png.len()));
+                hglobal_medium_from_bytes(png)
+            }
         }
     }
 
@@ -320,6 +366,8 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
                 }
                 Ok(RequestedFormat::ContentsQuery) => "contents_query",
                 Ok(RequestedFormat::PreferredDropEffect) => "preferred_drop_effect",
+                Ok(RequestedFormat::DibV5) => "dibv5",
+                Ok(RequestedFormat::Png) => "png",
                 Err(_) => "rejected",
             };
             if outcome != "logged" {
@@ -364,7 +412,7 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
             return Err(Error::from_hresult(E_NOTIMPL));
         }
         task_057_diagnostic(format_args!(
-            "enum_format_etc direction=get formats=descriptor,contents_wildcard,preferred_drop_effect"
+            "enum_format_etc direction=get formats=descriptor,contents_wildcard,preferred_drop_effect,dibv5,png"
         ));
         let formats = self.formats.as_format_etc();
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
@@ -538,6 +586,24 @@ impl IStream_Impl for ReadSeekStream_Impl {
     fn Clone(&self) -> Result<IStream> {
         Err(Error::from_hresult(E_NOTIMPL))
     }
+}
+
+fn hglobal_medium_from_bytes(bytes: &[u8]) -> Result<STGMEDIUM> {
+    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }?;
+    let destination = unsafe { GlobalLock(handle) };
+    if destination.is_null() {
+        let _ = unsafe { windows::Win32::Foundation::GlobalFree(Some(handle)) };
+        return Err(Error::from_win32());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination.cast::<u8>(), bytes.len());
+        let _ = GlobalUnlock(handle);
+    }
+    Ok(STGMEDIUM {
+        tymed: TYMED_HGLOBAL.0 as u32,
+        u: STGMEDIUM_0 { hGlobal: handle },
+        pUnkForRelease: ManuallyDrop::new(None),
+    })
 }
 
 fn hglobal_medium_from_copy<T: Copy>(value: &T) -> Result<STGMEDIUM> {

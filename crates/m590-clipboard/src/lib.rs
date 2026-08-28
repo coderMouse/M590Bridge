@@ -37,7 +37,10 @@ pub use error::ClipboardError;
 pub use file_paths::{
     first_regular_file, local_paths_from_text, read_file_for_offer, regular_file_from_text,
 };
-pub use image_file::{image_from_clipboard_text, image_from_paths, load_image_file};
+pub use image_file::{
+    image_from_clipboard_text, image_from_paths, is_decodable_image_path, is_likely_image_path,
+    load_image_file,
+};
 pub use virtual_file::{VirtualFile, VirtualFileCollection, VirtualFileCollectionEntry};
 
 #[cfg(target_os = "windows")]
@@ -132,6 +135,60 @@ impl ImageClipboard {
                 image::ExtendedColorType::Rgba8,
             )
             .map_err(|e| ClipboardError::Backend(format!("png encode: {e}")))?;
+        Ok(out)
+    }
+
+    /// Windows clipboard DIBv5 payload (`BITMAPV5HEADER` + bottom-up BGRA).
+    ///
+    /// Byte-layout mirrors what `arboard` writes on Windows (`CF_DIBV5`,
+    /// positive height, `BI_BITFIELDS` with RGBA masks, `LCS_sRGB`), so serving
+    /// this from an OLE data object yields the same pixels Word/WordPad read
+    /// and the same fingerprint our poll sees (no sync echo).
+    pub fn to_dibv5_bytes(&self) -> Result<Vec<u8>, ClipboardError> {
+        const LCS_SRGB: u32 = 0x7352_4742;
+        const LCS_GM_IMAGES: u32 = 4;
+        const BI_BITFIELDS: u32 = 3;
+        let size_image_u32 = u32::try_from((self.width as u64) * (self.height as u64) * 4)
+            .map_err(|_| ClipboardError::Backend("image too large for DIBv5".into()))?;
+        let mut out = Vec::with_capacity(124 + size_image_u32 as usize);
+        out.extend_from_slice(&124u32.to_le_bytes()); // bV5Size
+        out.extend_from_slice(&(self.width as i32).to_le_bytes());
+        // Positive height: bottom-up rows (Word cannot paste negative-height DIBs).
+        out.extend_from_slice(&(self.height as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bit count
+        out.extend_from_slice(&BI_BITFIELDS.to_le_bytes());
+        out.extend_from_slice(&size_image_u32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes()); // xPelsPerMeter
+        out.extend_from_slice(&0i32.to_le_bytes()); // yPelsPerMeter
+        out.extend_from_slice(&0u32.to_le_bytes()); // clrUsed
+        out.extend_from_slice(&0u32.to_le_bytes()); // clrImportant
+        out.extend_from_slice(&0x00ff_0000u32.to_le_bytes()); // red mask
+        out.extend_from_slice(&0x0000_ff00u32.to_le_bytes()); // green mask
+        out.extend_from_slice(&0x0000_00ffu32.to_le_bytes()); // blue mask
+        out.extend_from_slice(&0xff00_0000u32.to_le_bytes()); // alpha mask
+        out.extend_from_slice(&LCS_SRGB.to_le_bytes());
+        out.extend_from_slice(&[0u8; 36]); // bV5Endpoints
+        out.extend_from_slice(&0u32.to_le_bytes()); // gammaRed
+        out.extend_from_slice(&0u32.to_le_bytes()); // gammaGreen
+        out.extend_from_slice(&0u32.to_le_bytes()); // gammaBlue
+        out.extend_from_slice(&LCS_GM_IMAGES.to_le_bytes()); // intent
+        out.extend_from_slice(&0u32.to_le_bytes()); // profileData
+        out.extend_from_slice(&0u32.to_le_bytes()); // profileSize
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        debug_assert_eq!(out.len(), 124);
+        for row in (0..self.height).rev() {
+            for col in 0..self.width {
+                let index = ((row * self.width + col) * 4) as usize;
+                // RGBA -> DIB BGRA with the arboard bitfield byte order.
+                out.extend_from_slice(&[
+                    self.rgba[index + 2],
+                    self.rgba[index + 1],
+                    self.rgba[index],
+                    self.rgba[index + 3],
+                ]);
+            }
+        }
         Ok(out)
     }
 
@@ -676,6 +733,68 @@ mod tests {
     #[test]
     fn owner_label_uses_app_name() {
         assert!(placeholder_owner_label().contains(m590_core::APP_NAME));
+    }
+
+    #[test]
+    fn dibv5_layout_matches_windows_bitmap_consumer() {
+        // The payload is served as Windows `CF_DIBV5`; Word/WordPad read the
+        // BITMAPV5HEADER at fixed offsets and take the bits at `bV5Size`, so we
+        // assert the standard layout byte-for-byte instead of round-tripping
+        // through the `image` crate's BMP decoder (which since 0.25.7 assumes
+        // an extra 12-byte mask residue between the V5 header and the bits).
+        const BI_BITFIELDS: u32 = 3;
+        const LCS_SRGB: u32 = 0x7352_4742;
+        let rgba = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 64, 32, 16,
+        ];
+        let image = ImageClipboard::from_rgba(2, 2, rgba.clone()).unwrap();
+        let dib = image.to_dibv5_bytes().unwrap();
+
+        let u16_at = |off: usize| u16::from_le_bytes(dib[off..off + 2].try_into().unwrap());
+        let i32_at = |off: usize| i32::from_le_bytes(dib[off..off + 4].try_into().unwrap());
+        let u32_at = |off: usize| u32::from_le_bytes(dib[off..off + 4].try_into().unwrap());
+        assert_eq!(u32_at(0), 124); // bV5Size
+        assert_eq!(i32_at(4), 2); // width
+        assert_eq!(i32_at(8), 2); // positive height: bottom-up rows (Word rejects negative heights)
+        assert_eq!(u16_at(12), 1); // planes
+        assert_eq!(u16_at(14), 32); // bit count
+        assert_eq!(u32_at(16), BI_BITFIELDS);
+        assert_eq!(u32_at(20), 2 * 2 * 4); // bV5SizeImage
+        assert_eq!(u32_at(40), 0x00ff_0000); // red mask
+        assert_eq!(u32_at(44), 0x0000_ff00); // green mask
+        assert_eq!(u32_at(48), 0x0000_00ff); // blue mask
+        assert_eq!(u32_at(52), 0xff00_0000); // alpha mask
+        assert_eq!(u32_at(56), LCS_SRGB);
+        assert_eq!(dib.len(), 124 + 16);
+
+        // Bits at offset bV5Size: BGRA byte order, bottom-up rows (this is the
+        // byte layout arboard writes from its `flip_v` + `rgba_to_win` helpers).
+        // Rows of `rgba` are top-down: red, green / blue, teal.
+        let expected = [
+            255, 0, 0, 255, // blue row -> bottom row
+            32, 64, 128, 16, // teal
+            0, 0, 255, 255, // red row -> top row
+            0, 255, 0, 255, // green
+        ];
+        assert_eq!(&dib[124..], &expected);
+
+        // Independent consumer-side read: header at fixed offsets, bits at
+        // bV5Size, BGRA -> RGBA, bottom-up -> top-down. Round-trips to the
+        // original RGBA image.
+        let width = i32_at(4) as usize;
+        let height = i32_at(8) as usize;
+        let bits = &dib[u32_at(0) as usize..];
+        let mut decoded = vec![0u8; width * height * 4];
+        for row in 0..height {
+            for col in 0..width {
+                let src = ((height - 1 - row) * width + col) * 4;
+                let dst = (row * width + col) * 4;
+                decoded[dst..dst + 3].copy_from_slice(&bits[src..src + 3]);
+                decoded[dst..dst + 3].reverse(); // BGRA -> RGB
+                decoded[dst + 3] = bits[src + 3];
+            }
+        }
+        assert_eq!(decoded, rgba);
     }
 
     #[test]

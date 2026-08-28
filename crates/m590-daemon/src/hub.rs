@@ -178,6 +178,20 @@ struct LinuxVirtualReceive {
     first_chunk_at: Option<Instant>,
 }
 
+/// Auto-decoding of a received single image-file offer into a clipboard image
+/// (Word/画图 paste). Content is pulled to a temp .part file, decoded, written
+/// to the clipboard, then the temp file is removed.
+#[cfg(target_os = "linux")]
+struct LinuxAutoImageReceive {
+    transfer_id: String,
+    file_name: String,
+    expected_size: u64,
+}
+
+/// Cap for auto-downloading a received image-file offer into a clipboard image.
+#[cfg(target_os = "linux")]
+const AUTO_IMAGE_DECODE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct PendingLinuxVirtualChunk {
@@ -1936,6 +1950,8 @@ fn run_session_loop(
     let mut deferred_virtual_batch_offer: Option<DeferredVirtualBatchOffer> = None;
     #[cfg(target_os = "linux")]
     let mut pending_virtual_chunk: Option<PendingLinuxVirtualChunk> = None;
+    #[cfg(target_os = "linux")]
+    let mut linux_auto_image: Option<LinuxAutoImageReceive> = None;
     while session.state() != ConnectionState::Connected {
         if STOP_BRIDGE.load(Ordering::SeqCst) {
             let _ = session.handle(SessionEvent::Disconnect);
@@ -2339,7 +2355,7 @@ fn run_session_loop(
                             let summary =
                                 format!("[image {width}x{height} {}B {encoding:?}]", data.len());
                             with_status(&shared, |s| {
-                                s.last_sync_content_id = Some(content_id);
+                                s.last_sync_content_id = Some(content_id.clone());
                                 s.last_sync_text = Some(summary);
                                 s.last_error = None;
                             });
@@ -2348,6 +2364,42 @@ fn run_session_loop(
                                     width, height, encoding, data,
                                 ) {
                                     Ok(image) => {
+                                        #[cfg(target_os = "windows")]
+                                        {
+                                            // Dual representation: keep the bitmap on the
+                                            // clipboard (Word/WordPad) AND advertise the same
+                                            // image as a virtual .png file (Explorer paste-as-file).
+                                            // The OLE object also serves CF_DIBV5 + registered PNG,
+                                            // so our own poll reads back the same pixels (no echo).
+                                            if let Err(err) = clip.write_image(&image) {
+                                                with_status(&shared, |s| {
+                                                    s.last_error = Some(format!(
+                                                        "clipboard_write_image: {err}"
+                                                    ));
+                                                });
+                                            }
+                                            match image_file_collection(&content_id, &image) {
+                                                Ok(collection) => {
+                                                    if let Err(err) =
+                                                        ole_manager.publish_collection(collection)
+                                                    {
+                                                        with_status(&shared, |s| {
+                                                            s.last_error = Some(format!(
+                                                                "clipboard_offer_image_file: {err}"
+                                                            ));
+                                                        });
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    with_status(&shared, |s| {
+                                                        s.last_error = Some(format!(
+                                                            "clipboard_prepare_image_file: {err}"
+                                                        ));
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        #[cfg(not(target_os = "windows"))]
                                         if let Err(err) = clip.write_image(&image) {
                                             with_status(&shared, |s| {
                                                 s.last_error =
@@ -2367,6 +2419,70 @@ fn run_session_loop(
                     }
 
                     if let Some(file_event) = session.take_inbound_file() {
+                        #[cfg(target_os = "linux")]
+                        if let Some(auto) = linux_auto_image.as_ref() {
+                            match &file_event {
+                                InboundFileResult::Applied {
+                                    transfer_id,
+                                    path,
+                                    size,
+                                    ..
+                                } if auto.transfer_id == *transfer_id => {
+                                    let auto = linux_auto_image.take().expect("checked above");
+                                    let decoded = m590_clipboard::load_image_file(path);
+                                    let _ = std::fs::remove_file(path);
+                                    match decoded {
+                                        Ok(image) => {
+                                            if let Some(clip) = clipboard.as_mut() {
+                                                if let Err(err) = clip.write_image(&image) {
+                                                    with_status(&shared, |s| {
+                                                        s.last_error = Some(format!(
+                                                            "clipboard_write_image: {err}"
+                                                        ));
+                                                    });
+                                                }
+                                            }
+                                            with_status(&shared, |s| {
+                                                s.file_transfer_phase = Some("done".into());
+                                                s.last_file_transfer_id = Some(transfer_id.clone());
+                                                s.last_file_name = Some(auto.file_name.clone());
+                                                s.last_file_bytes = Some(auto.expected_size);
+                                                s.file_bytes_received = Some(auto.expected_size);
+                                                s.file_bytes_total = Some(auto.expected_size);
+                                                s.last_sync_text = Some(format!(
+                                                    "[image file {} {}B → 剪贴板图片]",
+                                                    auto.file_name, auto.expected_size
+                                                ));
+                                                s.last_error = None;
+                                            });
+                                        }
+                                        Err(err) => {
+                                            with_status(&shared, |s| {
+                                                s.file_transfer_phase = Some("failed".into());
+                                                s.last_error = Some(format!(
+                                                    "auto image decode {}: {err}",
+                                                    auto.file_name
+                                                ));
+                                            });
+                                        }
+                                    }
+                                    continue;
+                                }
+                                InboundFileResult::Failed {
+                                    transfer_id,
+                                    message,
+                                } if auto.transfer_id == *transfer_id => {
+                                    let auto = linux_auto_image.take().expect("checked above");
+                                    with_status(&shared, |s| {
+                                        s.file_transfer_phase = Some("failed".into());
+                                        s.last_error =
+                                            Some(format!("{}: {message}", auto.file_name));
+                                    });
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         #[cfg(target_os = "windows")]
                         if let InboundFileResult::BatchOffered {
                             batch_id,
@@ -3000,123 +3116,185 @@ fn run_session_loop(
                                     task_058_diagnostic(format_args!(
                                         "single_virtual_offer_received entry_id={transfer_id:?} path={file_name:?} size={size}"
                                     ));
-                                    let next = DeferredVirtualOffer {
-                                        transfer_id: transfer_id.clone(),
-                                        file_name: file_name.clone(),
-                                        size: *size,
-                                    };
-                                    let must_defer =
-                                        virtual_receive.as_ref().is_some_and(|current| {
-                                            linux_virtual_receive_must_finish(
-                                                current.requested,
-                                                current.completed,
-                                                current.consumed,
-                                                current.released,
-                                            )
-                                        }) || virtual_batch_receive
-                                            .as_ref()
-                                            .is_some_and(LinuxVirtualBatchReceive::must_finish);
-                                    if must_defer {
-                                        if let Some(stale) = deferred_virtual_batch_offer.take() {
-                                            cancel_deferred_linux_virtual_batch(
-                                                session,
-                                                conn,
-                                                stale,
-                                                "replaced by a newer deferred file offer",
-                                            )?;
-                                        }
-                                        if let Some(stale) = deferred_virtual_offer.replace(next) {
-                                            session
-                                                .cancel_file(
-                                                    stale.transfer_id,
-                                                    "replaced by a newer deferred file offer",
-                                                )
-                                                .map_err(|e| e.to_string())?;
-                                            conn.send_all(session.take_outbox().iter())
-                                                .map_err(|e| e.to_string())?;
+                                    let auto_image_eligible =
+                                        m590_clipboard::is_decodable_image_path(
+                                            std::path::Path::new(file_name.as_str()),
+                                        ) && *size <= AUTO_IMAGE_DECODE_MAX_BYTES
+                                            && with_status(&shared, |s| s.auto_sync)
+                                            && virtual_receive.is_none()
+                                            && virtual_batch_receive.is_none()
+                                            && linux_auto_image.is_none();
+                                    if auto_image_eligible {
+                                        task_058_diagnostic(format_args!(
+                                            "single_image_auto_receive entry_id={transfer_id:?} path={file_name:?} size={size}"
+                                        ));
+                                        match session.request_file(transfer_id.clone()) {
+                                            Ok(QueueFileResult::Queued) => {
+                                                conn.send_all(session.take_outbox().iter())
+                                                    .map_err(|e| e.to_string())?;
+                                                linux_auto_image = Some(LinuxAutoImageReceive {
+                                                    transfer_id: transfer_id.clone(),
+                                                    file_name: file_name.clone(),
+                                                    expected_size: *size,
+                                                });
+                                                with_status(&shared, |s| {
+                                                    clear_batch_status_fields(s);
+                                                    s.file_transfer_phase =
+                                                        Some("receiving".into());
+                                                    s.last_file_transfer_id =
+                                                        Some(transfer_id.clone());
+                                                    s.last_file_name = Some(file_name.clone());
+                                                    s.last_file_bytes = Some(*size);
+                                                    s.file_bytes_received = Some(0);
+                                                    s.file_bytes_total = Some(*size);
+                                                    s.last_sync_text = Some(format!(
+                                                        "[image file {file_name} {size}B → 剪贴板图片]"
+                                                    ));
+                                                    s.last_error = None;
+                                                });
+                                            }
+                                            Ok(other) => {
+                                                with_status(&shared, |s| {
+                                                    s.file_transfer_phase = Some("failed".into());
+                                                    s.last_error = Some(format!(
+                                                        "auto image request failed: {other:?}"
+                                                    ));
+                                                });
+                                            }
+                                            Err(err) => {
+                                                with_status(&shared, |s| {
+                                                    s.file_transfer_phase = Some("failed".into());
+                                                    s.last_error = Some(format!(
+                                                        "auto image request error: {err}"
+                                                    ));
+                                                });
+                                            }
                                         }
                                     } else {
-                                        if let Some(previous) = virtual_receive.take() {
-                                            if !previous.completed {
-                                                previous
-                                                    .producer
-                                                    .fail("replaced by a newer file offer");
+                                        let next = DeferredVirtualOffer {
+                                            transfer_id: transfer_id.clone(),
+                                            file_name: file_name.clone(),
+                                            size: *size,
+                                        };
+                                        let must_defer =
+                                            virtual_receive.as_ref().is_some_and(|current| {
+                                                linux_virtual_receive_must_finish(
+                                                    current.requested,
+                                                    current.completed,
+                                                    current.consumed,
+                                                    current.released,
+                                                )
+                                            }) || virtual_batch_receive
+                                                .as_ref()
+                                                .is_some_and(LinuxVirtualBatchReceive::must_finish);
+                                        if must_defer {
+                                            if let Some(stale) = deferred_virtual_batch_offer.take()
+                                            {
+                                                cancel_deferred_linux_virtual_batch(
+                                                    session,
+                                                    conn,
+                                                    stale,
+                                                    "replaced by a newer deferred file offer",
+                                                )?;
+                                            }
+                                            if let Some(stale) =
+                                                deferred_virtual_offer.replace(next)
+                                            {
                                                 session
                                                     .cancel_file(
-                                                        previous.transfer_id,
+                                                        stale.transfer_id,
+                                                        "replaced by a newer deferred file offer",
+                                                    )
+                                                    .map_err(|e| e.to_string())?;
+                                                conn.send_all(session.take_outbox().iter())
+                                                    .map_err(|e| e.to_string())?;
+                                            }
+                                        } else {
+                                            if let Some(previous) = virtual_receive.take() {
+                                                if !previous.completed {
+                                                    previous
+                                                        .producer
+                                                        .fail("replaced by a newer file offer");
+                                                    session
+                                                        .cancel_file(
+                                                            previous.transfer_id,
+                                                            "replaced by a newer file offer",
+                                                        )
+                                                        .map_err(|e| e.to_string())?;
+                                                    conn.send_all(session.take_outbox().iter())
+                                                        .map_err(|e| e.to_string())?;
+                                                }
+                                            }
+                                            if let Some(previous) = virtual_batch_receive.take() {
+                                                cancel_linux_virtual_batch(
+                                                    session,
+                                                    conn,
+                                                    &previous,
+                                                    "replaced by a newer file offer",
+                                                )?;
+                                            }
+                                            if let Some(stale) = deferred_virtual_offer.take() {
+                                                session
+                                                    .cancel_file(
+                                                        stale.transfer_id,
                                                         "replaced by a newer file offer",
                                                     )
                                                     .map_err(|e| e.to_string())?;
                                                 conn.send_all(session.take_outbox().iter())
                                                     .map_err(|e| e.to_string())?;
                                             }
-                                        }
-                                        if let Some(previous) = virtual_batch_receive.take() {
-                                            cancel_linux_virtual_batch(
-                                                session,
-                                                conn,
-                                                &previous,
-                                                "replaced by a newer file offer",
-                                            )?;
-                                        }
-                                        if let Some(stale) = deferred_virtual_offer.take() {
-                                            session
-                                                .cancel_file(
-                                                    stale.transfer_id,
+                                            if let Some(stale) = deferred_virtual_batch_offer.take()
+                                            {
+                                                cancel_deferred_linux_virtual_batch(
+                                                    session,
+                                                    conn,
+                                                    stale,
                                                     "replaced by a newer file offer",
-                                                )
-                                                .map_err(|e| e.to_string())?;
-                                            conn.send_all(session.take_outbox().iter())
-                                                .map_err(|e| e.to_string())?;
-                                        }
-                                        if let Some(stale) = deferred_virtual_batch_offer.take() {
-                                            cancel_deferred_linux_virtual_batch(
-                                                session,
-                                                conn,
-                                                stale,
-                                                "replaced by a newer file offer",
-                                            )?;
-                                        }
-                                        let published = clipboard
-                                            .as_mut()
-                                            .ok_or_else(|| {
-                                                "Linux clipboard unavailable for virtual file"
-                                                    .to_string()
-                                            })
-                                            .and_then(|clip| {
-                                                publish_linux_virtual_offer(
-                                                    &mut fuse_manager,
-                                                    clip,
-                                                    &next,
-                                                )
-                                            });
-                                        match published {
-                                            Ok(receive) => {
-                                                task_058_diagnostic(format_args!(
+                                                )?;
+                                            }
+                                            let published = clipboard
+                                                .as_mut()
+                                                .ok_or_else(|| {
+                                                    "Linux clipboard unavailable for virtual file"
+                                                        .to_string()
+                                                })
+                                                .and_then(|clip| {
+                                                    publish_linux_virtual_offer(
+                                                        &mut fuse_manager,
+                                                        clip,
+                                                        &next,
+                                                    )
+                                                });
+                                            match published {
+                                                Ok(receive) => {
+                                                    task_058_diagnostic(format_args!(
                                                     "single_virtual_offer_published entry_id={transfer_id:?} path={file_name:?} size={size}"
                                                 ));
-                                                virtual_receive = Some(receive);
-                                                mark_virtual_offer(&shared, &next);
-                                            }
-                                            Err(error) => {
-                                                fuse_manager.clear();
-                                                session
-                                                    .cancel_file(
-                                                        next.transfer_id.clone(),
-                                                        format!("FUSE publish failed: {error}"),
-                                                    )
-                                                    .map_err(|e| e.to_string())?;
-                                                conn.send_all(session.take_outbox().iter())
-                                                    .map_err(|e| e.to_string())?;
-                                                with_status(&shared, |s| {
-                                                    s.file_transfer_phase = Some("failed".into());
-                                                    s.last_error =
-                                                        Some(format!("FUSE publish: {error}"));
-                                                });
+                                                    virtual_receive = Some(receive);
+                                                    mark_virtual_offer(&shared, &next);
+                                                }
+                                                Err(error) => {
+                                                    fuse_manager.clear();
+                                                    session
+                                                        .cancel_file(
+                                                            next.transfer_id.clone(),
+                                                            format!("FUSE publish failed: {error}"),
+                                                        )
+                                                        .map_err(|e| e.to_string())?;
+                                                    conn.send_all(session.take_outbox().iter())
+                                                        .map_err(|e| e.to_string())?;
+                                                    with_status(&shared, |s| {
+                                                        s.file_transfer_phase =
+                                                            Some("failed".into());
+                                                        s.last_error =
+                                                            Some(format!("FUSE publish: {error}"));
+                                                    });
+                                                }
                                             }
                                         }
                                     }
                                 }
+
                                 InboundFileResult::Failed {
                                     transfer_id,
                                     message,
@@ -5742,6 +5920,26 @@ fn rearm_cancelled_clipboard_offer(
     if let Some(clipboard) = clipboard {
         clipboard.rearm_file_offer_poll();
     }
+}
+
+/// Build an OLE virtual-file collection that exposes a received image both
+/// as a .png virtual file (Explorer paste) and as the CF_DIBV5 / PNG clipboard
+/// formats (Word/WordPad paste, and identical fingerprint for our own poll).
+#[cfg(target_os = "windows")]
+fn image_file_collection(
+    content_id: &str,
+    image: &m590_clipboard::ImageClipboard,
+) -> Result<m590_clipboard::VirtualFileCollection, String> {
+    use m590_clipboard::{VirtualFile, VirtualFileCollection};
+    let png = image.to_png_bytes().map_err(|e| e.to_string())?;
+    let dib_v5 = image.to_dibv5_bytes().map_err(|e| e.to_string())?;
+    let file_name = format!("image-{content_id}.png");
+    let file_png = png.clone();
+    let file = VirtualFile::new(file_name, png.len() as u64, move || {
+        Ok(std::io::Cursor::new(file_png.clone()))
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(VirtualFileCollection::single_image(file, dib_v5, png))
 }
 
 #[cfg(target_os = "windows")]

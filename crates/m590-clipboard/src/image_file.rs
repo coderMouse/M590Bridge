@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
 
+/// Image extensions `load_image_file` can actually decode with the enabled
+/// `image` codec features. Formats outside this set keep their file semantics
+/// untouched (e.g. TIFF still pastes as a file).
+const DECODABLE_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif"];
+
 /// Load the first existing local image among `paths`.
 pub fn image_from_paths(
     paths: &[std::path::PathBuf],
@@ -122,10 +127,23 @@ fn is_bare_filename_token(token: &str) -> bool {
     token.contains('.')
 }
 
-pub(crate) fn is_likely_image_path(path: &Path) -> bool {
+pub fn is_likely_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+        .unwrap_or(false)
+}
+
+/// Whether `load_image_file` can decode a path whose extension is a known image
+/// extension (codec features enabled for all formats in this list).
+pub fn is_decodable_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            DECODABLE_IMAGE_EXTS
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        })
         .unwrap_or(false)
 }
 
