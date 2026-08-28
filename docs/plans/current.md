@@ -60,7 +60,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
   通过；**待 Windows 10 / GNOME Wayland 真机验收**（见 task-061）。prtsc 后
   “不能粘贴成文件 + 后续文件复制阻塞”已修复：Windows 位图接收改为单一 OLE
   发布（不再先裸写 `EmptyClipboard` 覆盖 OLE owner），OLE 发布对
-  `CLIPBRD_E_CANT_OPEN` 短暂重试，待真机复测。
+  `CLIPBRD_E_CANT_OPEN` 短暂重试。剩余问题已记录：prtsc 位图 → Windows 可粘贴
+  成图片文件、但无法粘贴到 Word（`pending`，等待下次开发，见 task-061）。
 
 ## 产品分期对照
 
@@ -111,7 +112,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
    通过）：Windows 位图双表示、Linux 单图片文件自动解码写位图；prtsc 后 OLE
    publish 失败与文件复制阻塞已修（单一 OLE 发布 + `CLIPBRD_E_CANT_OPEN`
    重试）。待 Windows 10 + GNOME Wayland 四个方向真机验收（Word 与文件管理器
-   两种粘贴都可用、无回环、prtsc 复测）。
+   两种粘贴都可用、无回环、prtsc 复测；剩余：prtsc → Windows 无法贴 Word，
+   已记录等待下次开发）。
 2. task-060（收尾）：Q1/Q2、Q3 权限、Q4 角标均真机通过；mp4/多个 pdf 替换
    七轮修复已由用户确认；「目录 + mp4」批次替换的八轮修复已回滚，日常以
    「文件夹与其他文件分开复制」规避（见 task-060）。

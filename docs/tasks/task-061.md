@@ -156,3 +156,35 @@ Windows 复制任何文件都报 `OLE publish failed: ... OpenClipboard 失败
   74 通过；Windows 交叉 `cargo check --target x86_64-pc-windows-gnu --lib`、
   clippy `-D warnings`、fmt、`git diff --check` 通过。
 - 待真机复测：prtsc → Windows 贴 Word + 粘贴成图片文件；随后文件复制恢复正常。
+
+## 剩余问题记录（2026-08-29）：prtsc 位图 → Windows 可粘贴成图片文件，无法粘贴到 Word
+
+### 状态
+
+`pending`（用户指示：先记录，等待下次再开发；本次不改代码）。
+
+### 用户真机复测结果
+
+上一轮修复（单一 OLE 发布 + `CLIPBRD_E_CANT_OPEN` 重试）后：
+
+- Linux prtsc 截图 → Windows **能粘贴成图片文件**（Explorer 拿到 OLE 虚拟
+  `.png`，说明 OLE 发布已成功）；
+- 但 **无法粘贴到 Word**；
+- 之前「复制图片文件 → Windows 可贴 Word」场景通过，说明 OLE serve 位图格式
+  的路径在部分场景可用。
+
+与上一轮的“能贴 Word、不能贴文件”正好对调：问题已从 OLE 发布环节转移到
+「Word 从 OLE 数据对象读取位图格式（`CF_DIBV5` / 已注册 `PNG`）」环节。
+
+### 下次开发的待查方向（未验证，仅供参考）
+
+1. **抓取 Word 的读取请求**：用 `task-057-diagnostics` 确认 Word/WordPad 从
+   OLE 对象请求的是哪个格式（`get_data kind=dibv5 / kind=png`）、tymed、lindex，
+   以及 GetData 是否返回错误（如 `DV_E_TYMED`）。
+2. **对比通过的场景**：“复制图片文件 → Word 可贴”与 prtsc 的差异（内容来源、
+   尺寸、PNG/DIB 大小），确定是否与格式枚举顺序或内容大小有关。
+3. **候选尝试**（真机验证为准）：
+   - OLE 对象同时 serve `CF_DIB`（BITMAPINFOHEADER 风格）以兼容 Word 的枚举；
+   - 保持标准 DIBv5 布局（不要套用 image 0.25.10 的 +12 假设，Word 按标准读）；
+   - 若 OLE GetData 路径对 Word 不可靠，可评估「OLE 发布 + 有条件地补一次
+     arboard 裸写」的组合，但需避免上一轮的 ole32 owner 破坏问题。
