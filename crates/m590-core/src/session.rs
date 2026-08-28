@@ -1681,6 +1681,19 @@ impl Session {
 
         // Empty file: complete may arrive with no chunks.
         if !self.incoming_files.contains_key(&payload.transfer_id) {
+            // A stale FileComplete(ok) of a cancelled round (e.g. the previous
+            // network round finished while a reopened FUSE reader re-armed the
+            // same stream offer) can arrive before the fresh round's first
+            // chunk. Ignore it so it cannot fail the fresh round or drop the
+            // offer. The empty-file case is excluded because its complete is
+            // legitimate and must not be swallowed.
+            let empty_complete = self
+                .inbound_offers
+                .get(&payload.transfer_id)
+                .is_some_and(|offer| offer.size == 0);
+            if payload.ok && !empty_complete && self.stream_inbound.contains(&payload.transfer_id) {
+                return Ok(());
+            }
             if let Some(offer) = self.inbound_offers.remove(&payload.transfer_id) {
                 if offer.size == 0 {
                     let stream_target = self.stream_inbound.remove(&payload.transfer_id);
@@ -2752,6 +2765,91 @@ mod tests {
         assert_eq!(transfer_id, "xfer-stale");
         assert_eq!(size, data.len() as u64);
         assert_eq!(sha256_hex, expected_sha);
+    }
+
+    #[test]
+    fn stale_old_round_complete_is_ignored_after_stream_rearm() {
+        // A reopened FUSE reader (thumbnail probe) makes the hub cancel the old
+        // round and re-request the same stream offer. If the old round finished
+        // on the wire right before the cancel, its FileComplete(ok) can still be
+        // in flight and arrive before the fresh round's first chunk. It must be
+        // ignored instead of failing the fresh round and dropping the offer.
+        let (mut host, mut joiner) = pair_host_joiner();
+        let data = vec![0x3Cu8; FILE_CHUNK_SIZE * 8];
+
+        assert_eq!(
+            joiner
+                .offer_file("xfer-old-cpl", "old.bin", data.clone())
+                .unwrap(),
+            QueueFileResult::Queued
+        );
+        joiner.retain_outbound_file("xfer-old-cpl");
+        let offer_msg = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer_msg)).unwrap();
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Offered { .. })
+        ));
+
+        // Round 1: stream starts; deliver the first pump (4 chunks) as if the
+        // network round is still in flight when the reader releases and reopens.
+        assert_eq!(
+            host.request_file_stream("xfer-old-cpl").unwrap(),
+            QueueFileResult::Queued
+        );
+        let request_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(request_msg)).unwrap();
+        let first_pump: Vec<Message> = joiner.take_outbox().into_iter().collect();
+        assert_eq!(first_pump.len(), OUTBOUND_CHUNKS_PER_PUMP);
+        for msg in first_pump {
+            host.handle(SessionEvent::Message(msg)).unwrap();
+        }
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Chunk { .. })
+        ));
+
+        // The hub re-arms: cancel the old round, then re-request the same offer.
+        host.cancel_file_stream(
+            "xfer-old-cpl",
+            "stream reopened while previous stream active",
+        )
+        .unwrap();
+        let cancel_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(cancel_msg)).unwrap();
+        assert_eq!(
+            host.request_file_stream("xfer-old-cpl").unwrap(),
+            QueueFileResult::Queued
+        );
+        let request_msg = host.take_outbox().pop().unwrap();
+
+        // The stale old-round complete arrives before the fresh round's first
+        // chunk. It must be ignored: no Failed event, offer stays requestable.
+        let stale_complete = Message::file_complete(
+            FileCompletePayload::with_sha256(
+                joiner.local_device().clone(),
+                "xfer-old-cpl",
+                true,
+                "",
+                "",
+            )
+            .unwrap(),
+        );
+        host.handle(SessionEvent::Message(stale_complete)).unwrap();
+        assert_eq!(host.take_inbound_file(), None);
+
+        // The fresh round then streams from offset 0 and completes normally.
+        joiner.handle(SessionEvent::Message(request_msg)).unwrap();
+        drain_file_send(&mut joiner, &mut host);
+        let final_event = host.take_inbound_file();
+        let InboundFileResult::StreamCompleted {
+            transfer_id, size, ..
+        } = final_event.unwrap()
+        else {
+            panic!("expected fresh stream completed, got failure");
+        };
+        assert_eq!(transfer_id, "xfer-old-cpl");
+        assert_eq!(size, data.len() as u64);
     }
 
     #[test]

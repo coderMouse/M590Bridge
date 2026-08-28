@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（Q1/Q2 真机通过；Q3 权限修复已真机通过；Q4 角标已真机消失；**mp4/pdf 粘贴替换「拼接文件时出错」修复已实现并通过单测，待真机复测**）
+`in_progress`（Q1/Q2 真机通过；Q3 权限修复已真机通过；Q4 角标已真机消失；**mp4/单个 pdf 替换真机通过；另一 pdf 仍报「拼接文件时出错」→ 二轮修复（忽略旧轮在途 FileComplete）已提交，待真机复测**）
 
 ## 背景
 
@@ -323,6 +323,27 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
     `cargo clippy -p m590-core -p m590-daemon --lib --no-deps -- -D warnings`、
     `cargo fmt --all -- --check`、`git diff --check`：全部通过。
 - 待真机复测：Q3 mp4/pdf 替换修复（Windows→Linux，目录已有同名文件选「替换」）。
+- 真机复测（2026-08-28，用户）：mp4 替换成功；`mm 450 (Chivoc) - App Feedback Basic.pdf`
+  替换成功；`MES需求解决方案优化汇报.pdf` 替换仍报「拼接文件时出错：输入/输出错误」，
+  失败后目标文件损坏无法打开。
+- 七轮（2026-08-28，旧轮 complete 残留修复）：定位二轮真机失败的根因——失败 pdf 的
+  旧网络轮次在 FUSE 重开前已在线上传完，其 `FileComplete(ok=true)` 与旧轮尾 chunk
+  一起积压在 recv 缓冲区；re-arm（cancel + 新 `FileRequest`）先执行，随后旧轮 complete
+  到达。`on_file_complete` 发现无 incoming 文件，按「unknown transfer / complete
+  without data」失败并删除 offer，直接杀掉新轮：FUSE `read` 中断 → Nautilus 报
+  「拼接文件时出错」且目标文件只写入部分。成功案例（mp4/另一 pdf）旧轮仍在途阻塞，
+  无 complete 积压，故不受影响。
+  - **修复**（`session.rs` `on_file_complete`）：ok=true 的 complete 到达时若无 active
+    incoming、该 transfer 在 `stream_inbound`（已 re-arm 等待新轮首块），视为旧轮残留
+    并静默忽略（保留 offer），排除空文件 legitimate complete 场景。非 stream 与
+    ok=false 路径行为不变（新轮真失败仍需透传）。
+  - 新增单测：`session::stale_old_round_complete_is_ignored_after_stream_rearm`。
+  - 验证：`cargo test -p m590-core --lib`：41 passed；`cargo test -p m590-daemon --lib`：
+    74 passed，2 ignored；`cargo check -p m590-daemon --target
+    x86_64-pc-windows-gnu --lib`、`cargo clippy -p m590-core -p m590-daemon --lib
+    --no-deps -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：全部通过。
+- 待真机复测：「MES需求解决方案优化汇报.pdf」（及同类 pdf）替换；并回归 mp4、替换后
+  再次粘贴。
 
 ## 文档影响
 
@@ -338,13 +359,14 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
   的目录树、空文件、取消、断线场景。
 - 残留边界（已记录不保证）：旧轮与新一轮在极窄窗口内（首块 0 号 chunk 仍在途时被取消）
   可能产生理论上等价的重复首块；旧轮 complete 恰与 re-arm 交叉时的处理以真机复测为准。
+- 旧轮 `FileComplete(ok=false)` 在 re-arm 后到达仍会透传失败（现有发送端不再产生
+  busy 拒绝，此路径为防御性保留）。
 
 ## 下一步
 
 - ~~真机复测 Q3 权限~~：已通过。FUSE 文件权限 `0o664`，落地文件可读写。
 - ~~真机复测 Q4 角标~~：已通过。粘贴落地文件不再显示「x」角标。
-- **待真机复测**：mp4/pdf 替换修复（Windows→Linux，`Ctrl+V` 选「替换」）。修复已在
-  `hub.rs`（Request 在途先取消再重开）、`virtual_file_bridge.rs`（resetting 门控 +
-  `arm()`）、`session.rs`（旧轮续传 chunk 静默丢弃）实现，单测通过；需在真机验证
-  mp4/pdf 替换、以及替换后再次粘贴、断线重连等回归场景。
+- **待真机复测**：二轮修复后的 mp4/pdf 替换（Windows→Linux，`Ctrl+V` 选「替换」）。
+  首轮真机已有 mp4/单个 pdf 通过；二轮修复（`session.rs` 忽略旧轮在途 ok complete）
+  需复测失败的 `MES需求解决方案优化汇报.pdf`，并回归替换后再次粘贴、断线重连。
 - Q1/Q2 与 Q3 权限连锁修复已真机通过，不再重复验证。
