@@ -29,6 +29,7 @@ import {
   fetchStatus,
   filePhaseLabel,
   fileProgressPercent,
+  formatBytes,
   getApiBase,
   hubOfflineMessage,
   MAX_SEND_FILE_BYTES,
@@ -903,11 +904,13 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                           <div>
                             整体：{status.file_batch_files_completed ?? 0} /{' '}
                             {status.file_batch_files_total ?? 0} 个文件 ·{' '}
-                            {(status.file_batch_bytes_completed ?? 0) +
-                              (status.file_batch_current_path
-                                ? (status.file_bytes_received ?? 0)
-                                : 0)}{' '}
-                            / {status.file_batch_bytes_total ?? 0} 字节
+                            {formatBytes(
+                              (status.file_batch_bytes_completed ?? 0) +
+                                (status.file_batch_current_path
+                                  ? (status.file_bytes_received ?? 0)
+                                  : 0),
+                            )}{' '}
+                            / {formatBytes(status.file_batch_bytes_total ?? 0)}
                           </div>
                           <div className="truncate text-[#1A2030]">
                             当前：{status.file_batch_current_path || '—'}
@@ -919,14 +922,14 @@ export function OperableApp({ onOpenGallery }: { onOpenGallery?: () => void }) {
                             />
                           </div>
                           <div>
-                            当前条目：{status.file_bytes_received ?? 0} /{' '}
-                            {status.file_bytes_total ?? 0} 字节
+                            当前条目：{formatBytes(status.file_bytes_received ?? 0)} /{' '}
+                            {formatBytes(status.file_bytes_total ?? 0)}
                           </div>
                         </>
                       ) : (
                         <div>
-                          进度字节：{status?.file_bytes_received ?? 0} /{' '}
-                          {status?.file_bytes_total ?? 0}
+                          进度：{formatBytes(status?.file_bytes_received ?? 0)} /{' '}
+                          {formatBytes(status?.file_bytes_total ?? 0)}
                         </div>
                       )}
                       {status?.last_file_saved_path ? (

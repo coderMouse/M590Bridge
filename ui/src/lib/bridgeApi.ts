@@ -490,6 +490,22 @@ export function batchProgressPercent(status: HubStatus | null): number {
   return Math.max(0, Math.min(100, Math.round(((completed + current) / total) * 100)))
 }
 
+/** 把字节数格式化为人类可读单位（B / KB / MB / GB，1024 进制）。 */
+export function formatBytes(bytes?: number | null): string {
+  const value = bytes ?? 0
+  if (!Number.isFinite(value) || value <= 0) return '0 B'
+  if (value < 1024) return `${value} B`
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB']
+  let amount = value
+  let index = -1
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024
+    index += 1
+  }
+  const text = amount >= 100 ? amount.toFixed(0) : amount.toFixed(1)
+  return `${text.replace(/\.0$/, '')} ${units[index]}`
+}
+
 /** Tauri native multi-file dialog → absolute paths. Empty if cancelled / not in Tauri. */
 export async function pickSendFilesNative(): Promise<string[]> {
   const invoke = getTauriInvoke()
