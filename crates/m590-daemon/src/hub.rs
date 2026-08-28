@@ -3127,18 +3127,30 @@ fn run_session_loop(
                                     {
                                         deferred_virtual_offer = None;
                                     }
-                                    if virtual_receive
-                                        .as_ref()
-                                        .is_some_and(|v| v.transfer_id == *transfer_id)
+                                    let stale_failure =
+                                        virtual_receive.as_ref().is_some_and(|current| {
+                                            current.transfer_id == *transfer_id
+                                                && !current.requested
+                                        });
+                                    if !stale_failure
+                                        && virtual_receive
+                                            .as_ref()
+                                            .is_some_and(|v| v.transfer_id == *transfer_id)
                                     {
                                         if let Some(current) = virtual_receive.take() {
                                             current.producer.fail(message.clone());
                                         }
                                         fuse_manager.clear();
                                     }
-                                    with_status(&shared, |s| {
-                                        mark_file_failed_if_current(s, transfer_id, message);
-                                    });
+                                    if !stale_failure {
+                                        with_status(&shared, |s| {
+                                            mark_file_failed_if_current(s, transfer_id, message);
+                                        });
+                                    } else {
+                                        task_058_diagnostic(format_args!(
+                                            "single_network_stream_failed_stale entry_id={transfer_id:?} message={message:?}"
+                                        ));
+                                    }
                                 }
                                 InboundFileResult::StreamCompleted {
                                     transfer_id, size, ..
@@ -3803,11 +3815,44 @@ fn run_session_loop(
                                 current.consumed = false;
                                 current.released = false;
                                 current.first_chunk_at = None;
+                            } else if current.network_started_at.is_some() {
+                                // The previous network round is still in flight (e.g. a
+                                // Nautilus thumbnail/metadata probe released the reader
+                                // mid-stream, so the sender is still streaming). The
+                                // sender answers a concurrent second FileRequest with
+                                // "sender busy with another transfer", which fails the
+                                // paste with an input/output error. Abort the old round
+                                // first, then start a fresh serial round from offset 0.
+                                task_058_diagnostic(format_args!(
+                                    "single_fuse_request_rearm entry_id={:?} since_publish_ms={}",
+                                    current.transfer_id,
+                                    requested_at
+                                        .saturating_duration_since(current.published_at)
+                                        .as_millis()
+                                ));
+                                session
+                                    .cancel_file_stream(
+                                        current.transfer_id.clone(),
+                                        "stream reopened while previous stream active",
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                conn.send_all(session.take_outbox().iter())
+                                    .map_err(|e| e.to_string())?;
+                                // Drop the backpressured chunk of the cancelled round; it
+                                // would otherwise repopulate the reset pipe with stale data.
+                                pending_virtual_chunk = None;
+                                // Reset round-local state; the dispatch below re-requests.
+                                current.completed = false;
+                                current.consumed = false;
+                                current.released = false;
+                                current.first_chunk_at = None;
+                                current.network_started_at = None;
                             }
                             match session.request_file_stream(current.transfer_id.clone()) {
                                 Ok(QueueFileResult::Queued) => {
                                     conn.send_all(session.take_outbox().iter())
                                         .map_err(|e| e.to_string())?;
+                                    current.producer.arm();
                                     current.producer.start();
                                     current.network_started_at = Some(Instant::now());
                                     task_058_diagnostic(format_args!(
@@ -4076,6 +4121,34 @@ fn run_session_loop(
                                     current.completed_bytes = current
                                         .completed_bytes
                                         .saturating_sub(current.files[index].entry.size);
+                                } else if current.active_index == Some(index) {
+                                    // This entry's network round is still in flight (e.g. a
+                                    // Nautilus thumbnail probe released the reader mid-stream).
+                                    // Abort the old round so the sender answers the fresh
+                                    // FileRequest below instead of replying "sender busy".
+                                    task_058_diagnostic(format_args!(
+                                        "batch_fuse_request_rearm batch_id={:?} path={:?} entry_id={:?}",
+                                        current.batch_id,
+                                        current.files[index].entry.relative_path,
+                                        current.files[index].entry.entry_id
+                                    ));
+                                    let entry_id = current.files[index].entry.entry_id.clone();
+                                    session
+                                        .cancel_file_stream(
+                                            entry_id.clone(),
+                                            "stream reopened while previous stream active",
+                                        )
+                                        .map_err(|e| e.to_string())?;
+                                    conn.send_all(session.take_outbox().iter())
+                                        .map_err(|e| e.to_string())?;
+                                    // Drop the backpressured chunk of the cancelled round;
+                                    // it would otherwise repopulate the reset pipe.
+                                    pending_virtual_chunk = None;
+                                    current.files[index].completed = false;
+                                    current.files[index].consumed = false;
+                                    current.files[index].released = false;
+                                    current.files[index].first_chunk_seen = false;
+                                    current.active_index = None;
                                 }
                             }
                             BridgeEvent::Consumed => {
@@ -4165,6 +4238,7 @@ fn run_session_loop(
                             Ok(QueueFileResult::Queued) => {
                                 conn.send_all(session.take_outbox().iter())
                                     .map_err(|error| error.to_string())?;
+                                current.files[index].producer.arm();
                                 current.files[index].producer.start();
                                 current.active_index = Some(index);
                                 task_058_diagnostic(format_args!(
@@ -6370,6 +6444,22 @@ fn handle_linux_virtual_batch_stream_event(
             batch.batch_id == *transfer_id || batch.file_index(transfer_id).is_some()
         }) =>
         {
+            if receive.as_ref().is_some_and(|batch| {
+                batch
+                    .file_index(transfer_id)
+                    .is_some_and(|index| !batch.files[index].requested)
+            }) {
+                // Stale failure from a soft-cancelled entry (thumbnail probe).
+                // Keep the mount and offer alive; a reopen re-requests the stream.
+                let stale_batch_id = receive
+                    .as_ref()
+                    .map(|batch| batch.batch_id.clone())
+                    .unwrap_or_default();
+                task_058_diagnostic(format_args!(
+                    "batch_network_stream_failed_stale batch_id={stale_batch_id:?} entry_id={transfer_id:?} message={message:?}",
+                ));
+                return Ok(LinuxVirtualBatchStreamEvent::Handled(None));
+            }
             let failed = receive.take().expect("matching Linux virtual batch");
             let batch_id = failed.batch_id.clone();
             cancel_linux_virtual_batch(session, conn, &failed, message)?;

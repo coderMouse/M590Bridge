@@ -35,6 +35,12 @@ struct PipeState {
     consumed: bool,
     #[cfg(target_os = "linux")]
     released: bool,
+    /// Linux: set by `open_reader` when a reader reopens while the previous
+    /// network round is still winding down. While true, `try_push` refuses new
+    /// bytes so stale leftovers of the old round can never reach the new reader.
+    /// Cleared by `PipeProducer::arm()` once the hub has dispatched a fresh round.
+    #[cfg(target_os = "linux")]
+    resetting: bool,
     finished: bool,
     cancelled: bool,
     error: Option<String>,
@@ -88,6 +94,8 @@ impl VirtualFileBridge {
                 consumed: false,
                 #[cfg(target_os = "linux")]
                 released: false,
+                #[cfg(target_os = "linux")]
+                resetting: false,
                 finished: false,
                 cancelled: false,
                 error: None,
@@ -173,6 +181,7 @@ fn open_reader(inner: &Arc<PipeInner>, size: u64) -> io::Result<PipeReader> {
         #[cfg(target_os = "linux")]
         {
             state.released = false;
+            state.resetting = true;
         }
     }
     state.reader_open = true;
@@ -221,6 +230,17 @@ impl PipeProducer {
         }
     }
 
+    /// Linux: end the reopen window opened by `open_reader`. Call after the hub
+    /// has dispatched a fresh network round so its chunks may fill the pipe.
+    #[cfg(target_os = "linux")]
+    pub fn arm(&self) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.resetting = false;
+            state.write_blocked_since = None;
+            self.inner.changed.notify_all();
+        }
+    }
+
     /// Push one verified network chunk, waiting for bounded capacity or cancellation.
     pub fn push(&self, data: &[u8]) -> io::Result<()> {
         self.push_with_timeout(data, WRITE_TIMEOUT)
@@ -251,6 +271,14 @@ impl PipeProducer {
                 io::ErrorKind::Interrupted,
                 "transfer cancelled",
             ));
+        }
+        // A reopened reader is waiting for a fresh network round. Refuse bytes
+        // from the previous round (thumbnail-probe leftovers still in flight)
+        // until the hub re-arms this bridge; otherwise the new reader would see
+        // stale mid-file data before the sender restarts from offset 0.
+        #[cfg(target_os = "linux")]
+        if state.resetting {
+            return Ok(false);
         }
         if self.inner.capacity - state.bytes.len() < data.len() {
             let blocked_since = *state.write_blocked_since.get_or_insert_with(Instant::now);
@@ -794,5 +822,42 @@ mod tests {
         // as released so the pipe can be reset on reopen.
         release_reader(&bridge.inner, "virtual file reader closed");
         assert_eq!(bridge.take_event(), Some(BridgeEvent::Released));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reopened_reader_ignores_old_round_pushes_until_armed() {
+        // Round 1: a Nautilus thumbnail probe opens the FUSE file, reads a few
+        // bytes, and releases while the network stream is still in flight.
+        let (bridge, producer) = VirtualFileBridge::with_capacity(16);
+        let producer2 = producer.clone();
+        let mut first = open_reader(&bridge.inner, 8).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+        assert!(producer.try_push(b"01234567").unwrap());
+        let mut prefix = [0_u8; 3];
+        first.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"012");
+        release_reader(&bridge.inner, "virtual file reader closed");
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Released));
+        drop(first);
+
+        // Round 2: the paste reopens the FUSE file. open_reader resets the pipe
+        // and marks the bridge as `resetting` until the hub re-arms it.
+        let mut second = open_reader(&bridge.inner, 8).unwrap();
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Request));
+
+        // Leftover bytes of the old round must be refused: the new reader must
+        // never see mid-file data of the previously cancelled round.
+        assert!(!producer2.try_push(b"4567").unwrap());
+
+        // The hub re-arms after dispatching a fresh FileRequest; a fresh round
+        // then streams from offset 0 and reaches the reader untouched.
+        producer2.arm();
+        assert!(producer2.try_push(b"abcdefgh").unwrap());
+        producer2.finish();
+        let mut out = Vec::new();
+        second.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"abcdefgh");
+        assert_eq!(bridge.take_event(), Some(BridgeEvent::Consumed));
     }
 }

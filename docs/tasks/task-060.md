@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（Q1/Q2 真机通过；Q3 权限修复已真机通过；Q4 角标已真机消失；**mp4/pdf 粘贴替换仍报「拼接文件时出错：输入/输出错误」，待下次修复**）
+`in_progress`（Q1/Q2 真机通过；Q3 权限修复已真机通过；Q4 角标已真机消失；**mp4/pdf 粘贴替换「拼接文件时出错」修复已实现并通过单测，待真机复测**）
 
 ## 背景
 
@@ -292,6 +292,37 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
   -D warnings`、`cargo fmt --all -- --check`：全部通过。
 - 待真机验收：Q3 mp4/pdf 替换（缩略图探测软取消后 FUSE 不卸载、可重开）。Q4 角标已真机
   确认消失。
+- 六轮（2026-08-28，mp4/pdf 替换修复）：定位并修复「旧网络流在途时 FUSE 重开」的根因：
+  - **根因**：Nautilus 缩略图探测（mp4/pdf）打开 FUSE 文件读到一小段后 release，只标
+    `released` 不取消（防卸载），网络流继续在途；用户替换粘贴重开 FUSE 再发 `FileRequest`
+    时，发送端 `active_outbound` 仍在，按协议回 `FileComplete(false, "sender busy with
+    another transfer")`，接收端 `producer.fail` → FUSE `read` EIO → Nautilus 报
+    「拼接文件时出错：输入/输出错误」。txt/apk/zip 无缩略图探测，故正常。
+  - **hub 单文件/批次**（`hub.rs`）：`BridgeEvent::Request` 中若
+    `network_started_at.is_some() && !completed`（单文件）或
+    `active_index == Some(index) && !completed`（批次 entry），即旧轮仍在途，先
+    `session.cancel_file_stream(tid, "stream reopened while previous stream active")`
+    并 flush outbox，丢弃 `pending_virtual_chunk`，重置轮次状态，再发新 `FileRequest`；
+    dispatch 成功后在 `producer.start()` 前调用 `producer.arm()`。
+  - **bridge**（`virtual_file_bridge.rs`）：`PipeState` 新增 Linux `resetting` 门控——
+    `open_reader` 在 prior_round 重置时置位，`try_push` 在重置中直接返回 `Ok(false)`
+    （backpressure，不留旧字节进管道）；新增 `PipeProducer::arm()`，hub 在新请求发出后
+    清除门控。这样重开与 re-arm 之间的任何旧轮数据都无法进入新 reader。
+  - **core 接收端**（`session.rs`）：`on_file_chunk` 对「无 incoming 文件、transfer 在
+    `stream_inbound`（已 re-arm）、offset != 0」的旧轮在途续传 chunk 静默丢弃，而不是走
+    「first chunk offset must be 0」失败路径清掉 offer。
+  - **陈旧守卫**：Linux 单文件 `Failed` 增加 `!requested` 守卫（与 `StreamCompleted` 一致）；
+    批次 `Failed` 对已软取消 entry 忽略。旧轮被 abort 时不回发任何 complete（
+    `abort_active_outbound` 仅 re-stage），故不存在旧轮 complete 污染新轮的常规路径。
+  - 新增单测：`virtual_file_bridge::reopened_reader_ignores_old_round_pushes_until_armed`
+    （Linux）、`session::stale_continuation_chunk_is_dropped_after_stream_rearm`。
+  - 验证：`cargo test -p m590-core --lib`：40 passed；`cargo test -p m590-daemon --lib`：
+    74 passed，2 ignored；`cargo test -p m590-daemon virtual_file`：24 passed，2 ignored；
+    `cargo test -p m590-daemon linux_virtual`：18 passed，1 ignored。`cargo check
+    --workspace`、`cargo check -p m590-daemon --target x86_64-pc-windows-gnu --lib`、
+    `cargo clippy -p m590-core -p m590-daemon --lib --no-deps -- -D warnings`、
+    `cargo fmt --all -- --check`、`git diff --check`：全部通过。
+- 待真机复测：Q3 mp4/pdf 替换修复（Windows→Linux，目录已有同名文件选「替换」）。
 
 ## 文档影响
 
@@ -305,15 +336,15 @@ true，**本地剪贴板轮询被永久阻塞**——这就是「复制不更新
 - 永久保留发送源可能造成文件句柄/路径泄漏，需区分剪贴板来源与普通 API 来源。
 - FUSE `getattr`/`lookup` 在替换流程下的行为需以真机日志为准，避免回归 task-058 已通过
   的目录树、空文件、取消、断线场景。
+- 残留边界（已记录不保证）：旧轮与新一轮在极窄窗口内（首块 0 号 chunk 仍在途时被取消）
+  可能产生理论上等价的重复首块；旧轮 complete 恰与 re-arm 交叉时的处理以真机复测为准。
 
 ## 下一步
 
 - ~~真机复测 Q3 权限~~：已通过。FUSE 文件权限 `0o664`，落地文件可读写。
 - ~~真机复测 Q4 角标~~：已通过。粘贴落地文件不再显示「x」角标。
-- **待修复**：mp4/pdf 粘贴替换报「拼接文件时出错：输入/输出错误」。
-  - 根因方向：Nautilus 缩略图探测触发网络流后，FUSE 重开时旧流仍在传输，
-    发送端拒绝重新请求。
-  - 修复方向：Hub 在 `Request` 事件中检测旧流仍在传输时，先 `cancel_file_stream`
-    取消旧流，再发新 `FileRequest`；并对旧流的 `StreamCompleted`/`Failed`/chunk
-    做陈旧守卫。
+- **待真机复测**：mp4/pdf 替换修复（Windows→Linux，`Ctrl+V` 选「替换」）。修复已在
+  `hub.rs`（Request 在途先取消再重开）、`virtual_file_bridge.rs`（resetting 门控 +
+  `arm()`）、`session.rs`（旧轮续传 chunk 静默丢弃）实现，单测通过；需在真机验证
+  mp4/pdf 替换、以及替换后再次粘贴、断线重连等回归场景。
 - Q1/Q2 与 Q3 权限连锁修复已真机通过，不再重复验证。

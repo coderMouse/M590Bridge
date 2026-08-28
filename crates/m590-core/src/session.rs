@@ -1578,6 +1578,13 @@ impl Session {
             return Ok(());
         }
 
+        // A stream target that was re-armed (reopened after a partial read) may
+        // still receive in-flight continuation chunks from the cancelled round.
+        // They carry a non-zero offset and must be dropped instead of failing
+        // the freshly requested round with "first chunk offset must be 0".
+        if payload.offset != 0 && self.stream_inbound.contains(&payload.transfer_id) {
+            return Ok(());
+        }
         let Some(offer) = self.inbound_offers.remove(&payload.transfer_id) else {
             self.last_inbound_file = Some(InboundFileResult::Failed {
                 transfer_id: payload.transfer_id,
@@ -2655,6 +2662,96 @@ mod tests {
         assert_eq!(transfer_id, "xfer-retain");
         assert_eq!(size, data.len() as u64);
         assert_eq!(sha256_hex, expect_sha);
+    }
+
+    #[test]
+    fn stale_continuation_chunk_is_dropped_after_stream_rearm() {
+        // A reopened FUSE reader (e.g. after a Nautilus thumbnail probe) makes the
+        // hub cancel the in-flight round and re-request the same offer. Chunks of
+        // the old round that are still crossing the wire carry a non-zero offset and
+        // must be dropped instead of failing the freshly requested round.
+        let (mut host, mut joiner) = pair_host_joiner();
+        let data = vec![0x5Au8; FILE_CHUNK_SIZE * 8];
+        let expected_sha = crate::bytes_to_hex(&{
+            use sha2::Digest;
+            sha2::Sha256::digest(&data)
+        });
+
+        assert_eq!(
+            joiner
+                .offer_file("xfer-stale", "stale.bin", data.clone())
+                .unwrap(),
+            QueueFileResult::Queued
+        );
+        joiner.retain_outbound_file("xfer-stale");
+        let offer_msg = joiner.take_outbox().pop().unwrap();
+        host.handle(SessionEvent::Message(offer_msg)).unwrap();
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Offered { .. })
+        ));
+
+        // Round 1: request the stream and deliver only the first pump (4 chunks),
+        // as if the network round is still in flight when the reader releases.
+        assert_eq!(
+            host.request_file_stream("xfer-stale").unwrap(),
+            QueueFileResult::Queued
+        );
+        let request_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(request_msg)).unwrap();
+        let first_pump: Vec<Message> = joiner.take_outbox().into_iter().collect();
+        assert_eq!(first_pump.len(), OUTBOUND_CHUNKS_PER_PUMP);
+        for msg in first_pump {
+            host.handle(SessionEvent::Message(msg)).unwrap();
+        }
+        assert!(matches!(
+            host.take_inbound_file(),
+            Some(InboundFileResult::Chunk { .. })
+        ));
+
+        // The hub re-arms: cancel the old round, then re-request the same offer.
+        host.cancel_file_stream("xfer-stale", "stream reopened while previous stream active")
+            .unwrap();
+        let cancel_msg = host.take_outbox().pop().unwrap();
+        joiner.handle(SessionEvent::Message(cancel_msg)).unwrap();
+        assert_eq!(
+            host.request_file_stream("xfer-stale").unwrap(),
+            QueueFileResult::Queued
+        );
+        let request_msg = host.take_outbox().pop().unwrap();
+
+        // A stale continuation chunk of the old round (offset = old round's next
+        // offset) arrives before the fresh round's first chunk. It must be dropped
+        // silently: no Failed event, and the offer must remain requestable.
+        let stale_offset = (OUTBOUND_CHUNKS_PER_PUMP * FILE_CHUNK_SIZE) as u64;
+        let stale_chunk = Message::file_chunk(
+            FileChunkPayload::new(
+                joiner.local_device().clone(),
+                "xfer-stale",
+                stale_offset,
+                vec![0xAAu8; 32],
+            )
+            .unwrap(),
+        );
+        host.handle(SessionEvent::Message(stale_chunk)).unwrap();
+        assert_eq!(host.take_inbound_file(), None);
+
+        // The fresh round then streams from offset 0 and completes normally.
+        joiner.handle(SessionEvent::Message(request_msg)).unwrap();
+        drain_file_send(&mut joiner, &mut host);
+        let final_event = host.take_inbound_file();
+        let InboundFileResult::StreamCompleted {
+            transfer_id,
+            size,
+            sha256_hex,
+            ..
+        } = final_event.unwrap()
+        else {
+            panic!("expected fresh stream completed, got failure");
+        };
+        assert_eq!(transfer_id, "xfer-stale");
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(sha256_hex, expected_sha);
     }
 
     #[test]
