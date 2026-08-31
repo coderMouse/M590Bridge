@@ -305,9 +305,18 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
                 format.cfFormat, format.lindex, format.tymed
             ));
         }
-        let requested = self
-            .requested_format(format, false)
-            .map_err(Error::from_hresult)?;
+        // Log rejections too: without this a failed Word read looks identical to
+        // "no request arrived" in the trace (task-061 pending investigation).
+        let requested = match self.requested_format(format, false) {
+            Ok(requested) => requested,
+            Err(err) => {
+                task_057_diagnostic(format_args!(
+                    "get_data kind=rejected hr=0x{:08X}",
+                    err.0 as u32
+                ));
+                return Err(Error::from_hresult(err));
+            }
+        };
         match requested {
             RequestedFormat::Descriptor => {
                 task_057_diagnostic(format_args!(
@@ -419,6 +428,15 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
         }
         task_057_diagnostic(format_args!(
             "enum_format_etc direction=get formats=descriptor,contents_wildcard,preferred_drop_effect,dibv5,png"
+        ));
+        // Numeric ids let the trace map later `get_data cf=<n>` lines to a format.
+        task_057_diagnostic(format_args!(
+            "format_ids descriptor={} contents={} preferred_drop_effect={} dibv5={} png={}",
+            self.formats.descriptor,
+            self.formats.contents,
+            self.formats.preferred_drop_effect,
+            self.formats.dib_v5,
+            self.formats.png
         ));
         let formats = self.formats.as_format_etc();
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
@@ -715,6 +733,13 @@ pub fn publish_virtual_file_collection(
             .iter()
             .filter(|entry| entry.is_directory())
             .count()
+    ));
+    // Payload sizes distinguish the prtsc bitmap case from the image-file case
+    // when comparing traces (task-061 pending investigation).
+    task_057_diagnostic(format_args!(
+        "publish_collection_image dibv5_bytes={} png_bytes={}",
+        collection.dib_v5_bytes().map_or(0, <[u8]>::len),
+        collection.png_bytes().map_or(0, <[u8]>::len)
     ));
     #[cfg(feature = "task-057-diagnostics")]
     for (index, entry) in collection.entries().iter().enumerate() {

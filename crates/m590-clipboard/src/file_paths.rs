@@ -264,15 +264,27 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_file(name: &str, data: &[u8]) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("m590-fpath-{nanos}"));
+        // A nanosecond stamp alone is not unique across parallel test threads:
+        // two tests landing on the same value shared one directory, and the
+        // first one's remove_dir_all deleted the other's files (flaky failure).
+        let dir = std::env::temp_dir().join(format!("m590-fpath-{}", unique_suffix()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         fs::write(&path, data).unwrap();
         path
+    }
+
+    /// Process id + monotonically increasing counter + nanos: unique per
+    /// directory even when several tests run in the same nanosecond.
+    fn unique_suffix() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{seq}-{nanos}", std::process::id())
     }
 
     #[test]
@@ -377,11 +389,7 @@ mod tests {
 
     #[test]
     fn bare_desktop_name_resolves_under_home_desktop() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let home = std::env::temp_dir().join(format!("m590-home-{nanos}"));
+        let home = std::env::temp_dir().join(format!("m590-home-{}", unique_suffix()));
         let desk = home.join("桌面");
         fs::create_dir_all(&desk).unwrap();
         let file = desk.join("12.txt");

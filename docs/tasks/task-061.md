@@ -188,3 +188,109 @@ Windows 复制任何文件都报 `OLE publish failed: ... OpenClipboard 失败
    - 保持标准 DIBv5 布局（不要套用 image 0.25.10 的 +12 假设，Word 按标准读）；
    - 若 OLE GetData 路径对 Word 不可靠，可评估「OLE 发布 + 有条件地补一次
      arboard 裸写」的组合，但需避免上一轮的 ole32 owner 破坏问题。
+
+## 诊断准备（2026-08-31）：为真机抓取 Word 读取请求补日志
+
+### 背景
+
+上面「待查方向 1/2」需要真机日志。检查现有诊断输出后发现三个盲点，会让
+Word 侧的失败无法区分，因此先只补日志（`task-057-diagnostics` feature 内，
+不改任何运行行为），再请用户在 Windows 真机复现。
+
+### 盲点与补丁
+
+1. **`GetData` 拒绝路径无日志**：原先 `requested_format` 出错直接 `?` 返回，
+   trace 里「Word 请求了但被拒」与「Word 根本没请求」完全同形。现补
+   `get_data kind=rejected hr=0x........`（含 `DV_E_TYMED` / `DV_E_CLIPFORMAT`
+   等具体 HRESULT）。
+2. **`get_data_request cf=<数字>` 无法对应格式名**：已注册格式（`PNG`、
+   FILEDESCRIPTOR 等）的 id 是运行时动态分配的。现在 `EnumFormatEtc` 时输出
+   `format_ids descriptor=.. contents=.. preferred_drop_effect=.. dibv5=.. png=..`，
+   可把后续 `cf=` 数字映射回格式。
+3. **无法从日志区分 prtsc 与图片文件两种来源**：现 `publish_collection` 追加
+   `publish_collection_image dibv5_bytes=.. png_bytes=..`，用于比对两种场景的
+   净荷大小（待查方向 2）。
+
+### 修改文件
+
+- `crates/m590-clipboard/src/windows_virtual_file.rs`：`GetData` 拒绝日志、
+  `EnumFormatEtc` 输出格式 id 表、`publish_virtual_file_collection` 输出双表示
+  净荷大小。三处均在 `task-057-diagnostics` 下，正式构建不受影响。
+- `crates/m590-clipboard/src/file_paths.rs`：修复测试辅助 `temp_file` 的并行竞态
+  （见下）。
+
+### 顺带修复：验证命令本身 flaky
+
+`cargo test -p m590-clipboard --lib` 是本 task 的验证命令，但它偶发失败
+（12 次里 1 次）：`local_paths_from_text_keeps_multiline_files_and_directories`
+断言只剩 `nested` 一项。根因是测试辅助 `temp_file` 只用纳秒命名临时目录，
+并行线程取到同一纳秒时共用同一目录，另一个测试的 `remove_dir_all` 删掉了
+本测试的文件。改为 `pid + 原子递增序号 + 纳秒`（新增 `unique_suffix()`，
+`bare_desktop_name_resolves_under_home_desktop` 的 HOME 目录同样改用）。
+修复后连跑 30 次全通过。仅测试代码，不影响产品行为。
+
+### 代码级验证（2026-08-31 实际运行）
+
+- `cargo test -p m590-clipboard --lib` 26 通过；连续 30 次全通过（0 失败）。
+- `cargo test -p m590-daemon --lib` 74 通过（2 ignored）；
+  `cargo test -p m590-core --lib` 41 通过。
+- `cargo clippy -p m590-core -p m590-daemon -p m590-clipboard --lib --no-deps
+  -- -D warnings` 通过；Windows 交叉
+  `cargo clippy -p m590-clipboard --lib --no-deps --features task-057-diagnostics
+  --target x86_64-pc-windows-gnu -- -D warnings` 通过；
+  `cargo check -p m590-daemon --target x86_64-pc-windows-gnu --lib --features
+  task-057-diagnostics` 通过；`cargo check --workspace`、`cargo fmt --check`、
+  `git diff --check` 通过。
+- 未做真机验证（本机 Ubuntu 无 Windows 运行条件）。
+
+### 用户真机复现步骤（Windows 侧抓日志）
+
+`desktop:standalone` 已默认启用诊断：`ui/package.json` 的
+`desktop:standalone` 带 `--features custom-protocol,task-057-diagnostics`，
+`ui/src-tauri/src/main.rs` 在该 feature 下不隐藏 Windows 控制台。**无需改命令
+参数**，只需把控制台输出重定向到文件：
+
+Windows（PowerShell，在仓库 `ui` 目录）：
+
+```powershell
+npm run desktop:standalone 2>&1 | Tee-Object -FilePath ..\win-trace.txt
+```
+
+Linux（仓库 `ui` 目录）：
+
+```bash
+npm run desktop:standalone 2>&1 | tee ../linux-trace.txt
+```
+
+复现顺序（每步之间停 2 秒，便于时间线对齐）：
+
+1. 两端启动并配对成功。
+2. **场景 A（当前失败）**：Linux 按 `prtsc` 截图 → 切到 Windows，先在
+   Word 里 `Ctrl+V`（预期失败），再在 Explorer 里 `Ctrl+V`（预期成功得到
+   `.png`）。
+3. **场景 B（此前通过，作对照）**：Linux 复制一个 `.png` 图片文件 → Windows
+   在 Word 里 `Ctrl+V`（预期成功）。
+4. 把 Windows 的 `win-trace.txt` 交回。
+
+日志里需要关注（Windows 侧）：
+
+- `format_ids ...`：把后面的 `cf=` 数字映射到格式名。
+- `publish_collection_image dibv5_bytes=.. png_bytes=..`：场景 A 与 B 的净荷大小差异。
+- `get_data_request cf=.. lindex=.. tymed=0x..` 与紧随的
+  `get_data kind=dibv5|png|rejected`：Word 请求了什么、是否被拒、HRESULT 是多少。
+- 若 Word 的 `Ctrl+V` 后**完全没有** `get_data_request`：说明 Word 在
+  `EnumFormatEtc`/`QueryGetData` 阶段就没选中位图格式，方向转为格式枚举顺序
+  或补 `CF_DIB`（待查方向 3）。
+
+## 文档影响检查（2026-08-31）
+
+- 已更新：本 task（诊断准备、flaky 修复、真机复现步骤）、`docs/plans/current.md`。
+- 无需更新：`docs/discovery/commands.md` — `desktop:standalone` 已记录会启用
+  `task-057-diagnostics` 并保留 Windows 控制台，本次未改命令或 feature 接线。
+- 无需更新：`AGENTS.md` 阶段描述 — 功能状态未变，pending 问题仍未解决。
+- 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 — 均未触及。
+
+## 下一步
+
+用户在 Windows 真机按上面步骤跑场景 A + B，回传 `win-trace.txt`；据此判断是
+补 `CF_DIB`、调整格式枚举顺序，还是改 GetData 的 tymed 处理。

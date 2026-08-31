@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
-> 更新：2026-08-28
-> 阶段：task-059 已统一应用版本来源；功能状态保持在 task-058 真机验收后水平
+> 更新：2026-08-31
+> 阶段：task-061 已补 Windows OLE 诊断日志，等待用户回传真机 trace
 
 ## 目标（近期）
 
@@ -60,8 +60,12 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
   通过；**待 Windows 10 / GNOME Wayland 真机验收**（见 task-061）。prtsc 后
   “不能粘贴成文件 + 后续文件复制阻塞”已修复：Windows 位图接收改为单一 OLE
   发布（不再先裸写 `EmptyClipboard` 覆盖 OLE owner），OLE 发布对
-  `CLIPBRD_E_CANT_OPEN` 短暂重试。剩余问题已记录：prtsc 位图 → Windows 可粘贴
-  成图片文件、但无法粘贴到 Word（`pending`，等待下次开发，见 task-061）。
+  `CLIPBRD_E_CANT_OPEN` 短暂重试。剩余问题：prtsc 位图 → Windows 可粘贴
+  成图片文件、但无法粘贴到 Word。2026-08-31 已为该问题补齐 Windows OLE 诊断
+  日志（`GetData` 拒绝 HRESULT、格式 id 映射表、双表示净荷大小；均在
+  `task-057-diagnostics` 下，正式构建不变），并顺带修复验证命令
+  `cargo test -p m590-clipboard --lib` 的并行临时目录竞态（30 次连跑全通过）。
+  **等待用户在 Windows 真机跑场景 A/B 并回传 trace**（步骤见 task-061）。
 
 ## 产品分期对照
 
@@ -108,12 +112,12 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. **task-061（待真机验收）**：图片/图片文件「双表示」粘贴初版已完成（代码级
+1. **task-061（待真机抓 trace）**：图片/图片文件「双表示」粘贴初版已完成（代码级
    通过）：Windows 位图双表示、Linux 单图片文件自动解码写位图；prtsc 后 OLE
    publish 失败与文件复制阻塞已修（单一 OLE 发布 + `CLIPBRD_E_CANT_OPEN`
-   重试）。待 Windows 10 + GNOME Wayland 四个方向真机验收（Word 与文件管理器
-   两种粘贴都可用、无回环、prtsc 复测；剩余：prtsc → Windows 无法贴 Word，
-   已记录等待下次开发）。
+   重试）。剩余：prtsc 位图 → Windows 无法贴 Word。已补 OLE 诊断日志，
+   **下一步是用户在 Windows 真机按 task-061 的步骤跑场景 A/B 并回传
+   `win-trace.txt`**，据此决定是否补 `CF_DIB` 或调整格式枚举。
 2. task-060（收尾）：Q1/Q2、Q3 权限、Q4 角标均真机通过；mp4/多个 pdf 替换
    七轮修复已由用户确认；「目录 + mp4」批次替换的八轮修复已回滚，日常以
    「文件夹与其他文件分开复制」规避（见 task-060）。
