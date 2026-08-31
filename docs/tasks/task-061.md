@@ -544,15 +544,29 @@ Descriptor 一类 OLE 内嵌协商）+ `cf=13`(CF_UNICODETEXT) 作为「**OLE �
 
 用**不带诊断 feature** 的构建跑场景 A（Linux `prtsc` → Windows 在 Word `Ctrl+V`）。
 注意 `ui/package.json` 的 `desktop:standalone` **把 `task-057-diagnostics` 写死在
-脚本里**，加 `--` 传参不会去掉它，必须绕开该脚本直接跑：
+脚本里**，加 `--` 传参不会去掉它。为此新增了同款但不带诊断的脚本：
 
 ```
-cd ui
-node scripts/prepare-standalone.mjs
-npm run build
-cargo run --manifest-path src-tauri/Cargo.toml --release --features custom-protocol
+cd ui && npm run desktop:standalone:nodiag
 ```
+
+（与 `desktop:standalone` 只差这一个 feature；`predesktop:standalone:nodiag` 同样会先跑
+`prepare-standalone.mjs`，已实测 npm 的 pre 钩子对带冒号的脚本名生效。等价的手写形式是
+`node scripts/prepare-standalone.mjs && npm run build && cargo run --manifest-path
+src-tauri/Cargo.toml --release --features custom-protocol`。`package-windows.ps1`
+打出的 NSIS 安装包同样不含该 feature，用它验证亦可。）
+
+**只有 Windows 端需要换构建**：怀疑的竞争在接收侧发布窗口，Linux 端只负责发位图。
+该构建不输出 `[task-057]` 日志，判读是二值的，不需要回传 trace。
 
 - **能贴** → (a) 成立，task-061 的 Windows 侧可判通过，诊断可择期收敛。
 - **不能贴** → (b) 成立，问题是发布窗口竞争，按上面的代码缺口做确定性修复
   （发布期间抑制本地轮询 / 在正式构建里也加一次发布后同步屏障），而不是继续补格式。
+
+## 文档影响检查（2026-08-31，第四次）
+
+- 已更新：本 task（第三轮 trace 事实、指纹统计、遗留风险、最小实验）、
+  `docs/plans/current.md`、`docs/discovery/commands.md`（新增
+  `desktop:standalone:nodiag` 及其用途说明）。
+- 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 —— 本轮未触及应用行为，
+  只加了一个 npm 脚本别名（feature 组合差异，非新功能）。

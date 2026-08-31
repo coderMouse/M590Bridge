@@ -5,9 +5,10 @@
 ## 桌面（推荐）
 
 ```bash
-cd ui && npm run desktop:standalone # 日常桌面：release + 内嵌 UI/Hub，不需要浏览器
-cd ui && npm run desktop:dev        # 开发：Vite 热更 + Tauri，仅开发会话使用
-cd ui && npm run build              # 仅前端
+cd ui && npm run desktop:standalone        # 日常桌面：release + 内嵌 UI/Hub，不需要浏览器
+cd ui && npm run desktop:standalone:nodiag # 同上，但不启用 task-057-diagnostics
+cd ui && npm run desktop:dev               # 开发：Vite 热更 + Tauri，仅开发会话使用
+cd ui && npm run build                     # 仅前端
 ```
 
 内嵌 hub：`http://127.0.0.1:5910`。Tauri WebView 自动取得进程临时令牌，无需手工配置。
@@ -18,6 +19,11 @@ cd ui && npm run build              # 仅前端
 task-057 排障期间，该命令还会临时启用 `task-057-diagnostics`；Windows 从源码运行时保留
 控制台并输出 `[task-057]` OLE/批次/速率行。NSIS 与普通 `desktop:build` 不启用该 feature，
 仍为无控制台正式构建。
+
+`desktop:standalone:nodiag` 与 `desktop:standalone` 只差 `task-057-diagnostics` 这一个
+feature，其余（`prepare-standalone.mjs` 预处理、release、内嵌 UI/Hub）完全相同。用于
+验证「某个现象是否依赖诊断代码的副作用」—— 诊断代码本身会碰剪贴板，留着就测不出它是否
+load-bearing（见 task-061 第三轮）。
 Linux 上该命令还会刷新用户级隐藏 `m590-ui.desktop` 与应用图标，供 GNOME/Wayland
 按 `app_id=m590-ui` 显示正确的任务栏图标；具体清理路径见 `ui/README.md`。
 

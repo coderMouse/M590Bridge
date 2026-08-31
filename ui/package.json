@@ -11,6 +11,8 @@
     "desktop:dev": "tauri dev",
     "predesktop:standalone": "node scripts/prepare-standalone.mjs",
     "desktop:standalone": "npm run build && cargo run --manifest-path src-tauri/Cargo.toml --release --features custom-protocol,task-057-diagnostics",
+    "predesktop:standalone:nodiag": "node scripts/prepare-standalone.mjs",
+    "desktop:standalone:nodiag": "npm run build && cargo run --manifest-path src-tauri/Cargo.toml --release --features custom-protocol",
     "desktop:build": "tauri build",
     "desktop:build:windows": "tauri build --bundles nsis"
   },
