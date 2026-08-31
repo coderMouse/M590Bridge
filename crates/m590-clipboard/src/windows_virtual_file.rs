@@ -22,7 +22,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::DataExchange::{GetClipboardSequenceNumber, RegisterClipboardFormatW};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{
-    OleInitialize, OleSetClipboard, OleUninitialize, CF_DIBV5, DROPEFFECT_COPY,
+    OleInitialize, OleSetClipboard, OleUninitialize, CF_DIB, CF_DIBV5, DROPEFFECT_COPY,
 };
 use windows::Win32::UI::Shell::{
     SHCreateStdEnumFmtEtc, CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_PREFERREDDROPEFFECT,
@@ -55,6 +55,7 @@ struct ClipboardFormats {
     descriptor: u16,
     contents: u16,
     preferred_drop_effect: u16,
+    dib: u16,
     dib_v5: u16,
     png: u16,
 }
@@ -65,12 +66,13 @@ impl ClipboardFormats {
             descriptor: register_format(CFSTR_FILEDESCRIPTORW)?,
             contents: register_format(CFSTR_FILECONTENTS)?,
             preferred_drop_effect: register_format(CFSTR_PREFERREDDROPEFFECT)?,
+            dib: CF_DIB.0,
             dib_v5: CF_DIBV5.0,
             png: register_format(windows::core::w!("PNG"))?,
         })
     }
 
-    fn as_format_etc(self) -> [FORMATETC; 5] {
+    fn as_format_etc(self) -> [FORMATETC; 6] {
         [
             FORMATETC {
                 cfFormat: self.descriptor,
@@ -94,6 +96,18 @@ impl ClipboardFormats {
             },
             FORMATETC {
                 cfFormat: self.preferred_drop_effect,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: FORMAT_INDEX_NONE,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            },
+            // CF_DIB: task-061 traces showed no consumer ever requested the
+            // CF_DIBV5 (17) we advertise — not one cf=17 GetData in either
+            // scenario — so the classic format every bitmap consumer knows was
+            // simply missing.  Listed first as the more widely understood of the
+            // two; the traces say nothing about whether order matters here.
+            FORMATETC {
+                cfFormat: self.dib,
                 ptd: std::ptr::null_mut(),
                 dwAspect: DVASPECT_CONTENT.0,
                 lindex: FORMAT_INDEX_NONE,
@@ -131,6 +145,7 @@ enum RequestedFormat {
     Contents(usize),
     ContentsQuery,
     PreferredDropEffect,
+    Dib,
     DibV5,
     Png,
 }
@@ -185,6 +200,11 @@ impl VirtualFileDataObject {
                 return Err(DV_E_LINDEX);
             }
             (RequestedFormat::PreferredDropEffect, TYMED_HGLOBAL.0 as u32)
+        } else if format.cfFormat == self.formats.dib {
+            if format.lindex != FORMAT_INDEX_NONE {
+                return Err(DV_E_LINDEX);
+            }
+            (RequestedFormat::Dib, TYMED_HGLOBAL.0 as u32)
         } else if format.cfFormat == self.formats.dib_v5 {
             if format.lindex != FORMAT_INDEX_NONE {
                 return Err(DV_E_LINDEX);
@@ -339,6 +359,14 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
                 self.content_medium(index)
             }
             RequestedFormat::ContentsQuery => unreachable!("GetData rejects capability queries"),
+            RequestedFormat::Dib => {
+                let dib = self
+                    .collection
+                    .dib_bytes()
+                    .ok_or_else(|| Error::from_hresult(DV_E_CLIPFORMAT))?;
+                task_057_diagnostic(format_args!("get_data kind=dib bytes={}", dib.len()));
+                hglobal_medium_from_bytes(dib)
+            }
             RequestedFormat::DibV5 => {
                 let dib = self
                     .collection
@@ -381,6 +409,7 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
                 }
                 Ok(RequestedFormat::ContentsQuery) => "contents_query",
                 Ok(RequestedFormat::PreferredDropEffect) => "preferred_drop_effect",
+                Ok(RequestedFormat::Dib) => "dib",
                 Ok(RequestedFormat::DibV5) => "dibv5",
                 Ok(RequestedFormat::Png) => "png",
                 Err(_) => "rejected",
@@ -427,14 +456,15 @@ impl IDataObject_Impl for VirtualFileDataObject_Impl {
             return Err(Error::from_hresult(E_NOTIMPL));
         }
         task_057_diagnostic(format_args!(
-            "enum_format_etc direction=get formats=descriptor,contents_wildcard,preferred_drop_effect,dibv5,png"
+            "enum_format_etc direction=get formats=descriptor,contents_wildcard,preferred_drop_effect,dib,dibv5,png"
         ));
         // Numeric ids let the trace map later `get_data cf=<n>` lines to a format.
         task_057_diagnostic(format_args!(
-            "format_ids descriptor={} contents={} preferred_drop_effect={} dibv5={} png={}",
+            "format_ids descriptor={} contents={} preferred_drop_effect={} dib={} dibv5={} png={}",
             self.formats.descriptor,
             self.formats.contents,
             self.formats.preferred_drop_effect,
+            self.formats.dib,
             self.formats.dib_v5,
             self.formats.png
         ));
@@ -737,7 +767,8 @@ pub fn publish_virtual_file_collection(
     // Payload sizes distinguish the prtsc bitmap case from the image-file case
     // when comparing traces (task-061 pending investigation).
     task_057_diagnostic(format_args!(
-        "publish_collection_image dibv5_bytes={} png_bytes={}",
+        "publish_collection_image dib_bytes={} dibv5_bytes={} png_bytes={}",
+        collection.dib_bytes().map_or(0, <[u8]>::len),
         collection.dib_v5_bytes().map_or(0, <[u8]>::len),
         collection.png_bytes().map_or(0, <[u8]>::len)
     ));

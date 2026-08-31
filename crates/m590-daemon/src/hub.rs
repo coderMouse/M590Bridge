@@ -5932,8 +5932,9 @@ fn rearm_cancelled_clipboard_offer(
 }
 
 /// Build an OLE virtual-file collection that exposes a received image both
-/// as a .png virtual file (Explorer paste) and as the CF_DIBV5 / PNG clipboard
-/// formats (Word/WordPad paste, and identical fingerprint for our own poll).
+/// as a .png virtual file (Explorer paste) and as the CF_DIB / CF_DIBV5 / PNG
+/// clipboard formats (Word/WordPad paste, and identical fingerprint for our own
+/// poll).  CF_DIB is what Word actually enumerates — see `to_dib_bytes`.
 #[cfg(target_os = "windows")]
 fn image_file_collection(
     content_id: &str,
@@ -5941,6 +5942,7 @@ fn image_file_collection(
 ) -> Result<m590_clipboard::VirtualFileCollection, String> {
     use m590_clipboard::{VirtualFile, VirtualFileCollection};
     let png = image.to_png_bytes().map_err(|e| e.to_string())?;
+    let dib = image.to_dib_bytes().map_err(|e| e.to_string())?;
     let dib_v5 = image.to_dibv5_bytes().map_err(|e| e.to_string())?;
     let file_name = format!("image-{content_id}.png");
     let file_png = png.clone();
@@ -5948,7 +5950,7 @@ fn image_file_collection(
         Ok(std::io::Cursor::new(file_png.clone()))
     })
     .map_err(|e| e.to_string())?;
-    Ok(VirtualFileCollection::single_image(file, dib_v5, png))
+    Ok(VirtualFileCollection::single_image(file, dib, dib_v5, png))
 }
 
 #[cfg(target_os = "windows")]

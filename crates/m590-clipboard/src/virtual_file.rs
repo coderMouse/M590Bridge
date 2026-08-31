@@ -103,6 +103,11 @@ impl fmt::Debug for VirtualFileCollectionEntry {
 #[derive(Clone, Debug)]
 pub struct VirtualFileCollection {
     entries: Vec<VirtualFileCollectionEntry>,
+    /// Optional plain DIB payload served as the Windows `CF_DIB` clipboard
+    /// format. This is the bitmap format Word enumerates (task-061 traces show
+    /// it never asks for `CF_DIBV5`), so it is what makes Word paste work.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    dib: Option<Vec<u8>>,
     /// Optional DIBv5 payload served as the Windows `CF_DIBV5` clipboard
     /// format when this collection also carries an image (Word/WordPad).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -150,6 +155,7 @@ impl VirtualFileCollection {
         }
         Ok(Self {
             entries,
+            dib: None,
             dib_v5: None,
             png: None,
         })
@@ -163,22 +169,29 @@ impl VirtualFileCollection {
         };
         Self {
             entries: vec![entry],
+            dib: None,
             dib_v5: None,
             png: None,
         }
     }
 
     /// A single virtual PNG file whose image is ALSO advertised as the Windows
-    /// `CF_DIBV5` and registered `PNG` clipboard formats. One OLE data object
-    /// then serves Explorer (virtual file paste) and Word/WordPad (image paste).
+    /// `CF_DIB` / `CF_DIBV5` and registered `PNG` clipboard formats. One OLE data
+    /// object then serves Explorer (virtual file paste) and Word/WordPad (image
+    /// paste).
+    ///
+    /// `CF_DIB` is the one that makes Word work: task-061 traces show Word never
+    /// asks for `CF_DIBV5`, and with no format it recognized it never issued a
+    /// `GetData` call at all.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub fn single_image(file: VirtualFile, dib_v5: Vec<u8>, png: Vec<u8>) -> Self {
+    pub fn single_image(file: VirtualFile, dib: Vec<u8>, dib_v5: Vec<u8>, png: Vec<u8>) -> Self {
         Self {
             entries: vec![VirtualFileCollectionEntry {
                 relative_path: file.file_name.clone(),
                 relative_path_utf16: file.file_name_utf16.clone(),
                 file: Some(file),
             }],
+            dib: Some(dib),
             dib_v5: Some(dib_v5),
             png: Some(png),
         }
@@ -186,6 +199,11 @@ impl VirtualFileCollection {
 
     pub fn entries(&self) -> &[VirtualFileCollectionEntry] {
         &self.entries
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn dib_bytes(&self) -> Option<&[u8]> {
+        self.dib.as_deref()
     }
 
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]

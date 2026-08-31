@@ -138,6 +138,58 @@ impl ImageClipboard {
         Ok(out)
     }
 
+    /// Windows clipboard `CF_DIB` payload (40-byte `BITMAPINFOHEADER` + bottom-up
+    /// BGRA), the classic bitmap format every bitmap consumer understands.
+    ///
+    /// task-061 real-machine traces: consumers issued ~25 `GetData` calls per
+    /// paste (text, HDROP, a range of registered formats) but **not one** for
+    /// `CF_BITMAP` (2), `CF_DIB` (8) or the `CF_DIBV5` (17) we did advertise. So
+    /// the data object offered no bitmap format anyone came to fetch. Whether
+    /// `CF_DIB` alone makes Word's paste work is unconfirmed — it needs a real
+    /// Windows machine.
+    ///
+    /// `BI_RGB` with 32 bpp: the alpha byte is ignored by consumers rather than
+    /// premultiplied, which matches how `CF_DIB` is conventionally produced.
+    pub fn to_dib_bytes(&self) -> Result<Vec<u8>, ClipboardError> {
+        const BI_RGB: u32 = 0;
+        const HEADER_BYTES: usize = 40;
+        let size_image_u32 = u32::try_from((self.width as u64) * (self.height as u64) * 4)
+            .map_err(|_| ClipboardError::Backend("image too large for DIB".into()))?;
+        let mut out = Vec::with_capacity(HEADER_BYTES + size_image_u32 as usize);
+        out.extend_from_slice(&(HEADER_BYTES as u32).to_le_bytes()); // biSize
+        out.extend_from_slice(&(self.width as i32).to_le_bytes());
+        // Positive height: bottom-up rows, same convention as our DIBv5 payload.
+        out.extend_from_slice(&(self.height as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        out.extend_from_slice(&BI_RGB.to_le_bytes());
+        out.extend_from_slice(&size_image_u32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        out.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        out.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        debug_assert_eq!(out.len(), HEADER_BYTES);
+        self.append_bottom_up_bgra(&mut out);
+        Ok(out)
+    }
+
+    /// Bottom-up rows of BGRA pixels, the shared pixel layout of `CF_DIB` and
+    /// `CF_DIBV5`.
+    fn append_bottom_up_bgra(&self, out: &mut Vec<u8>) {
+        for row in (0..self.height).rev() {
+            for col in 0..self.width {
+                let index = ((row * self.width + col) * 4) as usize;
+                // RGBA -> DIB BGRA.
+                out.extend_from_slice(&[
+                    self.rgba[index + 2],
+                    self.rgba[index + 1],
+                    self.rgba[index],
+                    self.rgba[index + 3],
+                ]);
+            }
+        }
+    }
+
     /// Windows clipboard DIBv5 payload (`BITMAPV5HEADER` + bottom-up BGRA).
     ///
     /// Byte-layout mirrors what `arboard` writes on Windows (`CF_DIBV5`,
@@ -177,18 +229,7 @@ impl ImageClipboard {
         out.extend_from_slice(&0u32.to_le_bytes()); // profileSize
         out.extend_from_slice(&0u32.to_le_bytes()); // reserved
         debug_assert_eq!(out.len(), 124);
-        for row in (0..self.height).rev() {
-            for col in 0..self.width {
-                let index = ((row * self.width + col) * 4) as usize;
-                // RGBA -> DIB BGRA with the arboard bitfield byte order.
-                out.extend_from_slice(&[
-                    self.rgba[index + 2],
-                    self.rgba[index + 1],
-                    self.rgba[index],
-                    self.rgba[index + 3],
-                ]);
-            }
-        }
+        self.append_bottom_up_bgra(&mut out);
         Ok(out)
     }
 
@@ -811,6 +852,35 @@ mod tests {
             }
         }
         assert_eq!(decoded, rgba);
+    }
+
+    #[test]
+    fn dib_layout_matches_windows_bitmap_consumer() {
+        // task-061: no consumer requested any bitmap format in the real-machine
+        // trace (not CF_DIB, CF_BITMAP, nor the CF_DIBV5 we advertised), so the
+        // same pixels are now also served as plain CF_DIB. 40-byte
+        // BITMAPINFOHEADER, BI_RGB, 32 bpp, bits immediately after the header.
+        const BI_RGB: u32 = 0;
+        let rgba = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 128, 64, 32, 16,
+        ];
+        let image = ImageClipboard::from_rgba(2, 2, rgba.clone()).unwrap();
+        let dib = image.to_dib_bytes().unwrap();
+
+        let u16_at = |off: usize| u16::from_le_bytes(dib[off..off + 2].try_into().unwrap());
+        let i32_at = |off: usize| i32::from_le_bytes(dib[off..off + 4].try_into().unwrap());
+        let u32_at = |off: usize| u32::from_le_bytes(dib[off..off + 4].try_into().unwrap());
+        assert_eq!(u32_at(0), 40); // biSize
+        assert_eq!(i32_at(4), 2); // width
+        assert_eq!(i32_at(8), 2); // positive height: bottom-up rows
+        assert_eq!(u16_at(12), 1); // biPlanes
+        assert_eq!(u16_at(14), 32); // biBitCount
+        assert_eq!(u32_at(16), BI_RGB);
+        assert_eq!(u32_at(20), 2 * 2 * 4); // biSizeImage
+        assert_eq!(dib.len(), 40 + 16);
+
+        // Same pixel block as the DIBv5 payload: BGRA, bottom-up.
+        assert_eq!(&dib[40..], &image.to_dibv5_bytes().unwrap()[124..]);
     }
 
     #[test]

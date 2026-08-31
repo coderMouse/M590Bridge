@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-31
-> 阶段：task-061 已补 Windows OLE 诊断日志，等待用户回传真机 trace
+> 阶段：task-061 已据真机 trace 补 `CF_DIB` 位图格式，等待 Windows 真机确认
 
 ## 目标（近期）
 
@@ -65,7 +65,12 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
   日志（`GetData` 拒绝 HRESULT、格式 id 映射表、双表示净荷大小；均在
   `task-057-diagnostics` 下，正式构建不变），并顺带修复验证命令
   `cargo test -p m590-clipboard --lib` 的并行临时目录竞态（30 次连跑全通过）。
-  **等待用户在 Windows 真机跑场景 A/B 并回传 trace**（步骤见 task-061）。
+  真机 trace 已回传并逐条核对：`Ctrl+V` 后确有约 25 次 `GetData`，但
+  **`CF_BITMAP`(2) / `CF_DIB`(8) / `CF_DIBV5`(17) 一次都没被请求** —— 数据对象
+  没有提供任何消费者会来取的位图格式。据此补 `CF_DIB`（40 字节
+  `BITMAPINFOHEADER` + bottom-up BGRA，与 DIBv5 共用像素块），代码级验证通过。
+  **仍待 Windows 真机确认 `CF_DIB` 是否让 Word 粘贴可用**；另注意该 trace 也
+  无法证实「场景 B（图片文件）在 Word 里成功」，下轮需同时回报肉眼结果。
 
 ## 产品分期对照
 

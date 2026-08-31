@@ -290,7 +290,105 @@ npm run desktop:standalone 2>&1 | tee ../linux-trace.txt
 - 无需更新：`AGENTS.md` 阶段描述 — 功能状态未变，pending 问题仍未解决。
 - 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 — 均未触及。
 
+## 真机 trace 结论与修复（2026-08-31）：无人请求位图格式，补 `CF_DIB`
+
+### trace 读到的事实（逐条核对 `win-trace.txt`，非推测）
+
+HRESULT 对照取自 `windows-0.61.3` 的 `Win32/Foundation/mod.rs` 常量定义：
+`0x8004006A`=`DV_E_CLIPFORMAT`、`0x80040069`=`DV_E_TYMED`、
+`0x8004006B`=`DV_E_DVASPECT`。
+
+1. **`Ctrl+V` 后确实有大量 `get_data_request`**（约 25 次/场景），消费者把
+   `CF_UNICODETEXT`(13)、`CF_HDROP`(15) 和一批注册格式挨个问了一遍，其中 49 次
+   得到 `DV_E_CLIPFORMAT`（我们没提供该格式，属正常）。
+2. **零次 `cf=2`(`CF_BITMAP`) / `cf=8`(`CF_DIB`) / `cf=17`(`CF_DIBV5`) 请求。**
+   `grep -cE "cf=(2|8|17) "` 结果为 0。我们枚举了 `dibv5=17`，但没有任何消费者
+   来取它。
+3. **我们自己的 `PNG`(49330) 被以 `tymed=0x4`(`TYMED_ISTREAM`) 请求过 3 次，
+   均回 `DV_E_TYMED`**（我们只提供 `TYMED_HGLOBAL`）。但在
+   `imgfile-35227-6` 那次，调用方随后用 `tymed=0x1` 重试并成功
+   （`get_data kind=png bytes=87432`）—— 这是探测回退模式，**不是致命错误**，
+   因此本次不动 tymed 处理。
+4. Explorer 侧 `descriptor` + `contents lindex=0` 取数正常，与「Explorer 粘贴得到
+   `.png` 成功」一致。
+
+### 本次 trace 的局限（必须记下，避免下次误判）
+
+场景 B（复制图片文件）里**同样没有任何位图格式请求**，trace 里也没有任何
+能证明 Word 成功插入图片的痕迹。也就是说 **这份 trace 无法证实「场景 B 在
+Word 里成功」**；此前那条观察可能早于 OLE 化改动。下次真机验证需要同时回报
+Word 里的肉眼结果，不能只看日志。
+
+### 根因判断
+
+数据对象只提供 `CF_DIBV5`(17) 与注册格式 `PNG`。`CF_DIBV5` 是较晚引入的扩展
+格式，Word 的图片粘贴路径不来取它（事实 2）；注册的 `PNG` 虽然被取走过，但那
+是文件/通用路径，不是 Word 的「插入图片」格式。缺的是**最经典的
+`CF_DIB`(8)** —— 位图消费者普遍认它。
+
+这个判断的强度：事实 2 是硬证据（没人要 17），补 `CF_DIB` 是最小且方向明确的
+一步；但**它是否足以让 Word 可用，只有真机能确认**。
+
+### 改动
+
+- `crates/m590-clipboard/src/lib.rs`：新增 `ImageClipboard::to_dib_bytes()`，
+  产出 40 字节 `BITMAPINFOHEADER` + bottom-up BGRA（`BI_RGB`、32bpp、正高度）。
+  与 `to_dibv5_bytes()` 共用新抽出的 `append_bottom_up_bgra()`，两种格式的像素
+  块保证逐字节一致。
+- `crates/m590-clipboard/src/virtual_file.rs`：`VirtualFileCollection` 增
+  `dib` 字段与 `dib_bytes()`；`single_image()` 签名变为
+  `(file, dib, dib_v5, png)`。
+- `crates/m590-clipboard/src/windows_virtual_file.rs`：`ClipboardFormats` 增
+  `dib: CF_DIB.0`；`as_format_etc()` 由 5 项增至 6 项；
+  `RequestedFormat::Dib` 分支接入 `requested_format` / `GetData` /
+  `QueryGetData`；诊断的 `format_ids`、`enum_format_etc`、
+  `publish_collection_image` 三行都带上 `dib`，便于下轮 trace 判读。
+- `crates/m590-daemon/src/hub.rs`：`image_file_collection()` 额外算 `dib` 并传入
+  `single_image()`。
+
+`CF_DIBV5` 与 `PNG` 都保留：DIBv5 带 alpha 信息，认它的消费者能拿到更好结果。
+枚举顺序把 `CF_DIB` 放在 `CF_DIBV5` 前面，但**这一点没有 trace 证据支持**
+（没人请求过 17，顺序很可能无关），只是倾向广泛兼容的那个格式。
+
+### 代码级验证（2026-08-31 实际运行）
+
+- `cargo test -p m590-clipboard --lib` 27 通过（新增
+  `dib_layout_matches_windows_bitmap_consumer`：断言 40 字节头各字段，并断言像素
+  块与 `to_dibv5_bytes()[124..]` 逐字节相同）。
+- `cargo test -p m590-daemon --lib` 74 通过（2 ignored）；
+  `cargo test -p m590-core --lib` 41 通过。
+- `cargo clippy -p m590-core -p m590-daemon -p m590-clipboard --lib --no-deps
+  -- -D warnings` 通过；Windows 交叉
+  `cargo clippy -p m590-clipboard --lib --no-deps --features task-057-diagnostics
+  --target x86_64-pc-windows-gnu -- -D warnings` 通过；
+  `cargo check -p m590-daemon --target x86_64-pc-windows-gnu --lib --features
+  task-057-diagnostics` 通过；`cargo check --workspace`、`cargo fmt --check`、
+  `git diff --check` 通过。
+- **未做真机验证（本机 Ubuntu 无 Windows 运行条件）** —— 这是 blocker：
+  `CF_DIB` 是否真的让 Word 的粘贴可用，只能在 Windows 上确认。
+
+### 待用户真机确认
+
+按前一节同样方式启动（`desktop:standalone` 已默认带诊断），跑场景 A：
+Linux `prtsc` → Windows 在 Word `Ctrl+V`。**请同时回报 Word 里的肉眼结果**
+（见上文「局限」）。判读：
+
+- 预期出现 `get_data_request cf=8 ...` 紧随 `get_data kind=dib bytes=..`，
+  且 Word 里出现图片 → 修复成立。
+- 若出现 `cf=8` 请求但 Word 报错/图像错乱 → 转为像素布局问题（高度符号、
+  `BI_RGB` 下 alpha 字节的处理）。
+- 若**仍无任何 `cf=8`/`cf=2` 请求** → 说明问题不在格式列表，下一步转向
+  `CF_BITMAP`(2, 需 `TYMED_GDI` + HBITMAP) 或 `OleSetClipboard` 之后的
+  剪贴板所有权/延迟渲染时序；可用
+  `publish_collection_image dib_bytes=..` 行先确认净荷确实挂上了。
+
+## 文档影响检查（2026-08-31，第二次）
+
+- 已更新：本 task（trace 逐条核对结论、`CF_DIB` 修复、trace 局限、待确认判读）。
+- 待更新：`docs/plans/current.md` —— pending 问题状态。
+- 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 —— 均未触及；
+  `docs/discovery/commands.md` 未改命令或 feature 接线。
+
 ## 下一步
 
-用户在 Windows 真机按上面步骤跑场景 A + B，回传 `win-trace.txt`；据此判断是
-补 `CF_DIB`、调整格式枚举顺序，还是改 GetData 的 tymed 处理。
+用户在 Windows 真机跑场景 A，按上面三条判读回报结果（含 Word 肉眼结果）。
