@@ -468,3 +468,91 @@ Linux `prtsc` → Windows 在 Word `Ctrl+V`。**请同时回报 Word 里的肉�
 
 用户跑第三轮场景 A，回报 `system_clipboard_formats` 一行 + 场景 B 在 Word 的
 实际结果。
+
+## 第三轮真机 trace（2026-08-31）：两场景均通过；发布环节被证明是对的，但 fail→pass 尚无代码解释
+
+用户回报：**场景一和场景二都测试通过了**（trace 275 行，三次 publish）。
+
+### 事实 1 — 系统剪贴板确实暴露了位图格式（发布环节洗清）
+
+三次发布输出完全相同的一行：
+
+```
+system_clipboard_formats count=9 ids=49161(DataObject) 49393(FileGroupDescriptorW)
+  49342(FileContents) 49397(Preferred DropEffect) 8 17 49330(PNG)
+  49171(Ole Private Data) 2
+```
+
+- `8`(CF_DIB)、`17`(CF_DIBV5) **在系统剪贴板上跨进程可见** → 第二轮设想的
+  「延迟渲染未 `OleFlushClipboard`、格式没落地」这条分支**证伪**，发布路径正确，
+  不需要 `OleFlushClipboard`。
+- `2`(CF_BITMAP) 排在 `Ole Private Data` **之后**，即系统由 `CF_DIB`
+  **合成**的格式（合成格式在 `EnumClipboardFormats` 中排在实际写入的格式之后）。
+  Word 需要的位图形式是齐的。
+
+### 事实 2 — 「Word 是否真的读了」有了可判别的指纹
+
+第二轮把那串 `GetData` 整体归给「Explorer/监视器」是**过粗**的。把两轮 trace 按
+publish 切段后统计（脚本按 `get_data_request cf=.. tymed=..` 聚合）：
+
+| trace | 段 | 请求数 | `cf=13` | TYMED_ISTORAGE(0x4) | OLE 内嵌格式 |
+|---|---|---|---|---|---|
+| 第二轮 | 段1（prtsc，**Word 失败**） | 23 | 0 | 0 | 无 |
+| 第二轮 | 段4（图片文件，**Word 成功**） | 38 | 3 | 6 | 49933/49935/49936/49938 |
+| 第三轮 | 段1/2/3（**全部成功**） | 各 37 | 各 3 | 各 5 | 49933/49935/49936/49938 |
+
+以 `TYMED_ISTORAGE` 探测 `49933/49935/49936/49938`（Embed Source / Object
+Descriptor 一类 OLE 内嵌协商）+ `cf=13`(CF_UNICODETEXT) 作为「**OLE 容器
+（Word）真的接触了数据对象**」的指纹，它与用户报告的成功/失败**在 7 个观测点上
+完全一致**：失败的那段没有这个指纹，成功的每一段都有。
+
+所以第二轮的核心判断成立且现在更精确：**当时的失败不是「Word 读了但拒绝」，
+而是「Word 根本没读」**；本轮 Word 读了，于是能贴。
+
+### 事实 3 — 即便成功，Word 也从不向我们的 `IDataObject` 要位图
+
+**全部 7 段（含三段成功）中 `cf=2/8/17` 的请求数均为 0。** 结合事实 1：Word 的
+位图是直接从**系统剪贴板**取的，不经过 `IDataObject::GetData`。这解释了为什么
+前两轮盯着 `GetData` 日志找位图请求永远找不到 —— 那里本来就不会有。
+
+### 事实 4（未解决）— 本轮没有任何行为改动，fail→pass 无代码解释
+
+第三轮提交 `1e78f4f` **只加了诊断**（`log_system_clipboard_formats`），未改发布
+逻辑。因此「上一轮失败、这一轮成功」目前**不能由我们的改动解释**。两种可能：
+
+- **(a) 第二轮那次失败是测试侧偶发**（构建/焦点/时序），`CF_DIB`（`2947157`）
+  实际已经修好或本就不需要；
+- **(b) 诊断本身是 load-bearing**：它在 `OleSetClipboard` 之后立刻
+  `OpenClipboard(None)` / `CloseClipboard`，占住了发布后的那个窗口。
+
+(b) 有一条 trace 级佐证：第二轮**失败的那一段**里，本地轮询
+`[task-057][hub] clipboard_file_list_detected roots=0 files=0 directories=0`
+恰好落在 `format_ids` **紧后面**（即发布窗口内，且它读到的是「空」）；第三轮三次
+发布的同一位置都换成了我们的 `system_clipboard_formats`，全程没有轮询插入。
+
+代码侧确有对应缺口：`hub.rs:4770-4781` 只在 `virtual_receive` /
+`virtual_batch_receive` 活跃时抑制轮询，而**图片双表示 OLE 发布这两者都不置位**，
+因此发布后本地轮询不受抑制，可以立刻回读剪贴板并与发布窗口竞争。
+
+### 由此产生的风险（尚未验证）
+
+`log_system_clipboard_formats` 只在 `task-057-diagnostics` 下编译，**正式构建是
+空 stub**。用户三轮真机跑的都是 `--features custom-protocol,task-057-diagnostics`。
+若 (b) 成立，**正式构建仍然是坏的**，而我们会误以为已修好。
+
+### 判定下一步的最小实验
+
+用**不带诊断 feature** 的构建跑场景 A（Linux `prtsc` → Windows 在 Word `Ctrl+V`）。
+注意 `ui/package.json` 的 `desktop:standalone` **把 `task-057-diagnostics` 写死在
+脚本里**，加 `--` 传参不会去掉它，必须绕开该脚本直接跑：
+
+```
+cd ui
+node scripts/prepare-standalone.mjs
+npm run build
+cargo run --manifest-path src-tauri/Cargo.toml --release --features custom-protocol
+```
+
+- **能贴** → (a) 成立，task-061 的 Windows 侧可判通过，诊断可择期收敛。
+- **不能贴** → (b) 成立，问题是发布窗口竞争，按上面的代码缺口做确定性修复
+  （发布期间抑制本地轮询 / 在正式构建里也加一次发布后同步屏障），而不是继续补格式。
