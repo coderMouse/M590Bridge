@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-08-31
-> 阶段：task-061 已据真机 trace 补 `CF_DIB` 位图格式，等待 Windows 真机确认
+> 阶段：task-061 补格式方向已证伪，改补系统剪贴板枚举诊断，等待第三轮真机 trace
 
 ## 目标（近期）
 
@@ -66,11 +66,15 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
   `task-057-diagnostics` 下，正式构建不变），并顺带修复验证命令
   `cargo test -p m590-clipboard --lib` 的并行临时目录竞态（30 次连跑全通过）。
   真机 trace 已回传并逐条核对：`Ctrl+V` 后确有约 25 次 `GetData`，但
-  **`CF_BITMAP`(2) / `CF_DIB`(8) / `CF_DIBV5`(17) 一次都没被请求** —— 数据对象
-  没有提供任何消费者会来取的位图格式。据此补 `CF_DIB`（40 字节
-  `BITMAPINFOHEADER` + bottom-up BGRA，与 DIBv5 共用像素块），代码级验证通过。
-  **仍待 Windows 真机确认 `CF_DIB` 是否让 Word 粘贴可用**；另注意该 trace 也
-  无法证实「场景 B（图片文件）在 Word 里成功」，下轮需同时回报肉眼结果。
+  **`CF_BITMAP`(2) / `CF_DIB`(8) / `CF_DIBV5`(17) 一次都没被请求**。据此补了
+  `CF_DIB`，**第二轮真机验证证明无效**：格式表与净荷都正常（`dib=8`、
+  `dib_bytes=16367404`），但仍零次 `cf=8` 请求，且 `QueryGetData` 调用 0 次、
+  两个场景的读取序列几乎逐字节相同 —— 说明那串请求是 Explorer/剪贴板监视器
+  的指纹，**Word 很可能从未接触我们的数据对象**，两轮「补格式」方向本身有误。
+  2026-08-31 第三轮改为只补一条可证伪诊断：发布后枚举系统剪贴板真实格式列表
+  （`system_clipboard_formats`，诊断 feature 内，正式构建空 stub）。
+  **待真机回传该行**以判定问题在发布环节（`OleFlushClipboard`）还是读取条件；
+  另需澄清场景 B（图片文件）在 Word 是否真能贴。
 
 ## 产品分期对照
 

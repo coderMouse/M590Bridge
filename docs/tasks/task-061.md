@@ -389,6 +389,82 @@ Linux `prtsc` → Windows 在 Word `Ctrl+V`。**请同时回报 Word 里的肉�
 - 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 —— 均未触及；
   `docs/discovery/commands.md` 未改命令或 feature 接线。
 
+## 第二轮真机 trace（2026-08-31）：`CF_DIB` 无效，且此前对「谁在读」的归因是错的
+
+### 事实（逐条核对新 `win-trace.txt`，166 行）
+
+1. **`CF_DIB` 确实挂上了**：`format_ids ... dib=8 dibv5=17 png=49330`，
+   `publish_collection_image dib_bytes=16367404 dibv5_bytes=16367488
+   png_bytes=3696139`。净荷与格式表都没问题。
+2. **仍然零次 `cf=8` / `cf=2` / `cf=17` 请求**（`grep -cE "cf=(2|8|17) "` = 0）。
+   补 `CF_DIB` **对 Word 的粘贴没有任何作用**。
+3. **`QueryGetData` 被调用 0 次**（`grep -c query_get_data` = 0）。Word 判断
+   「粘贴是否可用」必然先经 `QueryGetData`，一次都没有。
+4. **场景 A 与场景 B 的 `GetData` 请求序列几乎逐字节相同**：各 23 / 24 条，
+   仅差一条 `cf=13`。但用户报告 B 在 Word 里能贴、A 不能 —— 相同的请求序列
+   不可能导出相反结果。
+5. 序列内容为 `cf=49397`(PreferredDropEffect)×14、`descriptor`、
+   `contents lindex=0`，以及一批 shell 专有格式（49333/49341/49414/49416…）。
+
+### 归因修正（重要）
+
+**此前把这些 `GetData` 当作「Word 的读取」是错的。** 事实 3+4+5 指向同一结论：
+这串请求是 **Explorer / 剪贴板监视器**的指纹，与 Word 无关。Word 很可能
+**从未接触过我们的数据对象** —— 它在更早的环节就没看到可贴的位图内容，
+所以数据对象的格式表里放什么都不会被读到。这解释了为什么两轮「补格式」
+（DIBv5 → 再补 CF_DIB）都完全无效：**方向本身错了**，不是格式选错了。
+
+### 本轮改动：只补一条能证伪的诊断（不改运行行为）
+
+不再猜格式。发布后立刻在本进程枚举**系统剪贴板**真实暴露的格式列表
+（`OpenClipboard(None)` + `EnumClipboardFormats` + `GetClipboardFormatNameW`），
+输出 `system_clipboard_formats count=.. ids=..`。
+
+- `OpenClipboard(None)` 传 None，本线程不会成为 clipboard owner，不干扰刚建立
+  的 OLE 所有权；任何路径都 `CloseClipboard`；打不开时输出
+  `system_clipboard_formats open_failed err=..` 而不是静默。
+- 整个函数在 `#[cfg(feature = "task-057-diagnostics")]` 下，正式构建是空 stub
+  （已验证两种 feature 组合的 Windows 交叉 clippy 均 `-D warnings` 通过）。
+
+判读逻辑（这是补它的唯一目的）：
+
+- **列表里没有 8/17** → 格式根本没落到系统剪贴板上。问题在**发布环节**，
+  最可能是延迟渲染的 OLE 对象未 `OleFlushClipboard`，跨进程枚举不到实体格式。
+- **列表里有 8/17** → 格式系统级可见，问题在 Word 侧的读取条件（此时才值得
+  查 `CF_BITMAP`/`TYMED_GDI`、DVASPECT、或 Word 对 OLE owner 的额外要求）。
+
+### 代码级验证（2026-08-31 实际运行）
+
+- `cargo test -p m590-clipboard --lib` 27 通过；`m590-daemon --lib` 74 通过
+  （2 ignored）；`m590-core --lib` 41 通过。
+- Windows 交叉 clippy **两种 feature 组合**均 `-D warnings` 通过：
+  `--features task-057-diagnostics` 与不带该 feature（确认 stub 不触发
+  unused 警告）。
+- `cargo clippy -p m590-core -p m590-daemon -p m590-clipboard --lib --no-deps
+  -- -D warnings`、`cargo check -p m590-daemon --target x86_64-pc-windows-gnu
+  --lib --features task-057-diagnostics`、`cargo check --workspace`、
+  `cargo fmt --check`、`git diff --check` 均通过。
+- 未做真机验证（本机 Ubuntu 无 Windows 运行条件）。本轮**不含任何行为修复**，
+  只为下一轮定位提供证据。
+
+### 待用户真机确认（第三轮）
+
+跑场景 A（Linux `prtsc` → Windows 在 Word `Ctrl+V`），回传 trace。只需看一行：
+`system_clipboard_formats count=.. ids=..`。按上面两条分支判读即可确定下一步是
+修发布（`OleFlushClipboard`）还是修读取条件。
+
+**另需你确认一件仍未澄清的事**：场景 B（复制图片文件）在 Word 里现在到底能不能
+贴？事实 4 显示两个场景的读取序列几乎相同，若「B 能贴」这条实际不成立，
+则问题范围应改为「所有 OLE 图片路径对 Word 均不可用」，方向会跟着变。
+
+## 文档影响检查（2026-08-31，第三次）
+
+- 已更新：本 task（第二轮 trace 事实、归因修正、系统剪贴板枚举诊断）、
+  `docs/plans/current.md`。
+- 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 —— 未触及；
+  `docs/discovery/commands.md` —— 未改命令或 feature 接线。
+
 ## 下一步
 
-用户在 Windows 真机跑场景 A，按上面三条判读回报结果（含 Word 肉眼结果）。
+用户跑第三轮场景 A，回报 `system_clipboard_formats` 一行 + 场景 B 在 Word 的
+实际结果。

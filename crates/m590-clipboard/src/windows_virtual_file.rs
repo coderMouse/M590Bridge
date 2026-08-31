@@ -19,6 +19,10 @@ use windows::Win32::System::Com::{
     STGMEDIUM, STGMEDIUM_0, STGM_READ, STGTY_STREAM, STREAM_SEEK, STREAM_SEEK_CUR, STREAM_SEEK_END,
     STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
 };
+#[cfg(feature = "task-057-diagnostics")]
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EnumClipboardFormats, GetClipboardFormatNameW, OpenClipboard,
+};
 use windows::Win32::System::DataExchange::{GetClipboardSequenceNumber, RegisterClipboardFormatW};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{
@@ -49,6 +53,67 @@ fn task_057_diagnostic(args: std::fmt::Arguments<'_>) {
 
 #[cfg(not(feature = "task-057-diagnostics"))]
 fn task_057_diagnostic(_args: std::fmt::Arguments<'_>) {}
+
+/// task-061 diagnostic: enumerate what the **system** clipboard actually exposes
+/// right after `OleSetClipboard`, and log it.
+///
+/// This exists to settle one question the previous two traces could not. Adding
+/// `CF_DIB` (8) to the data object changed nothing: still zero `cf=8` GetData
+/// calls, and `QueryGetData` was never called at all — while the requests we do
+/// see (14× PreferredDropEffect, descriptor, contents, shell-private formats)
+/// are an Explorer/clipboard-monitor fingerprint, near byte-identical between
+/// the failing and the working scenario. So Word may never reach our data object
+/// at all, in which case the format table is irrelevant.
+///
+/// A cross-process enumeration separates the two cases:
+///   - list has no 8/17 → the formats never landed on the system clipboard;
+///     the bug is in publishing (e.g. an unflushed delayed-render OLE object).
+///   - list has 8/17 → they are visible system-wide and the bug is in what
+///     makes Word decline to read them.
+///
+/// Opening the clipboard here is safe-ish but not free: it can fail while
+/// another window holds it, and we must always `CloseClipboard`. Diagnostics
+/// builds only — never compiled into a release build.
+#[cfg(feature = "task-057-diagnostics")]
+fn log_system_clipboard_formats() {
+    // Passing None keeps our thread from becoming the clipboard owner, so this
+    // observation cannot disturb the OLE ownership we just established.
+    if let Err(err) = unsafe { OpenClipboard(None) } {
+        task_057_diagnostic(format_args!(
+            "system_clipboard_formats open_failed err={err}"
+        ));
+        return;
+    }
+    let mut listed = String::new();
+    let mut format = unsafe { EnumClipboardFormats(0) };
+    let mut count = 0usize;
+    while format != 0 {
+        count += 1;
+        let mut name = [0u16; 64];
+        let written = unsafe { GetClipboardFormatNameW(format, &mut name) };
+        if written > 0 {
+            let label = String::from_utf16_lossy(&name[..written as usize]);
+            listed.push_str(&format!(" {format}({label})"));
+        } else {
+            // Predefined formats (CF_DIB=8, CF_DIBV5=17, ...) have no name.
+            listed.push_str(&format!(" {format}"));
+        }
+        format = unsafe { EnumClipboardFormats(format) };
+    }
+    let _ = unsafe { CloseClipboard() };
+    task_057_diagnostic(format_args!(
+        "system_clipboard_formats count={count} ids={}",
+        if listed.is_empty() {
+            " <none>".to_string()
+        } else {
+            listed
+        }
+        .trim_start()
+    ));
+}
+
+#[cfg(not(feature = "task-057-diagnostics"))]
+fn log_system_clipboard_formats() {}
 
 #[derive(Clone, Copy)]
 struct ClipboardFormats {
@@ -824,6 +889,7 @@ pub fn publish_virtual_file_collection(
         return Err(ClipboardError::Backend(err.to_string()));
     }
     let published_sequence = clipboard_sequence();
+    log_system_clipboard_formats();
     Ok(VirtualFileClipboard {
         object: Some(object),
         published_sequence,
