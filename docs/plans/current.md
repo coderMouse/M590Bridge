@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
-> 更新：2026-08-31
-> 阶段：task-061 第三轮真机两场景均通过；发布环节已洗清，待确认正式构建（无诊断 feature）是否同样可用
+> 更新：2026-09-01
+> 阶段：task-061 正式构建场景 A 真机通过；发布窗口轮询竞争已修（同步发布 + 静默期），待 Windows 真机复测
 
 ## 目标（近期）
 
@@ -78,11 +78,14 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
   `OleFlushClipboard` 分支证伪。按 publish 切段统计还得到「Word 是否真的读了」
   的指纹（`TYMED_ISTORAGE` 探测 OLE 内嵌格式 + `cf=13`），它与用户报告的
   成功/失败在 7 个观测点上完全一致：**当初的失败是 Word 根本没读，不是读了拒绝**。
-  遗留：本轮**只加诊断、未改行为**，fail→pass 无代码解释；疑点是发布窗口被
-  本地轮询竞争（失败那段的轮询恰好插在 `format_ids` 之后，且
-  `hub.rs:4770-4781` 对图片双表示发布不抑制轮询）。**风险：诊断在正式构建是空
-  stub，若它是 load-bearing 则正式构建仍坏。** 下一步最小实验：用不带
-  `task-057-diagnostics` 的构建复跑场景 A。
+  **2026-09-01 最小实验已跑：Windows 端用 `desktop:standalone:nodiag`（不带
+  `task-057-diagnostics`）跑场景 A，用户确认通过** → 诊断非 load-bearing，
+  「正式构建可能仍坏」的风险证伪，2026-08-29 起 `pending` 的「prtsc 位图 →
+  Windows 无法贴 Word」关闭。**仍未解决**：第二轮失败的构建已含 `CF_DIB`，与本轮
+  通过的构建产品代码等价，fail→pass 无代码解释（测试侧偶发 / 竞争未触发，单次
+  通过无法区分）；`hub.rs:4770-4781` 图片双表示发布不抑制本地轮询这一缺口未修。
+  正式构建上仍待真机：Explorer 粘贴成 `.png`、Windows→Linux 两场景、文本/批次/
+  替换/断线回归。
 
 ## 产品分期对照
 
@@ -129,12 +132,17 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. **task-061（待真机抓 trace）**：图片/图片文件「双表示」粘贴初版已完成（代码级
-   通过）：Windows 位图双表示、Linux 单图片文件自动解码写位图；prtsc 后 OLE
-   publish 失败与文件复制阻塞已修（单一 OLE 发布 + `CLIPBRD_E_CANT_OPEN`
-   重试）。剩余：prtsc 位图 → Windows 无法贴 Word。已补 OLE 诊断日志，
-   **下一步是用户在 Windows 真机按 task-061 的步骤跑场景 A/B 并回传
-   `win-trace.txt`**，据此决定是否补 `CF_DIB` 或调整格式枚举。
+1. **task-061（待真机复测竞争修复）**：图片/图片文件「双表示」粘贴：Windows 位图
+   双表示、Linux 单图片文件自动解码写位图；prtsc 后 OLE publish 失败与文件复制阻塞
+   已修；**prtsc 位图 → Windows 贴 Word 已在正式构建（无诊断）真机通过
+   （2026-09-01）**。**发布窗口轮询竞争已修（2026-09-01）**：根因是
+   `publish_collection` fire-and-forget（`OleSetClipboard` 最多晚 25ms 在 STA 线程
+   执行），已改为同步确认发布（`publish_collection_synced` + `PublishOutcome`）并加
+   500ms 发布后静默期；代码级验证通过（daemon 75 测试、两种 feature 组合 Windows
+   交叉 clippy）。**下一步：Windows 真机复测场景 A + Explorer 粘贴 `.png` + 收图后
+   500ms 内本地复制不丢 + 文本/批次/替换/断线回归。** 之后剩：② Windows→Linux
+   两场景真机验收；③ 收敛 `task-057-diagnostics`（是否从 `desktop:standalone`
+   默认移除）。
 2. task-060（收尾）：Q1/Q2、Q3 权限、Q4 角标均真机通过；mp4/多个 pdf 替换
    七轮修复已由用户确认；「目录 + mp4」批次替换的八轮修复已回滚，日常以
    「文件夹与其他文件分开复制」规避（见 task-060）。

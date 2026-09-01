@@ -11,14 +11,35 @@ use m590_clipboard::{
     VirtualFileCollection,
 };
 
+/// Upper bound for a confirmed publish. The STA loop wakes every 25ms and
+/// `publish_virtual_file_collection` retries `CLIPBRD_E_CANT_OPEN` 10x25ms, so a
+/// healthy publish answers well inside this; it only guards against a wedged STA.
+const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagerEvent {
     PublishFailed(String),
     ClipboardReplaced,
 }
 
+/// Whether the STA thread confirmed it finished `OleSetClipboard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The OLE object is live and owns the clipboard.
+    Confirmed,
+    /// Queued, but the STA thread did not answer within [`PUBLISH_ACK_TIMEOUT`].
+    /// The publish may still land, so callers must NOT fall back to a raw
+    /// clipboard write: `EmptyClipboard` over an OLE owner corrupts ole32
+    /// ownership and breaks every later `OleSetClipboard`.
+    Unconfirmed,
+}
+
 enum Command {
-    Publish(VirtualFileCollection),
+    Publish {
+        collection: VirtualFileCollection,
+        /// `Some` makes the publish synchronous for the caller.
+        ack: Option<Sender<()>>,
+    },
     ReplaceIfCurrent {
         collection: VirtualFileCollection,
         result: Sender<bool>,
@@ -54,8 +75,35 @@ impl WindowsVirtualFileManager {
 
     pub fn publish_collection(&self, collection: VirtualFileCollection) -> Result<(), String> {
         self.commands
-            .send(Command::Publish(collection))
+            .send(Command::Publish {
+                collection,
+                ack: None,
+            })
             .map_err(|_| "OLE STA stopped".into())
+    }
+
+    /// Publish and wait until the STA thread finished `OleSetClipboard`.
+    ///
+    /// The plain [`Self::publish_collection`] is fire-and-forget: it returns as
+    /// soon as the command is queued, so the caller's thread can keep touching
+    /// the clipboard (e.g. the local poll's `OpenClipboard`) while the STA thread
+    /// is mid-publish. Callers that hold no other clipboard gate use this to
+    /// close that overlap.
+    pub fn publish_collection_synced(
+        &self,
+        collection: VirtualFileCollection,
+    ) -> Result<PublishOutcome, String> {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.commands
+            .send(Command::Publish {
+                collection,
+                ack: Some(ack_tx),
+            })
+            .map_err(|_| "OLE STA stopped".to_string())?;
+        match ack_rx.recv_timeout(PUBLISH_ACK_TIMEOUT) {
+            Ok(()) => Ok(PublishOutcome::Confirmed),
+            Err(_) => Ok(PublishOutcome::Unconfirmed),
+        }
     }
 
     /// Replace an offer only while M590Bridge still owns the clipboard.
@@ -104,13 +152,20 @@ fn sta_loop(commands: Receiver<Command>, events: Sender<ManagerEvent>) {
     let mut guard: Option<VirtualFileClipboard> = None;
     loop {
         match commands.recv_timeout(Duration::from_millis(25)) {
-            Ok(Command::Publish(collection)) => {
+            Ok(Command::Publish { collection, ack }) => {
                 guard.take();
                 match publish_virtual_file_collection(collection) {
                     Ok(next) => guard = Some(next),
                     Err(err) => {
                         let _ = events.send(ManagerEvent::PublishFailed(err.to_string()));
                     }
+                }
+                // Ack after the attempt either way: it only means "the STA thread
+                // is done touching the clipboard". Failures keep reporting through
+                // ManagerEvent::PublishFailed, so a waiting caller must not be
+                // left blocking for PUBLISH_ACK_TIMEOUT on the error path.
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
                 }
             }
             Ok(Command::ReplaceIfCurrent { collection, result }) => {

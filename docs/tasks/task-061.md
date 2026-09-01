@@ -3,7 +3,10 @@
 ## 状态
 
 `in_progress`（版本 0.1.2。先实施方案 A：接收端物化。Windows 双表示 + Linux 自动收图
-初版实现完成，代码级验证通过；待 Windows 10 / GNOME Wayland 真机验收，见文末）
+初版实现完成，代码级验证通过。**2026-09-01：正式构建（无 `task-057-diagnostics`）
+场景 A 真机通过，「prtsc 位图 → Windows 无法贴 Word」关闭，诊断非 load-bearing。**
+剩余：Windows→Linux 两场景与回归项在正式构建上待真机验收；fail→pass 仍无代码解释，
+`hub.rs:4770-4781` 发布窗口轮询竞争缺口未修。见文末「最小实验结果（2026-09-01）」）
 
 ## 背景
 
@@ -161,7 +164,8 @@ Windows 复制任何文件都报 `OLE publish failed: ... OpenClipboard 失败
 
 ### 状态
 
-`pending`（用户指示：先记录，等待下次再开发；本次不改代码）。
+`resolved`（2026-09-01：正式构建无诊断 feature 跑场景 A 真机通过，不再复现；
+见文末「最小实验结果（2026-09-01）」。原始记录保留在下，用于追溯三轮诊断过程。）
 
 ### 用户真机复测结果
 
@@ -570,3 +574,141 @@ src-tauri/Cargo.toml --release --features custom-protocol`。`package-windows.ps
   `desktop:standalone:nodiag` 及其用途说明）。
 - 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 —— 本轮未触及应用行为，
   只加了一个 npm 脚本别名（feature 组合差异，非新功能）。
+
+## 最小实验结果（2026-09-01）：正式构建（无诊断）场景 A 通过，风险 (b) 证伪
+
+### 用户回报
+
+按上一节「判定下一步的最小实验」执行：Windows 端改用
+`npm run desktop:standalone:nodiag`（不带 `task-057-diagnostics`），Linux 端照旧，
+跑场景 A（Linux `prtsc` → Windows 在 Word `Ctrl+V`）。**用户确认按要求测试通过。**
+
+### 结论
+
+1. **分支 (a) 成立，(b) 证伪**：`log_system_clipboard_formats` 在正式构建是空
+   stub，无诊断构建仍能贴 Word，说明诊断里那次 `OpenClipboard(None)` /
+   `CloseClipboard` **不是 load-bearing**。第四次记录中「正式构建可能仍然是坏的」
+   这条风险不成立。
+2. **2026-08-29 起 `pending` 的「prtsc 位图 → Windows 无法粘贴到 Word」在正式
+   构建上已不复现**，该遗留问题按此判定关闭。
+3. 位图读取路径与第三轮 trace 的结论一致：Word 的位图取自**系统剪贴板**上的
+   `8`(CF_DIB)/`17`(CF_DIBV5)/合成 `2`(CF_BITMAP)，不经 `IDataObject::GetData`。
+
+### 仍未解决：fail→pass 依旧没有代码解释
+
+第二轮失败时的构建**已经包含 `CF_DIB`**（`2947157`），与本轮通过的构建在
+产品代码上等价。因此 fail→pass 只剩两种可能，**单次通过无法区分**：
+
+- 第二轮那次失败是测试侧偶发（构建/焦点/时序）；
+- 竞争真实存在，本轮恰好没触发。
+
+代码缺口仍在（已复核，未修）：`crates/m590-daemon/src/hub.rs:4770-4781` 的
+`virtual_clipboard_active` 只在 `virtual_receive` / `virtual_batch_receive` 活跃时
+抑制本地轮询，而**图片双表示 OLE 发布两者都不置位**，发布后轮询可立刻回读剪贴板
+并与发布窗口竞争。若选 (a)，此缺口是潜在偶发源；若要确定性，需按上一节的
+「发布期间抑制本地轮询 / 发布后同步屏障」做修复。
+
+### 本轮未验证（正式构建上仍待真机确认）
+
+- Windows 收位图后 Explorer `Ctrl+V` 粘贴成 `.png`（第三轮在诊断构建通过）。
+- Windows → Linux 两个场景（复制图片文件 / 剪贴板位图）在 LibreOffice 与
+  Nautilus 的粘贴。
+- 回归：文本、普通文件批次、offer 替换、断线。
+
+## 文档影响检查（2026-09-01，第五次）
+
+- 已更新：本 task（最小实验结果、(b) 证伪、遗留 fail→pass 与代码缺口、未验证项）、
+  顶部状态块、2026-08-29 遗留问题状态、`docs/plans/current.md`、`AGENTS.md`。
+- 无需更新：`docs/discovery/commands.md` —— `desktop:standalone:nodiag` 上一轮已
+  记录，本轮未改命令；协议 wire、Hub HTTP API、UI 交互、安装器 —— 本轮零代码改动。
+
+## 修复记录（2026-09-01）：关闭图片发布与本地轮询的竞争窗口
+
+### 为什么要改（竞争窗口的确切形状）
+
+读代码时发现竞争比上一轮记的更具体：`WindowsVirtualFileManager::publish_collection`
+是 **fire-and-forget** —— 只把 `Command::Publish` 投进 mpsc channel 就返回，真正的
+`OleSetClipboard` 由 `m590-ole-sta` 线程在**最多 25ms 后**（STA 循环
+`recv_timeout(25ms)`）才执行。于是 hub 线程从 publish 返回后：
+
+1. 继续本轮循环，50ms 后（`IDLE_SESSION_LOOP_DELAY`）进入本地剪贴板轮询；
+2. 轮询 `OpenClipboard` 可能与 STA 线程正在执行的 `OleSetClipboard` 重叠。
+
+对比之下，**文件 offer 天生没有这个窗口**：它走 `publish_windows_virtual_offer`，
+在同一轮就把 `virtual_receive` 置上，轮询被 `virtual_clipboard_active` 挡住。
+`publish_collection` 是唯一「fire-and-forget 且不置任何闸门」的发布点。
+
+这也给出上一轮 (b) 假设的机制解释：诊断里那次 `OpenClipboard(None)` 恰好占住了
+发布后的窗口，把轮询挤开。用户 2026-09-01 的无诊断实验证明它不是必要条件，
+但窗口本身是真的。
+
+### 改动（两处，都只落在图片发布路径）
+
+1. **同步确认发布**：`Command::Publish` 加可选 ack 通道，新增
+   `publish_collection_synced` → 返回 `PublishOutcome::{Confirmed, Unconfirmed}`，
+   hub 等 STA 线程做完 `OleSetClipboard` 再继续。ack 在成功/失败**两条路径都发**，
+   失败仍由 `ManagerEvent::PublishFailed` 上报，避免等满超时。
+   `PUBLISH_ACK_TIMEOUT = 2s`（STA 25ms 唤醒 + `CLIPBRD_E_CANT_OPEN` 重试
+   10×25ms，健康发布远快于此；只防 STA 卡死）。
+   **`Unconfirmed` 时不回退裸写** —— 发布可能仍在途，`EmptyClipboard` 盖在 OLE
+   owner 上会重现 2026-08-29 的 ole32 owner 破坏。只记诊断 + `last_error`。
+   文件 offer 仍用原 fire-and-forget `publish_collection`，行为不变。
+2. **发布后静默期**：新增 `IMAGE_PUBLISH_QUIET_PERIOD = 500ms` 与纯函数
+   `image_publish_quiet_period_active`，接入 Windows 段的
+   `virtual_clipboard_active`。代价有界：静默期内的本地复制由下一次轮询捡起，
+   不会丢同步（最多迟 500ms）。
+
+未采用「像文件 offer 那样置一个长期闸门」：那会在收图后无限期停掉本地轮询，
+直到剪贴板被别人替换，风险大于收益。
+
+### 修改文件
+
+- `crates/m590-daemon/src/windows_virtual_file_manager.rs`：`Command::Publish`
+  改带 ack 的结构体变体、新增 `PublishOutcome` 与 `publish_collection_synced`、
+  `PUBLISH_ACK_TIMEOUT`；STA 循环发 ack。
+- `crates/m590-daemon/src/hub.rs`：`IMAGE_PUBLISH_QUIET_PERIOD`、
+  `image_publish_quiet_period_active` + 单测、`last_image_publish_at` 状态、
+  AppliedImage 分支改用 `publish_collection_synced` 并处理 `Unconfirmed`、
+  `virtual_clipboard_active` 接入静默期。
+
+### 验证结果（2026-09-01 实际运行）
+
+- `cargo test -p m590-daemon --lib`：**75 通过**（2 ignored；新增
+  `image_publish_quiet_period_gates_only_inside_the_window`，本机真跑）。
+- `cargo test -p m590-core --lib` 41 通过；`cargo test -p m590-clipboard --lib` 27 通过。
+- Windows 交叉 clippy **两种 feature 组合**均 `-D warnings` 通过：
+  `--target x86_64-pc-windows-gnu --lib --no-deps`，带与不带 `task-057-diagnostics`。
+- `cargo clippy -p m590-core -p m590-daemon -p m590-clipboard --lib --no-deps
+  -- -D warnings`、`cargo check --workspace`、`cargo fmt --check`、
+  `git diff --check` 均通过。
+- **未做真机验证**：本机 Ubuntu 无 Windows 运行条件。
+
+### 注意：新单测为何不加 `cfg(target_os = "windows")`
+
+首版把 helper 和单测都 `#[cfg(target_os = "windows")]`，结果本机**完全无法编译验证**
+它 —— `cargo clippy --target x86_64-pc-windows-gnu --all-targets` 会在
+`virtual_file_bridge.rs:513` 失败（既有测试跨 crate 调 `pub(crate)` 的
+`open_content`，`E0624`；**stash 后复现，与本次改动无关**，未修，不在本 task 范围）。
+改为沿用仓库既有写法（`active_virtual_receive_must_finish` 等）：helper 与常量用
+`cfg_attr(not(windows), allow(dead_code))` 保持跨平台，调用点仍 Windows-only，
+这样纯逻辑单测在本机真跑。
+
+### 待真机验证（Windows 侧）
+
+1. 场景 A（Linux `prtsc` → Windows Word `Ctrl+V`）仍通过 —— 确认同步发布与静默期
+   没有引入回归。
+2. Explorer `Ctrl+V` 粘贴成 `.png` 仍通过。
+3. 收图后**立刻**在 Windows 本地复制一段文本/文件（500ms 内），确认最多迟一轮
+   被同步，不丢。
+4. 回归：文本、普通文件批次、offer 替换、断线。
+
+## 文档影响检查（2026-09-01，第六次）
+
+- 已更新：本 task（本节：竞争窗口机制、两处改动、验证结果、单测 cfg 决定、
+  待真机项）、`docs/plans/current.md`（下一步第 1 条改为待真机复测）。
+- 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 —— 改动只在 Windows 图片
+  接收发布路径的线程同步与轮询门控，无对外行为/字段变化。
+- 无需更新：`docs/discovery/commands.md`、`docs/discovery/project-map.md` ——
+  无新增/删除文件，无命令变化。
+- 待补：`--all-targets` 在 Windows target 下的既有 `E0624`（`virtual_file_bridge.rs`
+  测试可见性）已记在本 task，如需修复应另立 task。

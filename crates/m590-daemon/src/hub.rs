@@ -28,7 +28,9 @@ use crate::status::{persist_status_config, with_status, HubPhase, HubStatus, Sha
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::virtual_file_bridge::{BridgeEvent, PipeProducer, VirtualFileBridge};
 #[cfg(target_os = "windows")]
-use crate::windows_virtual_file_manager::{ManagerEvent, WindowsVirtualFileManager};
+use crate::windows_virtual_file_manager::{
+    ManagerEvent, PublishOutcome, WindowsVirtualFileManager,
+};
 
 static STOP_BRIDGE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -60,6 +62,18 @@ const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const VIRTUAL_PUBLISH_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "windows")]
 const REPLACED_BATCH_REQUEST_GRACE: Duration = Duration::from_secs(2);
+/// After publishing the received-image dual representation, keep the local
+/// clipboard poll off the clipboard for this long.
+///
+/// Unlike a file offer — which sets `virtual_receive` in the same loop turn and
+/// is gated by it — the image publish sets no gate, so the next poll (50ms later,
+/// see [`IDLE_SESSION_LOOP_DELAY`]) would `OpenClipboard` right as consumers and
+/// clipboard monitors are enumerating the freshly published formats. A consumer
+/// whose `OpenClipboard` loses that race can conclude there is nothing to paste.
+/// The cost of this window is bounded: a local copy made inside it is picked up
+/// by the following poll instead.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const IMAGE_PUBLISH_QUIET_PERIOD: Duration = Duration::from_millis(500);
 
 #[cfg(feature = "task-057-diagnostics")]
 fn task_057_diagnostic(args: std::fmt::Arguments<'_>) {
@@ -475,6 +489,18 @@ fn virtual_receive_publish_is_idle(
     !requested
         && !completed
         && now.saturating_duration_since(published_at) >= VIRTUAL_PUBLISH_IDLE_TIMEOUT
+}
+
+/// Whether the local clipboard poll must stay off the clipboard because the
+/// received-image dual representation was just published.
+///
+/// `None` means no image publish has happened in this session.
+///
+/// Only the Windows publish path calls this, but it stays platform-neutral so the
+/// unit test runs on any host (same pattern as the virtual-receive helpers above).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn image_publish_quiet_period_active(published_at: Option<Instant>, now: Instant) -> bool {
+    published_at.is_some_and(|at| now.saturating_duration_since(at) < IMAGE_PUBLISH_QUIET_PERIOD)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1938,6 +1964,10 @@ fn run_session_loop(
     let mut deferred_virtual_offer: Option<DeferredVirtualOffer> = None;
     #[cfg(target_os = "windows")]
     let mut deferred_virtual_batch_offer: Option<DeferredVirtualBatchOffer> = None;
+    // When the received-image dual representation was last published, for
+    // IMAGE_PUBLISH_QUIET_PERIOD.
+    #[cfg(target_os = "windows")]
+    let mut last_image_publish_at: Option<Instant> = None;
     #[cfg(target_os = "linux")]
     let mut fuse_manager = LinuxVirtualFileManager::new();
     #[cfg(target_os = "linux")]
@@ -2374,17 +2404,44 @@ fn run_session_loop(
                                             // owned clipboard corrupts ole32 ownership and every
                                             // later OleSetClipboard fails with CLIPBRD_E_CANT_OPEN
                                             // until an external app re-copies.
+                                            //
+                                            // The publish is synced because this branch
+                                            // sets no clipboard gate (a file offer sets
+                                            // virtual_receive in the same turn); without
+                                            // waiting, the local poll could OpenClipboard
+                                            // while the STA thread is still inside
+                                            // OleSetClipboard.
                                             let published =
                                                 image_file_collection(&content_id, &image)
                                                     .map_err(|e| e.to_string())
                                                     .and_then(|collection| {
                                                         ole_manager
-                                                            .publish_collection(collection)
+                                                            .publish_collection_synced(collection)
                                                             .map_err(|e| e.to_string())
                                                     });
                                             match published {
-                                                Ok(()) => {
+                                                Ok(outcome) => {
+                                                    // A publish was attempted, so hold
+                                                    // the poll off the clipboard even if
+                                                    // unconfirmed.
+                                                    last_image_publish_at = Some(Instant::now());
                                                     clip.adopt_image_baseline(&image);
+                                                    if outcome == PublishOutcome::Unconfirmed {
+                                                        // Do NOT raw-write here: the
+                                                        // publish may still be in flight
+                                                        // and EmptyClipboard over an OLE
+                                                        // owner corrupts ole32 ownership.
+                                                        task_057_diagnostic(format_args!(
+                                                            "image_publish_unconfirmed content_id={content_id}"
+                                                        ));
+                                                        with_status(&shared, |s| {
+                                                            s.last_error = Some(
+                                                                "clipboard_offer_image_file: \
+                                                                 OLE publish unconfirmed"
+                                                                    .to_string(),
+                                                            );
+                                                        });
+                                                    }
                                                 }
                                                 Err(err) => {
                                                     // OLE unavailable: fall back to a plain
@@ -4771,8 +4828,11 @@ fn run_session_loop(
         if let Some(clip) = clipboard.as_mut() {
             let auto = with_status(&shared, |s| s.auto_sync);
             #[cfg(target_os = "windows")]
-            let virtual_clipboard_active =
-                virtual_receive.is_some() || virtual_batch_receive.is_some();
+            let virtual_clipboard_active = virtual_receive.is_some()
+                || virtual_batch_receive.is_some()
+                // A just-published image dual representation has no offer gate of
+                // its own; keep the poll off the clipboard for a bounded window.
+                || image_publish_quiet_period_active(last_image_publish_at, Instant::now());
             #[cfg(target_os = "linux")]
             let virtual_clipboard_active =
                 virtual_receive.is_some() || virtual_batch_receive.is_some();
@@ -7317,6 +7377,30 @@ mod tests {
         ));
         assert!(linux_completed_replaced_virtual_receive_can_detach(
             true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn image_publish_quiet_period_gates_only_inside_the_window() {
+        let now = Instant::now();
+        // No image published in this session -> never gate the poll.
+        assert!(!image_publish_quiet_period_active(None, now));
+        // Just published -> gate.
+        assert!(image_publish_quiet_period_active(Some(now), now));
+        // Inside the window -> still gated.
+        assert!(image_publish_quiet_period_active(
+            Some(now),
+            now + IMAGE_PUBLISH_QUIET_PERIOD - Duration::from_millis(1)
+        ));
+        // At and past the window -> poll resumes, so a local copy is never
+        // shut out for longer than the window.
+        assert!(!image_publish_quiet_period_active(
+            Some(now),
+            now + IMAGE_PUBLISH_QUIET_PERIOD
+        ));
+        assert!(!image_publish_quiet_period_active(
+            Some(now),
+            now + IMAGE_PUBLISH_QUIET_PERIOD + Duration::from_secs(5)
         ));
     }
 
