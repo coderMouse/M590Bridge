@@ -132,7 +132,7 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. **task-061（Windows 侧真机通过，剩 Linux 方向验收）**：图片/图片文件「双表示」
+1. **task-061（已完成）**：图片/图片文件「双表示」
    粘贴。2026-09-01 真机暴露的两个问题（① Word 有时要粘两次 —— 本地轮询经 arboard
    每 50ms 反复 `OpenClipboard` 抢掉 Word 的；② Linux 目录批次在 Windows 粘贴卡死
    且下一个也粘不了 —— 图片时代残留的 `ClipboardReplaced` 被下一个批次 offer 吃掉
@@ -145,8 +145,11 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
    断线回归。**Windows→Linux 方向亦已通过**（`LinuxAutoImageReceive`）。
    **task-061 功能验收清单至此全部通过**；「多图批次贴不进 Word」是方案 A 的设计
    边界（`auto_image_eligible` 只对单文件 offer 生效），非缺陷。
-   剩余收尾一项：收敛 `task-057-diagnostics`（仍写死在 `desktop:standalone`，
-   已确认非 load-bearing）。
+   **收尾已完成**（2026-09-01）：`task-057-diagnostics` 已从 `desktop:standalone`
+   默认移除，新增 `desktop:standalone:diag`（含 `pre` 钩子）保留带诊断构建；原
+   `desktop:standalone:nodiag` 已删除 —— 它当初只为绕开写死的诊断，现与
+   `desktop:standalone` 完全等同。日常 standalone 不再输出诊断日志，Windows 也不再
+   保留控制台窗口。
 2. **task-062（已完成）**：Windows 粘贴多文件时「取消整个批次」按钮无效。根因已
    定位：`hub.rs` 的 `cancel_batch` 块里取消虚拟批次那段只有
    `#[cfg(target_os = "linux")]` 分支，Windows 上按钮只走到 `cancel_runtime_batch`

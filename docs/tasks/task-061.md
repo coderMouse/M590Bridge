@@ -2,7 +2,7 @@
 
 ## 状态
 
-`in_progress`（版本 0.1.2。方案 A：接收端物化。Windows 双表示 + Linux 自动收图已实现。
+**已完成**（版本 0.1.2。方案 A：接收端物化。Windows 双表示 + Linux 自动收图已实现。
 **2026-09-01 真机进展**：① 正式构建（无 `task-057-diagnostics`）场景 A 通过，
 「prtsc 位图 → Windows 无法贴 Word」关闭，诊断非 load-bearing；② 随后暴露的
 「Word 有时要粘两次」与「Linux 目录批次在 Windows 粘贴卡死」已定位为同一根因
@@ -10,9 +10,11 @@
 「收图后 Windows 本机复制仍能同步到 Linux」（长期闸门解除路径）。
 ③ Windows→Linux 方向亦已通过（`LinuxAutoImageReceive`）。**功能验收清单至此全部
 通过**（「多图批次贴 Word」不在方案 A 范围，属设计边界非缺陷）。
-剩余仅一项收尾：`task-057-diagnostics` 是否从 `desktop:standalone` 默认移除。
-同轮真机发现的两个 Windows 批次问题已另立 **task-062**（取消按钮无效，bug）与
-**task-063**（含文件夹不弹进度窗口，优化项）。见文末两节「真机复测通过」）
+**收尾已完成**（2026-09-01）：`task-057-diagnostics` 已从 `desktop:standalone` 默认
+移除（`ui/package.json:13`），新增 `desktop:standalone:diag` 保留带诊断构建；日常
+standalone 不再输出诊断日志、也无 Windows 控制台窗口。
+同轮真机发现的两个 Windows 批次问题已另立 **task-062**（取消按钮无效，已修复并真机
+通过）与 **task-063**（含文件夹不弹进度窗口，优化项）。见文末「真机复测通过」）
 
 ## 背景
 
