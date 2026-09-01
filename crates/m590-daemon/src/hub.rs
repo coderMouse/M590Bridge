@@ -2116,6 +2116,52 @@ fn run_session_loop(
                     });
                 }
             }
+            // Structurally the same as the Linux branch above. Without it the button
+            // only reached cancel_runtime_batch, which owns outbound/inbound (the
+            // manual send/receive batches) and never touches the clipboard virtual
+            // batch — so on Windows "cancel whole batch" did nothing for a paste.
+            #[cfg(target_os = "windows")]
+            {
+                let mut cancelled_virtual_batch = None;
+                if let Some(current) = virtual_batch_receive.take() {
+                    cancelled_virtual_batch = Some(current.batch_id.clone());
+                    // The user asked for it explicitly, so stop even a paste the OS
+                    // already started — same choice the Linux branch makes.
+                    cancel_windows_virtual_batch(
+                        session,
+                        conn,
+                        &current,
+                        "cancelled by local user",
+                    )?;
+                }
+                if let Some(deferred) = deferred_virtual_batch_offer.take() {
+                    cancelled_virtual_batch = Some(deferred.batch_id.clone());
+                    cancel_deferred_windows_virtual_batch(
+                        session,
+                        conn,
+                        deferred,
+                        "cancelled by local user",
+                    )?;
+                }
+                if let Some(batch_id) = cancelled_virtual_batch {
+                    // Takes our OLE object off the clipboard. Any event this produces
+                    // is drained by the image-epoch drain below (no receive is active
+                    // now) and cannot leak into the next offer, which additionally
+                    // calls discard_stale_ole_events before publishing.
+                    ole_manager.clear();
+                    task_057_diagnostic(format_args!(
+                        "virtual_batch_cancelled_by_user batch_id={batch_id}"
+                    ));
+                    with_status(&shared, |status| {
+                        status.file_transfer_phase = Some("cancelled".into());
+                        status.last_file_transfer_id = Some(batch_id);
+                        status.file_batch_current_path = None;
+                        status.file_bytes_received = None;
+                        status.file_bytes_total = None;
+                        status.last_error = None;
+                    });
+                }
+            }
         }
 
         #[cfg(target_os = "linux")]

@@ -142,16 +142,24 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
    drain 自己的事件、`discard_stale_ole_events` 发布前清队列。
    **用户确认五项真机复测全部通过**：收图后本机复制能同步到 Linux（闸门解除路径，
    最关键）、目录批次不再卡死、Word 一次贴成、Explorer 贴 `.png`、文本/批次/替换/
-   断线回归。**task-061 的 Windows 侧验收清单至此全部通过。**
-   剩余两项：① Windows→Linux 两场景（图片文件 / 剪贴板位图 → LibreOffice 与
-   Nautilus，即 `LinuxAutoImageReceive` 路径）未单独验收；② 收敛
-   `task-057-diagnostics`（仍写死在 `desktop:standalone`，已确认非 load-bearing）。
-2. task-060（收尾）：Q1/Q2、Q3 权限、Q4 角标均真机通过；mp4/多个 pdf 替换
+   断线回归。**Windows→Linux 方向亦已通过**（`LinuxAutoImageReceive`）。
+   **task-061 功能验收清单至此全部通过**；「多图批次贴不进 Word」是方案 A 的设计
+   边界（`auto_image_eligible` 只对单文件 offer 生效），非缺陷。
+   剩余收尾一项：收敛 `task-057-diagnostics`（仍写死在 `desktop:standalone`，
+   已确认非 load-bearing）。
+2. **task-062（新，bug）**：Windows 粘贴多文件时「取消整个批次」按钮无效。根因已
+   定位：`hub.rs` 的 `cancel_batch` 块里取消虚拟批次那段只有
+   `#[cfg(target_os = "linux")]` 分支，Windows 上按钮只走到 `cancel_runtime_batch`
+   （仅管手动发送/接收批次），剪贴板虚拟批次从未接入取消路径。
+3. **task-063（新，优化项）**：Windows 粘贴含文件夹的批次时不弹系统复制进度窗口。
+   机制已定位：`windows_virtual_file.rs:335-338` 把 `FD_PROGRESSUI` 只加在非目录
+   条目上。风险提示：task-058 目录树粘贴已验收，回归比缺进度窗口严重。
+4. task-060（收尾）：Q1/Q2、Q3 权限、Q4 角标均真机通过；mp4/多个 pdf 替换
    七轮修复已由用户确认；「目录 + mp4」批次替换的八轮修复已回滚，日常以
    「文件夹与其他文件分开复制」规避（见 task-060）。
-3. 为 Rust/前端构建与测试增加 CI
-4. （可选）设置页发现开关 / 本机显示名
-5. 如需发布到非开发用户，另建代码签名/升级机制 task，不改动现有传输协议
+5. 为 Rust/前端构建与测试增加 CI
+6. （可选）设置页发现开关 / 本机显示名
+7. 如需发布到非开发用户，另建代码签名/升级机制 task，不改动现有传输协议
 
 > task-042 至 task-054 已完成相应真机验收；task-056 的手动多文件/目录批次和 task-057
 > 的 Windows Explorer 多文件剪贴板均已完成两端验收。task-052 已证明 Linux FUSE 单文件

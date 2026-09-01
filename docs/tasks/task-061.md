@@ -8,9 +8,11 @@
 「Word 有时要粘两次」与「Linux 目录批次在 Windows 粘贴卡死」已定位为同一根因
 （图片发布无 receive 归属），修复后**用户确认五项真机复测全部通过**，含最关键的
 「收图后 Windows 本机复制仍能同步到 Linux」（长期闸门解除路径）。
-剩余：Windows→Linux 两场景（图片文件 / 剪贴板位图 → LibreOffice 与 Nautilus）
-尚未单独验收；`task-057-diagnostics` 是否从 `desktop:standalone` 默认移除待定。
-见文末「真机复测通过（2026-09-01）」）
+③ Windows→Linux 方向亦已通过（`LinuxAutoImageReceive`）。**功能验收清单至此全部
+通过**（「多图批次贴 Word」不在方案 A 范围，属设计边界非缺陷）。
+剩余仅一项收尾：`task-057-diagnostics` 是否从 `desktop:standalone` 默认移除。
+同轮真机发现的两个 Windows 批次问题已另立 **task-062**（取消按钮无效，bug）与
+**task-063**（含文件夹不弹进度窗口，优化项）。见文末两节「真机复测通过」）
 
 ## 背景
 
@@ -829,14 +831,40 @@ Explorer 在等永不到来的 `FileContents`，粘贴卡死；OLE 对象还在�
 - task-061 原始验收清单里的 Windows 侧全部项（Word 贴位图 + Explorer 贴图片文件 +
   轮询无回环 + 回归）至此**均已真机通过**。
 
-### 仍未单独验收
+### Windows → Linux 方向验收（2026-09-01，用户回报）
 
-- **Windows → Linux 两场景**：复制图片文件 / 剪贴板位图 → Linux 在 LibreOffice
-  与 Nautilus 的粘贴。第 5 项的回归覆盖了文本与文件批次，但这两个**图片方向**的
-  场景未被单独确认。方案 A 的 Linux 侧（收到单图片文件 offer → 自动解码写位图，
-  `LinuxAutoImageReceive`）因此仍属未验收。
+用户回报「测试通过」，并补充：**Linux 粘贴两张图片到文件夹也成功，虽然不能粘贴到
+Word（LibreOffice），暂时不管**。
+
+- **单图片文件方向通过**：`LinuxAutoImageReceive` 路径（收到单图片文件 offer →
+  自动下载解码 → 写剪贴板位图）真机可用。方案 A 的 Linux 侧至此验收完成。
+- **多图批次贴不进 Word 是设计使然，不是缺陷**：`hub.rs:3188-3195` 的
+  `auto_image_eligible` 门控要求 `virtual_batch_receive.is_none()` 且只对**单**文件
+  offer 生效。多张图片走批次通道，只挂虚拟文件、不解码位图，所以能贴进文件管理器、
+  贴不进 Word。这与方案 A 的范围一致（方案 A 只承诺「收到**单**图片文件 offer →
+  解码成位图」）。
+- 若将来要支持「多图批次也能贴位图」，属方案 B 或另立 task 的范围，且需先定产品
+  语义：多张图时把**哪一张**放进剪贴板位图。这是产品问题，不是实现问题。
+
+至此 task-061 的功能验收清单（Linux→Windows 与 Windows→Linux 两方向、位图与图片
+文件两来源、Word 与文件管理器两目标）**除「多图批次贴 Word」这一非目标项外全部
+通过**。
+
+### 仍未处理
+
 - `task-057-diagnostics` 仍写死在 `desktop:standalone` 里（`ui/package.json:13`），
   是否从默认移除待定。诊断已确认非 load-bearing，移除不影响功能。
+
+### 真机新发现（已另立 task，不在 task-061 范围）
+
+用户同轮报告两个 Windows 批次问题，均**不属图片双表示**，已另立：
+
+- **task-062**（bug）：Windows 粘贴多文件时「取消整个批次」按钮无效。根因是
+  `hub.rs` 的 `cancel_batch` 处理块里取消虚拟批次那段只有
+  `#[cfg(target_os = "linux")]` 分支，Windows 上该按钮只走到 `cancel_runtime_batch`
+  （仅管手动发送/接收批次），从未接入剪贴板虚拟批次。
+- **task-063**（优化项）：Windows 粘贴含文件夹的批次时不弹系统复制进度窗口。机制是
+  `windows_virtual_file.rs:335-338` 把 `FD_PROGRESSUI` 只加在非目录条目上。
 
 ## 文档影响检查（2026-09-01，第六次与第七次合并）
 
