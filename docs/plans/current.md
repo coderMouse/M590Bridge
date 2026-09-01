@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-09-01
-> 阶段：task-061 Windows 侧验收清单全部真机通过（长期闸门 + OLE 事件归属修复生效）；剩 Windows→Linux 图片方向验收与诊断收敛
+> 阶段：task-061 已完成（Windows 侧验收 + Windows→Linux 图片 + 诊断收敛全部真机通过）；task-062 已完成（Windows 取消按钮修复）；task-060 已完成（重复粘贴与替换/图标回归，遗留一个已知绕行）
 
 ## 目标（近期）
 
@@ -50,42 +50,13 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 - [x] **task-057** Windows Explorer 多文件剪贴板粘贴（用户确认 Windows 真机测试通过）
 - [x] **task-058** Linux FUSE 虚拟目录树（大文件批次、目录树及生命周期真机验收通过）
 - [x] **task-059** 统一应用版本来源（根 workspace 为唯一来源；Tauri/npm 不再重复维护）
+- [x] **task-060** 重复粘贴与替换/图标回归（Q1/Q2/Q3/Q4 均真机通过；遗留「目录 + 其他文件混合批次替换」已知绕行，分开复制规避）
+- [x] **task-061** 图片与图片文件双表示（Windows 侧验收 + Windows→Linux 图片 + 诊断收敛全部真机通过）
+- [x] **task-062** Windows 批次取消按钮修复（真机通过）
 
 ## 进行中 / 暂停
 
-- **task-061**：图片与图片文件的「双表示」粘贴（位图 + 虚拟图片文件）。方案 A
-  （接收端物化）初版已实现：Windows 收到位图 → OLE 双表示（Word 贴位图 +
-  Explorer 粘贴成 `.png` 文件，含 `CF_DIBV5`/已注册 `PNG`）；Linux 收到单图片
-  文件 offer（可解码扩展名、≤32MiB）→ 自动下载解码写剪贴板位图。代码级验证
-  通过；**待 Windows 10 / GNOME Wayland 真机验收**（见 task-061）。prtsc 后
-  “不能粘贴成文件 + 后续文件复制阻塞”已修复：Windows 位图接收改为单一 OLE
-  发布（不再先裸写 `EmptyClipboard` 覆盖 OLE owner），OLE 发布对
-  `CLIPBRD_E_CANT_OPEN` 短暂重试。剩余问题：prtsc 位图 → Windows 可粘贴
-  成图片文件、但无法粘贴到 Word。2026-08-31 已为该问题补齐 Windows OLE 诊断
-  日志（`GetData` 拒绝 HRESULT、格式 id 映射表、双表示净荷大小；均在
-  `task-057-diagnostics` 下，正式构建不变），并顺带修复验证命令
-  `cargo test -p m590-clipboard --lib` 的并行临时目录竞态（30 次连跑全通过）。
-  真机 trace 已回传并逐条核对：`Ctrl+V` 后确有约 25 次 `GetData`，但
-  **`CF_BITMAP`(2) / `CF_DIB`(8) / `CF_DIBV5`(17) 一次都没被请求**。据此补了
-  `CF_DIB`，**第二轮真机验证证明无效**：格式表与净荷都正常（`dib=8`、
-  `dib_bytes=16367404`），但仍零次 `cf=8` 请求，且 `QueryGetData` 调用 0 次、
-  两个场景的读取序列几乎逐字节相同 —— 说明那串请求是 Explorer/剪贴板监视器
-  的指纹，**Word 很可能从未接触我们的数据对象**，两轮「补格式」方向本身有误。
-  2026-08-31 第三轮改为只补一条可证伪诊断：发布后枚举系统剪贴板真实格式列表
-  （`system_clipboard_formats`，诊断 feature 内，正式构建空 stub）。
-  **第三轮真机：场景一、场景二均通过。** trace 证明发布环节是对的 ——
-  系统剪贴板确实暴露 `8`(CF_DIB)、`17`(CF_DIBV5) 及系统合成的 `2`(CF_BITMAP)，
-  `OleFlushClipboard` 分支证伪。按 publish 切段统计还得到「Word 是否真的读了」
-  的指纹（`TYMED_ISTORAGE` 探测 OLE 内嵌格式 + `cf=13`），它与用户报告的
-  成功/失败在 7 个观测点上完全一致：**当初的失败是 Word 根本没读，不是读了拒绝**。
-  **2026-09-01 最小实验已跑：Windows 端用 `desktop:standalone:nodiag`（不带
-  `task-057-diagnostics`）跑场景 A，用户确认通过** → 诊断非 load-bearing，
-  「正式构建可能仍坏」的风险证伪，2026-08-29 起 `pending` 的「prtsc 位图 →
-  Windows 无法贴 Word」关闭。**仍未解决**：第二轮失败的构建已含 `CF_DIB`，与本轮
-  通过的构建产品代码等价，fail→pass 无代码解释（测试侧偶发 / 竞争未触发，单次
-  通过无法区分）；`hub.rs:4770-4781` 图片双表示发布不抑制本地轮询这一缺口未修。
-  正式构建上仍待真机：Explorer 粘贴成 `.png`、Windows→Linux 两场景、文本/批次/
-  替换/断线回归。
+- **task-063**（优化项）：含文件夹的批次不弹系统复制进度窗口 —— `FD_PROGRESSUI` 只加在非目录条目上，最小改动是移出 `if !entry.is_directory()`，但必须真机验证，且任何 task-058 回归都比缺进度窗口严重。
 
 ## 产品分期对照
 
@@ -132,18 +103,8 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. **task-061（已完成）**：图片/图片文件「双表示」
-   粘贴。2026-09-01 真机暴露的两个问题（① Word 有时要粘两次 —— 本地轮询经 arboard
-   每 50ms 反复 `OpenClipboard` 抢掉 Word 的；② Linux 目录批次在 Windows 粘贴卡死
-   且下一个也粘不了 —— 图片时代残留的 `ClipboardReplaced` 被下一个批次 offer 吃掉
-   并将其取消，**②为 task-061 引入的回归**）**根因同一个**：图片发布是全仓库唯一
-   「有 OLE 对象存活、却无 receive 门控轮询、也无人消费 `ManagerEvent`」的状态。
-   已修：长期闸门 `image_clipboard_owned`（替换瞄错窗口的 500ms 静默期）、图片时代
-   drain 自己的事件、`discard_stale_ole_events` 发布前清队列。
-   **用户确认五项真机复测全部通过**：收图后本机复制能同步到 Linux（闸门解除路径，
-   最关键）、目录批次不再卡死、Word 一次贴成、Explorer 贴 `.png`、文本/批次/替换/
-   断线回归。**Windows→Linux 方向亦已通过**（`LinuxAutoImageReceive`）。
-   **task-061 功能验收清单至此全部通过**；「多图批次贴不进 Word」是方案 A 的设计
+1. **task-063（优化项，暂停）**：含文件夹的批次不弹系统复制进度窗口 —— 最小改动是把 `FD_PROGRESSUI` 移出 `if !entry.is_directory()`，但必须真机验证，且任何 task-058 回归都比缺进度窗口严重。
+2. 继续其他功能开发或问题修复。
    边界（`auto_image_eligible` 只对单文件 offer 生效），非缺陷。
    **收尾已完成**（2026-09-01）：`task-057-diagnostics` 已从 `desktop:standalone`
    默认移除，新增 `desktop:standalone:diag`（含 `pre` 钩子）保留带诊断构建；原
