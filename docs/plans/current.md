@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-09-01
-> 阶段：task-061 真机暴露「Word 粘两次」与「目录批次卡死」（同一根因：图片发布无 receive 归属），已修长期闸门 + OLE 事件归属，待 Windows 真机复测
+> 阶段：task-061 Windows 侧验收清单全部真机通过（长期闸门 + OLE 事件归属修复生效）；剩 Windows→Linux 图片方向验收与诊断收敛
 
 ## 目标（近期）
 
@@ -132,23 +132,20 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. **task-061（待真机复测：长期闸门 + 事件归属）**：图片/图片文件「双表示」粘贴。
-   2026-09-01 真机暴露两个问题，**根因同一个**：图片发布是全仓库唯一「有 OLE 对象
-   存活、却无 receive 门控轮询、也无人消费 `ManagerEvent`」的状态。
-   ① Word 有时要粘两次 —— 轮询经 arboard 每 50ms 反复 `OpenClipboard`（每次读都开，
-   5 次×5ms 重试），抢掉 Word 的 `OpenClipboard`；这也解释了第二轮 trace 里
-   「Word 从未接触数据对象」。② Linux 目录批次在 Windows 粘贴卡死且下一个也粘不了
-   —— 图片时代残留的 `ClipboardReplaced`（任何剪贴板写入都让
-   `GetClipboardSequenceNumber` 加一，如收文本 `write_text`）没人消费，被下一个批次
-   offer 的事件循环吃到，在 `must_finish()` 仍为 false 时把刚发布的批次取消。
-   **② 是 task-061 引入的回归。** 已修：长期闸门 `image_clipboard_owned`（替换上一轮
-   瞄错窗口的 500ms 静默期，解除条件为 `ClipboardReplaced` 或 receive 接管）、图片
-   时代 drain 自己的事件、`discard_stale_ole_events` 在两个发布 helper 里发布前清队列。
-   代码级验证通过（daemon 75、两种 feature 组合 Windows 交叉 clippy）。
-   **下一步 Windows 真机按重要性验：① 收图后本机复制能同步到 Linux（长期闸门唯一
-   失效模式，无超时兜底）；② 目录批次不再卡死；③ Word 一次贴成；④ Explorer 贴
-   `.png`；⑤ 文本/批次/替换/断线回归。** 之后剩：Windows→Linux 两场景验收；
-   收敛 `task-057-diagnostics`。
+1. **task-061（Windows 侧真机通过，剩 Linux 方向验收）**：图片/图片文件「双表示」
+   粘贴。2026-09-01 真机暴露的两个问题（① Word 有时要粘两次 —— 本地轮询经 arboard
+   每 50ms 反复 `OpenClipboard` 抢掉 Word 的；② Linux 目录批次在 Windows 粘贴卡死
+   且下一个也粘不了 —— 图片时代残留的 `ClipboardReplaced` 被下一个批次 offer 吃掉
+   并将其取消，**②为 task-061 引入的回归**）**根因同一个**：图片发布是全仓库唯一
+   「有 OLE 对象存活、却无 receive 门控轮询、也无人消费 `ManagerEvent`」的状态。
+   已修：长期闸门 `image_clipboard_owned`（替换瞄错窗口的 500ms 静默期）、图片时代
+   drain 自己的事件、`discard_stale_ole_events` 发布前清队列。
+   **用户确认五项真机复测全部通过**：收图后本机复制能同步到 Linux（闸门解除路径，
+   最关键）、目录批次不再卡死、Word 一次贴成、Explorer 贴 `.png`、文本/批次/替换/
+   断线回归。**task-061 的 Windows 侧验收清单至此全部通过。**
+   剩余两项：① Windows→Linux 两场景（图片文件 / 剪贴板位图 → LibreOffice 与
+   Nautilus，即 `LinuxAutoImageReceive` 路径）未单独验收；② 收敛
+   `task-057-diagnostics`（仍写死在 `desktop:standalone`，已确认非 load-bearing）。
 2. task-060（收尾）：Q1/Q2、Q3 权限、Q4 角标均真机通过；mp4/多个 pdf 替换
    七轮修复已由用户确认；「目录 + mp4」批次替换的八轮修复已回滚，日常以
    「文件夹与其他文件分开复制」规避（见 task-060）。

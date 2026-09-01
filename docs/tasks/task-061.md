@@ -2,11 +2,15 @@
 
 ## 状态
 
-`in_progress`（版本 0.1.2。先实施方案 A：接收端物化。Windows 双表示 + Linux 自动收图
-初版实现完成，代码级验证通过。**2026-09-01：正式构建（无 `task-057-diagnostics`）
-场景 A 真机通过，「prtsc 位图 → Windows 无法贴 Word」关闭，诊断非 load-bearing。**
-剩余：Windows→Linux 两场景与回归项在正式构建上待真机验收；fail→pass 仍无代码解释，
-`hub.rs:4770-4781` 发布窗口轮询竞争缺口未修。见文末「最小实验结果（2026-09-01）」）
+`in_progress`（版本 0.1.2。方案 A：接收端物化。Windows 双表示 + Linux 自动收图已实现。
+**2026-09-01 真机进展**：① 正式构建（无 `task-057-diagnostics`）场景 A 通过，
+「prtsc 位图 → Windows 无法贴 Word」关闭，诊断非 load-bearing；② 随后暴露的
+「Word 有时要粘两次」与「Linux 目录批次在 Windows 粘贴卡死」已定位为同一根因
+（图片发布无 receive 归属），修复后**用户确认五项真机复测全部通过**，含最关键的
+「收图后 Windows 本机复制仍能同步到 Linux」（长期闸门解除路径）。
+剩余：Windows→Linux 两场景（图片文件 / 剪贴板位图 → LibreOffice 与 Nautilus）
+尚未单独验收；`task-057-diagnostics` 是否从 `desktop:standalone` 默认移除待定。
+见文末「真机复测通过（2026-09-01）」）
 
 ## 背景
 
@@ -799,10 +803,46 @@ Explorer 在等永不到来的 `FileContents`，粘贴卡死；OLE 对象还在�
 4. Explorer `Ctrl+V` 仍能粘贴成 `.png`。
 5. 回归：文本、普通文件批次、offer 替换、断线。
 
+## 真机复测通过（2026-09-01）：五项全部通过
+
+用户回报「所有都测试通过」，对应上一节列出的五项：
+
+| # | 验证项 | 结果 |
+|---|--------|------|
+| 1 | 收图后 Windows 本机复制文本/文件 → 同步到 Linux | 通过 |
+| 2 | Linux 目录批次 → Windows 粘贴不卡死，且能连续粘下一个 | 通过 |
+| 3 | prtsc / 图片文件 → Word **一次**粘贴成功 | 通过 |
+| 4 | Explorer `Ctrl+V` 粘贴成 `.png` | 通过 |
+| 5 | 回归：文本 / 普通文件批次 / offer 替换 / 断线 | 通过 |
+
+### 由此确认的结论
+
+- **第 1 项是本轮最关键的回归项**：它证明长期闸门的解除路径真实有效 ——
+  `GetClipboardSequenceNumber` 变化 → STA `is_current()` 转 false →
+  `ClipboardReplaced` → drain 解除 `image_clipboard_owned` → 轮询恢复并采集本地复制。
+  上一节「遗留风险」里那条「闸门可能永不解除」在真机上未发生。
+- **第 3 项确认问题 1 的根因判断正确**：症状从「有时要粘两次」变为一次贴成，说明
+  瓶颈确实是本地轮询与 Word 争抢 `OpenClipboard`，而非数据对象的格式表。
+  这同时坐实了前两轮「补 CF_DIBV5 / 补 CF_DIB」方向错误的结论。
+- **第 2 项确认陈旧 `ClipboardReplaced` 跨时代泄漏是目录批次卡死的真因**，
+  且发布前清队列 + 图片时代 drain 两处合起来足以覆盖 50ms 休眠窗口。
+- task-061 原始验收清单里的 Windows 侧全部项（Word 贴位图 + Explorer 贴图片文件 +
+  轮询无回环 + 回归）至此**均已真机通过**。
+
+### 仍未单独验收
+
+- **Windows → Linux 两场景**：复制图片文件 / 剪贴板位图 → Linux 在 LibreOffice
+  与 Nautilus 的粘贴。第 5 项的回归覆盖了文本与文件批次，但这两个**图片方向**的
+  场景未被单独确认。方案 A 的 Linux 侧（收到单图片文件 offer → 自动解码写位图，
+  `LinuxAutoImageReceive`）因此仍属未验收。
+- `task-057-diagnostics` 仍写死在 `desktop:standalone` 里（`ui/package.json:13`），
+  是否从默认移除待定。诊断已确认非 load-bearing，移除不影响功能。
+
 ## 文档影响检查（2026-09-01，第六次与第七次合并）
 
 - 已更新：本 task（第六次：同步发布与静默期；第七次：真机两问题、根因、长期闸门 +
-  事件 drain、遗留风险、待真机项）、`docs/plans/current.md`、`AGENTS.md`。
+  事件 drain、遗留风险、待真机项；第八次：五项真机通过、由此确认的结论、仍未单独
+  验收项）、顶部状态块、`docs/plans/current.md`、`AGENTS.md`。
 - 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 —— 改动只在 Windows 图片
   接收发布路径的线程同步、轮询门控与 OLE 事件归属，无对外行为/字段变化。
 - 无需更新：`docs/discovery/commands.md`、`docs/discovery/project-map.md` ——
