@@ -702,12 +702,109 @@ src-tauri/Cargo.toml --release --features custom-protocol`。`package-windows.ps
    被同步，不丢。
 4. 回归：文本、普通文件批次、offer 替换、断线。
 
-## 文档影响检查（2026-09-01，第六次）
+## 真机反馈（2026-09-01，两端 `desktop:standalone`）：两个问题，同一根因
 
-- 已更新：本 task（本节：竞争窗口机制、两处改动、验证结果、单测 cfg 决定、
-  待真机项）、`docs/plans/current.md`（下一步第 1 条改为待真机复测）。
+### 用户报告
+
+1. prtsc 或图片文件，在 Windows Word 里**有时要粘贴两次才成功**。
+2. 复制 Linux 目录（`视频/2` 文件夹）→ **Windows 粘贴卡死，无法粘贴，也无法粘贴下一个文件**。
+
+### 根因（读码确认，非推测）
+
+**上一轮的 500ms 静默期瞄错了窗口。** 真正的问题不是「发布瞬间」，而是
+**图片发布建立了 OLE 剪贴板状态，却没有任何生命周期归属**：
+
+- `virtual_clipboard_active` 之外的每个 OLE 发布都挂着 `virtual_receive` /
+  `virtual_batch_receive`，它们既门控轮询、也消费 `ManagerEvent`。
+- 图片双表示发布**两者都不置位**。这是全仓库唯一「有 OLE 对象存活、却无人门控、
+  无人消费事件」的状态。
+
+由此派生两个症状：
+
+**问题 1（粘贴两次）**：轮询每轮经 arboard 读 text + image + file_list，而 arboard
+的 Windows 后端**每次读都 `OpenClipboard`**（`DEFAULT_OPEN_ATTEMPTS = 5`，间隔 5ms，
+见 `arboard-3` `platform/windows.rs`）。于是我们每 50ms 就反复抢占系统剪贴板。
+Word 的 `Ctrl+V` 若在此刻 `OpenClipboard` 失败，就认为无可粘贴内容 → 第一次失败、
+第二次成功。这也回头解释了第二轮 trace 的谜团：**Word 从未接触我们的数据对象，
+是因为它连剪贴板都没打开成功**，而不是格式不对。500ms 静默期无效，因为用户是在
+发布若干秒后才粘贴的。
+
+**问题 2（目录批次卡死）**：`VirtualFileClipboard::clipboard_was_replaced()` 比较
+`GetClipboardSequenceNumber()`，**任何剪贴板写入都会让序号加一**。所以：收到图片
+（OLE 守卫持有图片对象）→ 之后收到一条文本，`write_text`（`hub.rs:2157`/`2374`）
+让序号加一 → 图片守卫 `is_current()` 变 false → STA 发 `ClipboardReplaced` →
+**因为没有 `virtual_receive`，该事件积在 channel 里没人消费**。等复制文件夹，批次
+offer 发布并置上 `virtual_batch_receive`，批次的事件循环取到这个**上一时代的陈旧
+事件**，而此时 `WindowsVirtualBatchReceive::must_finish()` 为 false（还没有 entry
+被请求），于是走 else 分支把刚发布的批次按 "clipboard replaced" 立即取消 →
+Explorer 在等永不到来的 `FileContents`，粘贴卡死；OLE 对象还在剪贴板上但后备传输
+已死，下一个文件也粘不了。
+
+**问题 2 是 task-061 引入的回归**：task-061 之前每个 OLE 发布都有 receive 归属，
+陈旧事件不可能跨时代泄漏。
+
+### 改动
+
+1. **图片闸门改为长期**（问题 1）：删除 `IMAGE_PUBLISH_QUIET_PERIOD` 与
+   `image_publish_quiet_period_active`，改为 `image_clipboard_owned` 状态 +
+   `image_clipboard_gate_next(currently_owned, clipboard_replaced, receive_active)`，
+   接入 `virtual_clipboard_active`。闸门活到 OLE 图片对象被替换为止，与文件 offer
+   同一契约。解除条件两个：`ClipboardReplaced`（别人拿走了剪贴板，STA 约 25ms 内
+   发现，随即恢复轮询以捡起对方的复制）；`receive_active`（文件 offer 发布覆盖了
+   图片对象，门控移交给它，否则图片标志会滞留、在该 offer 结束后永久挡住轮询）。
+2. **图片时代消费自己的事件**（问题 2 的一半）：在轮询块前加 drain，仅在无 receive
+   活跃时执行 —— `ClipboardReplaced` 用于解除闸门，`PublishFailed`（此前对图片发布
+   被直接丢弃）改为记诊断 + `last_error` 并解除闸门。
+3. **发布前清理陈旧事件**（问题 2 的另一半，关键）：新增
+   `discard_stale_ole_events`，在 `publish_windows_virtual_offer` 与
+   `publish_windows_virtual_batch_offer` 发布前调用。发布新对象那一刻队列里的任何
+   事件必然属于上一个时代（新对象尚不存在），必须丢弃。
+   **单靠 2 不够**：陈旧事件若在 50ms 休眠期间才由 STA 发出，下一轮的 offer 提升会
+   先于 drain 执行，offer 仍会吃到它。仓库既有做法一致（`replace_*_if_current`
+   失败路径已有 `while take_event`）。
+
+### 修改文件
+
+- `crates/m590-daemon/src/hub.rs`：`image_clipboard_gate_next` + 单测替换旧的静默期
+  helper/常量/单测；`image_clipboard_owned` 状态替换 `last_image_publish_at`；
+  轮询前事件 drain；`discard_stale_ole_events` 及两处发布前调用；
+  `virtual_clipboard_active` 接入新闸门。
+
+### 验证结果（2026-09-01 实际运行）
+
+- `cargo test -p m590-daemon --lib` 75 通过（2 ignored；新
+  `image_clipboard_gate_holds_until_clipboard_leaves_us` 本机真跑）；
+  `m590-core --lib` 41、`m590-clipboard --lib` 27 通过。
+- Windows 交叉 clippy 两种 feature 组合均 `-D warnings` 通过；native clippy
+  `-D warnings`、`cargo check --workspace`、`cargo fmt --check`、
+  `git diff --check` 通过。
+- **未做真机验证**：本机无 Windows 条件。
+
+### 遗留风险
+
+- 长期闸门**没有超时兜底**：若 `GetClipboardSequenceNumber()` 返回 0
+  （`clipboard_sequence()` → `None`），`is_current()` 恒为 true，
+  `ClipboardReplaced` 永不发出，Windows→Linux 的本地复制会一直不被采集，直到
+  会话重启。这与文件 offer 的契约相同（它们同样依赖该序号），但图片路径没有
+  Linux 侧 `VIRTUAL_PUBLISH_IDLE_TIMEOUT` 那样的兜底。**未加超时是刻意的**：一旦
+  超时放开轮询，就会重新引入问题 1 的抢占竞争（用户可能几分钟后才粘贴）。
+- 因此下面第 3 项真机验证是本轮**最关键**的回归项。
+
+### 待真机验证（Windows 侧，按重要性）
+
+1. **收图后在 Windows 本地复制文本/文件，确认能同步到 Linux**（验证闸门会被
+   `ClipboardReplaced` 正确解除；这是长期闸门唯一的失效模式）。
+2. 复制 Linux 目录 → Windows 粘贴不再卡死，且能连续粘贴下一个文件（问题 2）。
+3. prtsc / 图片文件 → Word 一次粘贴成功，不再需要第二次（问题 1）。
+4. Explorer `Ctrl+V` 仍能粘贴成 `.png`。
+5. 回归：文本、普通文件批次、offer 替换、断线。
+
+## 文档影响检查（2026-09-01，第六次与第七次合并）
+
+- 已更新：本 task（第六次：同步发布与静默期；第七次：真机两问题、根因、长期闸门 +
+  事件 drain、遗留风险、待真机项）、`docs/plans/current.md`、`AGENTS.md`。
 - 无需更新：协议 wire、Hub HTTP API、UI 交互、安装器 —— 改动只在 Windows 图片
-  接收发布路径的线程同步与轮询门控，无对外行为/字段变化。
+  接收发布路径的线程同步、轮询门控与 OLE 事件归属，无对外行为/字段变化。
 - 无需更新：`docs/discovery/commands.md`、`docs/discovery/project-map.md` ——
   无新增/删除文件，无命令变化。
 - 待补：`--all-targets` 在 Windows target 下的既有 `E0624`（`virtual_file_bridge.rs`

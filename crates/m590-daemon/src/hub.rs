@@ -62,18 +62,30 @@ const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const VIRTUAL_PUBLISH_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "windows")]
 const REPLACED_BATCH_REQUEST_GRACE: Duration = Duration::from_secs(2);
-/// After publishing the received-image dual representation, keep the local
-/// clipboard poll off the clipboard for this long.
+/// Next state of the received-image clipboard gate.
 ///
-/// Unlike a file offer — which sets `virtual_receive` in the same loop turn and
-/// is gated by it — the image publish sets no gate, so the next poll (50ms later,
-/// see [`IDLE_SESSION_LOOP_DELAY`]) would `OpenClipboard` right as consumers and
-/// clipboard monitors are enumerating the freshly published formats. A consumer
-/// whose `OpenClipboard` loses that race can conclude there is nothing to paste.
-/// The cost of this window is bounded: a local copy made inside it is picked up
-/// by the following poll instead.
+/// The gate keeps the local poll off the clipboard while our OLE image object owns
+/// it. Every poll turn reads text + image + file list through arboard, and
+/// arboard's Windows backend `OpenClipboard`s on every read (5 attempts, 5ms
+/// apart). A consumer whose own `OpenClipboard` loses that race sees nothing to
+/// paste — the user-visible symptom is "paste into Word only works on the second
+/// try". A file offer never had this problem: it sets `virtual_receive` in the same
+/// loop turn and stays gated for its whole life.
+///
+/// Released on:
+/// - `clipboard_replaced`: someone else took the clipboard (the STA notices within
+///   ~25ms), so resume polling to pick their copy up;
+/// - `receive_active`: a file offer published over our image object and now owns
+///   the gating itself — otherwise the image flag would linger and, once that offer
+///   ends, block the poll forever.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const IMAGE_PUBLISH_QUIET_PERIOD: Duration = Duration::from_millis(500);
+fn image_clipboard_gate_next(
+    currently_owned: bool,
+    clipboard_replaced: bool,
+    receive_active: bool,
+) -> bool {
+    currently_owned && !clipboard_replaced && !receive_active
+}
 
 #[cfg(feature = "task-057-diagnostics")]
 fn task_057_diagnostic(args: std::fmt::Arguments<'_>) {
@@ -494,15 +506,6 @@ fn virtual_receive_publish_is_idle(
 /// Whether the local clipboard poll must stay off the clipboard because the
 /// received-image dual representation was just published.
 ///
-/// `None` means no image publish has happened in this session.
-///
-/// Only the Windows publish path calls this, but it stays platform-neutral so the
-/// unit test runs on any host (same pattern as the virtual-receive helpers above).
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn image_publish_quiet_period_active(published_at: Option<Instant>, now: Instant) -> bool {
-    published_at.is_some_and(|at| now.saturating_duration_since(at) < IMAGE_PUBLISH_QUIET_PERIOD)
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum SessionLoopPause {
     Yield,
@@ -1964,10 +1967,10 @@ fn run_session_loop(
     let mut deferred_virtual_offer: Option<DeferredVirtualOffer> = None;
     #[cfg(target_os = "windows")]
     let mut deferred_virtual_batch_offer: Option<DeferredVirtualBatchOffer> = None;
-    // When the received-image dual representation was last published, for
-    // IMAGE_PUBLISH_QUIET_PERIOD.
+    // Our OLE image object (received-image dual representation) owns the clipboard.
+    // Gates the local poll; see image_clipboard_gate_next.
     #[cfg(target_os = "windows")]
-    let mut last_image_publish_at: Option<Instant> = None;
+    let mut image_clipboard_owned = false;
     #[cfg(target_os = "linux")]
     let mut fuse_manager = LinuxVirtualFileManager::new();
     #[cfg(target_os = "linux")]
@@ -2424,7 +2427,7 @@ fn run_session_loop(
                                                     // A publish was attempted, so hold
                                                     // the poll off the clipboard even if
                                                     // unconfirmed.
-                                                    last_image_publish_at = Some(Instant::now());
+                                                    image_clipboard_owned = true;
                                                     clip.adopt_image_baseline(&image);
                                                     if outcome == PublishOutcome::Unconfirmed {
                                                         // Do NOT raw-write here: the
@@ -4825,14 +4828,51 @@ fn run_session_loop(
             }
         }
 
+        // The image publish is the only OLE publish with no virtual_receive /
+        // virtual_batch_receive attached, so nothing else drains ManagerEvent while
+        // our image object owns the clipboard. Left undrained, a ClipboardReplaced
+        // from the image epoch (any later clipboard write bumps
+        // GetClipboardSequenceNumber, e.g. an inbound text applied with write_text)
+        // stays queued and is then consumed by the NEXT offer's event loop, which
+        // cancels a freshly published offer as "clipboard replaced" before the OS
+        // ever asked for data — the paste hangs and the following one cannot start.
+        // Only drain while no receive is active: a live offer owns its own events.
+        #[cfg(target_os = "windows")]
+        {
+            let receive_active = virtual_receive.is_some() || virtual_batch_receive.is_some();
+            let mut clipboard_replaced = false;
+            if !receive_active {
+                while let Some(event) = ole_manager.take_event() {
+                    match event {
+                        ManagerEvent::ClipboardReplaced => clipboard_replaced = true,
+                        ManagerEvent::PublishFailed(error) => {
+                            // Previously dropped on the floor for image publishes.
+                            task_057_diagnostic(format_args!(
+                                "image_epoch_publish_failed error={error}"
+                            ));
+                            with_status(&shared, |s| {
+                                s.last_error = Some(format!("clipboard_offer_image_file: {error}"));
+                            });
+                            image_clipboard_owned = false;
+                        }
+                    }
+                }
+            }
+            image_clipboard_owned = image_clipboard_gate_next(
+                image_clipboard_owned,
+                clipboard_replaced,
+                receive_active,
+            );
+        }
+
         if let Some(clip) = clipboard.as_mut() {
             let auto = with_status(&shared, |s| s.auto_sync);
             #[cfg(target_os = "windows")]
             let virtual_clipboard_active = virtual_receive.is_some()
                 || virtual_batch_receive.is_some()
-                // A just-published image dual representation has no offer gate of
-                // its own; keep the poll off the clipboard for a bounded window.
-                || image_publish_quiet_period_active(last_image_publish_at, Instant::now());
+                // Our OLE image object owns the clipboard and has no offer gate of
+                // its own; polling would race consumers for OpenClipboard.
+                || image_clipboard_owned;
             #[cfg(target_os = "linux")]
             let virtual_clipboard_active =
                 virtual_receive.is_some() || virtual_batch_receive.is_some();
@@ -6013,12 +6053,34 @@ fn image_file_collection(
     Ok(VirtualFileCollection::single_image(file, dib, dib_v5, png))
 }
 
+/// Drop `ManagerEvent`s left over from the OLE object we are about to replace.
+///
+/// Any event still queued when a new object is published necessarily predates it —
+/// the new object does not exist yet. Left in place, the new offer's event loop
+/// consumes it: a stale `ClipboardReplaced` (e.g. from a received-image publish,
+/// whose epoch has no `virtual_receive` to drain it) cancels the fresh offer as
+/// "clipboard replaced" before the OS ever requests data, which hangs that paste
+/// and blocks the next one. The same drain already guards the
+/// `replace_*_if_current` failure paths.
+#[cfg(target_os = "windows")]
+fn discard_stale_ole_events(manager: &WindowsVirtualFileManager) {
+    let mut discarded = 0usize;
+    while let Some(event) = manager.take_event() {
+        discarded += 1;
+        task_057_diagnostic(format_args!("discard_stale_ole_event event={event:?}"));
+    }
+    if discarded > 0 {
+        task_057_diagnostic(format_args!("discard_stale_ole_events count={discarded}"));
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn publish_windows_virtual_offer(
     manager: &WindowsVirtualFileManager,
     offer: &DeferredVirtualOffer,
 ) -> Result<WindowsVirtualReceive, String> {
     let (file, receive) = prepare_windows_virtual_offer(offer)?;
+    discard_stale_ole_events(manager);
     manager.publish(file)?;
     Ok(receive)
 }
@@ -6065,6 +6127,7 @@ fn publish_windows_virtual_batch_offer(
     offer: &DeferredVirtualBatchOffer,
 ) -> Result<WindowsVirtualBatchReceive, String> {
     let (collection, receive) = prepare_windows_virtual_batch_offer(offer)?;
+    discard_stale_ole_events(manager);
     manager.publish_collection(collection)?;
     Ok(receive)
 }
@@ -7381,27 +7444,20 @@ mod tests {
     }
 
     #[test]
-    fn image_publish_quiet_period_gates_only_inside_the_window() {
-        let now = Instant::now();
-        // No image published in this session -> never gate the poll.
-        assert!(!image_publish_quiet_period_active(None, now));
-        // Just published -> gate.
-        assert!(image_publish_quiet_period_active(Some(now), now));
-        // Inside the window -> still gated.
-        assert!(image_publish_quiet_period_active(
-            Some(now),
-            now + IMAGE_PUBLISH_QUIET_PERIOD - Duration::from_millis(1)
-        ));
-        // At and past the window -> poll resumes, so a local copy is never
-        // shut out for longer than the window.
-        assert!(!image_publish_quiet_period_active(
-            Some(now),
-            now + IMAGE_PUBLISH_QUIET_PERIOD
-        ));
-        assert!(!image_publish_quiet_period_active(
-            Some(now),
-            now + IMAGE_PUBLISH_QUIET_PERIOD + Duration::from_secs(5)
-        ));
+    fn image_clipboard_gate_holds_until_clipboard_leaves_us() {
+        // Nothing published -> never gate.
+        assert!(!image_clipboard_gate_next(false, false, false));
+        // Published and still ours -> keep the poll off the clipboard, with no
+        // deadline: the consumer may paste seconds later.
+        assert!(image_clipboard_gate_next(true, false, false));
+        // Someone else took the clipboard -> release, so the local copy that
+        // replaced us is picked up by the next poll.
+        assert!(!image_clipboard_gate_next(true, true, false));
+        // A file offer published over us and now owns the gating; the image flag
+        // must not linger, or the poll would stay blocked after that offer ends.
+        assert!(!image_clipboard_gate_next(true, false, true));
+        // A replacement cannot resurrect the gate.
+        assert!(!image_clipboard_gate_next(false, true, false));
     }
 
     #[cfg(target_os = "linux")]

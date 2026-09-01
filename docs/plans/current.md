@@ -1,7 +1,7 @@
 # 当前计划 · M590Bridge
 
 > 更新：2026-09-01
-> 阶段：task-061 正式构建场景 A 真机通过；发布窗口轮询竞争已修（同步发布 + 静默期），待 Windows 真机复测
+> 阶段：task-061 真机暴露「Word 粘两次」与「目录批次卡死」（同一根因：图片发布无 receive 归属），已修长期闸门 + OLE 事件归属，待 Windows 真机复测
 
 ## 目标（近期）
 
@@ -132,17 +132,23 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
 
 ## 下一步（有序）
 
-1. **task-061（待真机复测竞争修复）**：图片/图片文件「双表示」粘贴：Windows 位图
-   双表示、Linux 单图片文件自动解码写位图；prtsc 后 OLE publish 失败与文件复制阻塞
-   已修；**prtsc 位图 → Windows 贴 Word 已在正式构建（无诊断）真机通过
-   （2026-09-01）**。**发布窗口轮询竞争已修（2026-09-01）**：根因是
-   `publish_collection` fire-and-forget（`OleSetClipboard` 最多晚 25ms 在 STA 线程
-   执行），已改为同步确认发布（`publish_collection_synced` + `PublishOutcome`）并加
-   500ms 发布后静默期；代码级验证通过（daemon 75 测试、两种 feature 组合 Windows
-   交叉 clippy）。**下一步：Windows 真机复测场景 A + Explorer 粘贴 `.png` + 收图后
-   500ms 内本地复制不丢 + 文本/批次/替换/断线回归。** 之后剩：② Windows→Linux
-   两场景真机验收；③ 收敛 `task-057-diagnostics`（是否从 `desktop:standalone`
-   默认移除）。
+1. **task-061（待真机复测：长期闸门 + 事件归属）**：图片/图片文件「双表示」粘贴。
+   2026-09-01 真机暴露两个问题，**根因同一个**：图片发布是全仓库唯一「有 OLE 对象
+   存活、却无 receive 门控轮询、也无人消费 `ManagerEvent`」的状态。
+   ① Word 有时要粘两次 —— 轮询经 arboard 每 50ms 反复 `OpenClipboard`（每次读都开，
+   5 次×5ms 重试），抢掉 Word 的 `OpenClipboard`；这也解释了第二轮 trace 里
+   「Word 从未接触数据对象」。② Linux 目录批次在 Windows 粘贴卡死且下一个也粘不了
+   —— 图片时代残留的 `ClipboardReplaced`（任何剪贴板写入都让
+   `GetClipboardSequenceNumber` 加一，如收文本 `write_text`）没人消费，被下一个批次
+   offer 的事件循环吃到，在 `must_finish()` 仍为 false 时把刚发布的批次取消。
+   **② 是 task-061 引入的回归。** 已修：长期闸门 `image_clipboard_owned`（替换上一轮
+   瞄错窗口的 500ms 静默期，解除条件为 `ClipboardReplaced` 或 receive 接管）、图片
+   时代 drain 自己的事件、`discard_stale_ole_events` 在两个发布 helper 里发布前清队列。
+   代码级验证通过（daemon 75、两种 feature 组合 Windows 交叉 clippy）。
+   **下一步 Windows 真机按重要性验：① 收图后本机复制能同步到 Linux（长期闸门唯一
+   失效模式，无超时兜底）；② 目录批次不再卡死；③ Word 一次贴成；④ Explorer 贴
+   `.png`；⑤ 文本/批次/替换/断线回归。** 之后剩：Windows→Linux 两场景验收；
+   收敛 `task-057-diagnostics`。
 2. task-060（收尾）：Q1/Q2、Q3 权限、Q4 角标均真机通过；mp4/多个 pdf 替换
    七轮修复已由用户确认；「目录 + mp4」批次替换的八轮修复已回滚，日常以
    「文件夹与其他文件分开复制」规避（见 task-060）。
