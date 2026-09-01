@@ -147,10 +147,12 @@ Linux + Windows 剪贴板与小文件桥；局域网发现；后续安装/自启
    边界（`auto_image_eligible` 只对单文件 offer 生效），非缺陷。
    剩余收尾一项：收敛 `task-057-diagnostics`（仍写死在 `desktop:standalone`，
    已确认非 load-bearing）。
-2. **task-062（新，bug）**：Windows 粘贴多文件时「取消整个批次」按钮无效。根因已
+2. **task-062（已完成）**：Windows 粘贴多文件时「取消整个批次」按钮无效。根因已
    定位：`hub.rs` 的 `cancel_batch` 块里取消虚拟批次那段只有
    `#[cfg(target_os = "linux")]` 分支，Windows 上按钮只走到 `cancel_runtime_batch`
-   （仅管手动发送/接收批次），剪贴板虚拟批次从未接入取消路径。
+   （仅管手动发送/接收批次），剪贴板虚拟批次从未接入取消路径。**已修复并真机通过**
+   （2026-09-01）：新增结构镜像的 Windows 分支，取消按钮立即生效，后续批次不受
+   影响，Linux 侧取消功能未回归。
 3. **task-063（新，优化项）**：Windows 粘贴含文件夹的批次时不弹系统复制进度窗口。
    机制已定位：`windows_virtual_file.rs:335-338` 把 `FD_PROGRESSUI` 只加在非目录
    条目上。风险提示：task-058 目录树粘贴已验收，回归比缺进度窗口严重。
