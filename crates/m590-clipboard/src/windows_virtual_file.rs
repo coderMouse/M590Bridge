@@ -324,7 +324,7 @@ impl VirtualFileDataObject {
 
 fn file_descriptor(entry: &VirtualFileCollectionEntry) -> FILEDESCRIPTORW {
     let mut descriptor = FILEDESCRIPTORW {
-        dwFlags: (FD_ATTRIBUTES.0 | FD_UNICODE.0) as u32,
+        dwFlags: (FD_ATTRIBUTES.0 | FD_UNICODE.0 | FD_PROGRESSUI.0) as u32,
         dwFileAttributes: if entry.is_directory() {
             FILE_ATTRIBUTE_DIRECTORY.0
         } else {
@@ -333,7 +333,7 @@ fn file_descriptor(entry: &VirtualFileCollectionEntry) -> FILEDESCRIPTORW {
         ..Default::default()
     };
     if !entry.is_directory() {
-        descriptor.dwFlags |= (FD_FILESIZE.0 | FD_PROGRESSUI.0) as u32;
+        descriptor.dwFlags |= FD_FILESIZE.0 as u32;
         descriptor.nFileSizeHigh = (entry.size() >> 32) as u32;
         descriptor.nFileSizeLow = entry.size() as u32;
     }
