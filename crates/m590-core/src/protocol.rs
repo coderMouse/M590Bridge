@@ -1077,8 +1077,7 @@ mod tests {
 
     #[test]
     fn batch_manifest_enforces_depth_count_and_encoded_size_limits() {
-        let deep_path = std::iter::repeat("d")
-            .take(MAX_BATCH_PATH_DEPTH + 1)
+        let deep_path = std::iter::repeat_n("d", MAX_BATCH_PATH_DEPTH + 1)
             .collect::<Vec<_>>()
             .join("/");
         assert!(BatchEntry::file("deep-1", deep_path, 0, "").is_err());
